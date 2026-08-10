@@ -159,13 +159,20 @@ Known limits today:
   needs to hold the model in CPU memory. Per-rank sharded checkpoints — which
   Moonclip already supports — are the answer for models past that point, and
   are not wired up yet.
-- **AMP on CUDA, and FSDP1**: tested on CPU only. There is no GPU in the
-  development environment, and FSDP1 refuses to initialise without an
-  accelerator, so the tests use FSDP2. Both go through the same gather.
 - **Your loop's bounds**: a resumed script runs its own `for epoch in
   range(N)` again from the top; it has no idea 3000 steps already happened. Set
   `max_steps` and Ravex ends the run at the right step regardless of how many
   times the process restarted.
+
+Under AMP, note that an overflowing gradient makes `scaler.step()` skip the
+optimizer. Ravex counts optimizer steps, not loop iterations, so a skipped
+iteration does not advance the counter — which is the right unit, since nothing
+about the model changed, but it does mean the step count and the number of
+batches you fed differ.
+
+The GPU paths — AMP with real fp16 overflow, the CUDA RNG, FSDP1, NCCL — are
+covered by `integration/test_cuda.py`, which skips without a GPU. They were
+last verified on 8× RTX 5060 Ti with torch 2.12/cu130.
 
 ## Development
 

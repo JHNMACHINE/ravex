@@ -10,12 +10,20 @@ to come back exactly where they were. Restoring only the weights would give
 plausible-looking losses that quietly differ.
 """
 
+import importlib.util
+
 import pytest
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 import ravex
+
+#: Checked with find_spec rather than pytest.importorskip: importorskip inside a
+#: decorator raises at import time and takes the *whole module* with it, so an
+#: environment without Moonclip would silently lose the torch_save end-to-end
+#: test too - the one test this project most needs to keep running.
+HAVE_MOONCLIP = importlib.util.find_spec("moonclip") is not None
 
 SAMPLES = 64
 BATCH = 8
@@ -125,10 +133,7 @@ def test_resume_reproduces_the_uninterrupted_run(tmp_path, monkeypatch):
         assert torch.equal(value, reference_weights[key]), f"{key} differs"
 
 
-@pytest.mark.skipif(
-    pytest.importorskip("moonclip", reason="moonclip not installed") is None,
-    reason="moonclip not installed",
-)
+@pytest.mark.skipif(not HAVE_MOONCLIP, reason="moonclip not installed")
 def test_resume_reproduces_the_uninterrupted_run_on_moonclip(tmp_path, monkeypatch):
     reference, reference_weights, second_half, resumed_weights = run_scenario(
         tmp_path, monkeypatch, "moonclip"

@@ -73,15 +73,20 @@ no idea that 7 epochs already happened in a previous process, so it does 10
 more — from the right state, but well past the intended budget.
 
 `max_steps` fixes this from Ravex's side. Once the counter reaches it, the
-dataloaders start yielding empty epochs: remaining loop iterations fall through
-instantly and the script exits on its own terms, without Ravex raising anything
-into user code.
+dataloader stops handing out batches: the epoch in progress ends there, any
+remaining loop iterations fall through instantly, and the script exits on its
+own terms — Ravex never raises anything into user code.
 
 ```yaml
 max_steps: 50000
 ```
 
-Total optimizer steps across every restart is then exactly 50000.
+Total optimizer steps across every restart is then exactly 50000, not "50000
+rounded up to the end of whatever epoch that fell in".
+
+The unit is optimizer steps, which under AMP is not the same as loop
+iterations: an overflowing gradient makes `scaler.step()` skip the optimizer,
+and a skipped step does not count because nothing about the model changed.
 
 ## Example
 

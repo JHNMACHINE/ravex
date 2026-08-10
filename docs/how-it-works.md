@@ -217,6 +217,30 @@ raise, it hangs. So for sharded models the final checkpoint is skipped and the
 periodic cadence is what you get. A bounded loss of a few steps beats an
 unbounded hang.
 
+### The step that never happened
+
+Loading sharded optimizer state calls `optimizer.step()` — on purpose, with
+zero gradients, to allocate the state tensors before filling them in. PyTorch
+says so in as many words:
+
+> `_init_optim_state`: initialize optim states by calling the step() with zero
+> grads.
+
+That step goes straight through the post-step hook, which cannot tell it apart
+from a real one. Left unguarded, every FSDP resume silently burns one step of
+the budget and misnumbers every checkpoint after it — and since each restart
+adds another, a job preempted ten times ends ten steps short with checkpoint
+names that no longer mean what they say. Nothing errors; the numbers just drift.
+
+So the runtime raises a flag for the duration of a restore, and the step hook
+returns immediately while it is set. Anything the loading machinery does to the
+optimizer is by definition not training.
+
+This one only shows up on a GPU: FSDP1 refuses to initialise without an
+accelerator, and the CPU-only FSDP2 path happened not to hit it.
+
+### Keys
+
 Keys for sharded models are positional (`sharded_0`), not structural
 fingerprints. A fingerprint built from parameter shapes would encode the world
 size, since each rank only sees its own shard — and a run sharded over eight
