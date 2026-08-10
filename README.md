@@ -130,12 +130,18 @@ Alpha. Works with plain PyTorch loops, and with anything built on them
 (HuggingFace `Trainer`, Lightning, Accelerate) since the hooks are on PyTorch
 itself.
 
+Verified: plain loops, gradient accumulation, LR schedulers, AMP loss-scale
+state, `num_workers > 0`, and DDP across two ranks — a killed `torchrun` job
+resumes on *every* rank with bit-identical losses, and its checkpoint loads
+into a plain single-process model afterwards.
+
 Known limits today:
 
 - **`IterableDataset`**: no index sampler exists, so the stream position cannot
   be replayed. Everything else is still restored.
-- **FSDP**: sharded state dicts are not gathered yet. DDP works — rank 0
-  writes, every rank resumes.
+- **FSDP**: sharded state dicts are not gathered yet.
+- **AMP on CUDA**: the scaler mechanism is tested, but only on CPU — there is
+  no GPU in the development environment, so the CUDA path is unproven.
 - **Your loop's bounds**: a resumed script runs its own `for epoch in
   range(N)` again from the top; it has no idea 3000 steps already happened. Set
   `max_steps` and Ravex ends the run at the right step regardless of how many
@@ -146,6 +152,15 @@ Known limits today:
 ```bash
 pip install -e ".[dev]"
 pytest
+```
+
+The unit suite runs in-process. The parts that only exist across a real process
+boundary — the `.pth` autoloader, a resume starting from an empty interpreter,
+`torchrun` — live in `integration/` and need Linux:
+
+```bash
+docker build -f integration/Dockerfile -t ravex-integration .
+docker run --rm ravex-integration
 ```
 
 ## Licence

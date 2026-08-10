@@ -34,6 +34,40 @@ def _inner_sampler(obj: Any) -> Any:
     return getattr(obj, "sampler", obj)
 
 
+def _install_epoch_offset(inner: Any, offset: int) -> None:
+    """Make ``set_epoch()`` continue the run rather than restart it.
+
+    ``DistributedSampler`` derives its shuffle purely from ``seed + epoch``, and
+    the epoch comes from the user's own loop counter:
+
+        for epoch in range(EPOCHS):
+            sampler.set_epoch(epoch)
+
+    A resumed script starts that counter at 0 again. Restoring the epoch once
+    fixes only the first pass — from the second onwards the run would replay
+    epochs it already did, in the wrong order relative to the run it is
+    continuing.
+
+    So the sampler's ``set_epoch`` is shifted by the epoch the checkpoint was
+    taken in. The user keeps counting from zero and the data keeps moving
+    forward.
+    """
+    if offset <= 0:
+        return
+    original = getattr(inner, "set_epoch", None)
+    if original is None or getattr(original, "_ravex_offset", None) is not None:
+        return
+
+    def set_epoch(epoch, *args, **kwargs):
+        return original(epoch + offset, *args, **kwargs)
+
+    set_epoch._ravex_offset = offset
+    try:
+        inner.set_epoch = set_epoch
+    except AttributeError:  # pragma: no cover - exotic sampler
+        logger.warning("Could not shift set_epoch on %r", inner)
+
+
 def _ensure_generator(sampler: Any) -> None:
     """Give an unseeded shuffling sampler a generator we can snapshot."""
     if not hasattr(sampler, "generator"):
@@ -201,8 +235,10 @@ class TrackedSampler:
         self._epoch_index = int(state.get("epoch_index", 0))
 
         if "sampler_epoch" in state and hasattr(inner, "set_epoch"):
+            epoch = int(state["sampler_epoch"])
             try:
-                inner.set_epoch(int(state["sampler_epoch"]))
+                inner.set_epoch(epoch)  # before the shift is installed
+                _install_epoch_offset(inner, epoch)
             except Exception as exc:  # pragma: no cover - defensive
                 logger.warning("set_epoch failed during restore: %s", exc)
 

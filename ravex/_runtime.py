@@ -50,6 +50,7 @@ class RavexRuntime:
         self._resume_manager: Optional[ResumeManager] = None
         self._leader_optimizer_id: Optional[int] = None
         self._checkpoint_due = False
+        self._resume_attempted = False
         self._last_saved_step: Optional[int] = None
         self._shutdown_done = False
         self._lock = threading.RLock()
@@ -92,8 +93,6 @@ class RavexRuntime:
             from ravex._frameworks import detect_framework
 
             self._framework = detect_framework()
-            self._backend = get_backend(self.config)
-            self._resume_manager = ResumeManager(self._backend, self.registry)
             self._patches = install_all_patches(self.registry, self)
             self._install_signal_handler()
 
@@ -107,6 +106,28 @@ class RavexRuntime:
         except Exception as exc:
             logger.error("Activation failed: %s", exc, exc_info=True)
             self._disable("activation failed")
+
+    def _ensure_backend(self) -> bool:
+        """Build the checkpoint backend on first real use.
+
+        Not at activation time. A `torchrun` launcher, a dataloader worker, or
+        any other helper process that happens to import torch inside a project
+        with a ravex.yaml would otherwise each construct a checkpoint manager —
+        creating directories and, with S3 or R2 configured, opening connections
+        on behalf of a process that will never train a single step.
+        """
+        if self._backend is not None:
+            return True
+        if not self._enabled:
+            return False
+        try:
+            self._backend = get_backend(self.config)
+            self._resume_manager = ResumeManager(self._backend, self.registry)
+        except Exception as exc:
+            logger.error("Could not open the checkpoint backend: %s", exc)
+            self._disable("backend unavailable")
+            return False
+        return True
 
     def _disable(self, reason: str) -> None:
         if not self._enabled:
@@ -149,7 +170,7 @@ class RavexRuntime:
 
         # Last chance to resume: reached only when the run has no DataLoader,
         # since DataLoader.__iter__ fires earlier.
-        if self._resume_manager is not None and not self._resume_manager.attempted:
+        if not self._resume_attempted:
             self._try_resume()
 
         self.registry.step_count += 1
@@ -192,9 +213,7 @@ class RavexRuntime:
         all exist, and no batch has been drawn yet — so the restored dataset
         position and RNG state are applied before they are used.
         """
-        if not self._enabled or self._resume_manager is None:
-            return
-        if self._resume_manager.attempted:
+        if not self._enabled or self._resume_attempted:
             return
         if self.registry.is_empty():
             return  # nothing to restore into yet
@@ -212,16 +231,15 @@ class RavexRuntime:
             self.registry.apply_pending_rng()
 
     def _try_resume(self, defer_rng: bool = False) -> None:
+        self._resume_attempted = True
         if not self.config.resume:
-            if self._resume_manager is not None:
-                self._resume_manager.attempted = True
+            return
+        if not self._ensure_backend():
             return
         try:
             self._resume_manager.try_resume(defer_rng=defer_rng)
         except Exception as exc:
             logger.warning("Resume failed (%s) - starting from scratch", exc)
-            if self._resume_manager is not None:
-                self._resume_manager.attempted = True
 
     # ─── checkpointing ──────────────────────────────────────────────
 
@@ -233,9 +251,9 @@ class RavexRuntime:
         writes in the background, so what the loop actually pays for is the
         copy, not the I/O.
         """
-        if not self._enabled or self._backend is None:
+        if not self._enabled or not is_main_process():
             return False
-        if not is_main_process():
+        if not self._ensure_backend():
             return False
 
         step = self.registry.step_count

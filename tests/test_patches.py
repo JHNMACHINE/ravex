@@ -3,6 +3,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 import ravex
+from ravex._backends import TorchSaveBackend
 from ravex._runtime import get_runtime
 
 
@@ -115,6 +116,49 @@ def test_old_checkpoints_are_pruned(storage):
     assert len(list(storage.glob("step_*.pt"))) == 2
 
 
+def run_amp_steps(model, optimizer, loader, scaler, steps):
+    done = 0
+    while done < steps:
+        for x, y in loader:
+            loss = ((model(x) - y) ** 2).mean()
+            optimizer.zero_grad()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)  # calls optimizer.step() internally
+            scaler.update()
+            done += 1
+            if done >= steps:
+                return
+
+
+def test_the_amp_scaler_is_tracked_and_its_scale_survives_a_resume(storage):
+    """The loss scale is tuned state, not a constant.
+
+    A resume that reset it to init_scale would spend the next few hundred steps
+    re-discovering the scale, overflowing gradients on the way. Exercised on
+    CPU here; the mechanism is device-independent since the hook is on
+    GradScaler.__init__.
+    """
+    ravex.activate(backend="torch_save", checkpoint_every=2)
+    model, optimizer, loader = make_loop()
+    scaler = torch.amp.GradScaler("cpu", enabled=True, init_scale=1024.0)
+
+    assert scaler in get_runtime().registry.scalers
+
+    run_amp_steps(model, optimizer, loader, scaler, 2)
+    scaler.update(new_scale=512.0)  # as an overflow would
+    run_amp_steps(model, optimizer, loader, scaler, 3)
+    ravex.deactivate()
+
+    # Fresh process: a new scaler back at its initial scale.
+    ravex.activate(backend="torch_save", checkpoint_every=2)
+    model, optimizer, loader = make_loop()
+    scaler = torch.amp.GradScaler("cpu", enabled=True, init_scale=1024.0)
+    run_amp_steps(model, optimizer, loader, scaler, 1)
+
+    assert scaler.get_scale() == 512.0
+    assert ravex.step() > 1, "the step counter should have resumed, not restarted"
+
+
 def test_deactivate_restores_pytorch(storage):
     original_init = torch.nn.Module.__init__
     original_step_owner = torch.optim.Optimizer.__init__
@@ -131,12 +175,13 @@ def test_deactivate_restores_pytorch(storage):
 
 def test_a_broken_backend_disables_ravex_instead_of_the_run(storage, monkeypatch):
     ravex.activate(backend="torch_save", checkpoint_every=1)
-    runtime = get_runtime()
 
     def explode(*args, **kwargs):
         raise RuntimeError("disk on fire")
 
-    monkeypatch.setattr(runtime.backend, "save", explode)
+    # Patched on the class: the backend instance does not exist yet, since it
+    # is only built when something actually needs to read or write.
+    monkeypatch.setattr(TorchSaveBackend, "save", explode)
 
     model, optimizer, loader = make_loop()
     run_steps(model, optimizer, loader, 3)  # must not raise

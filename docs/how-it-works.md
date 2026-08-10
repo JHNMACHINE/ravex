@@ -165,11 +165,44 @@ checkpoint.
 
 ## Distributed
 
-Rank 0 writes; every rank resumes. DDP and `torch.compile` wrappers are
-unwrapped before `state_dict()` so keys do not pick up a `module.` or
-`_orig_mod.` prefix that would fail to load in a single-GPU rerun.
+Rank 0 writes; every rank resumes. That asymmetry matters: a rank that came
+back with fresh weights would poison the first all-reduce, and the run would
+diverge without ever reporting an error.
+
+DDP and `torch.compile` wrappers are unwrapped before `state_dict()`, so keys
+do not pick up a `module.` or `_orig_mod.` prefix that would load fine on the
+cluster that wrote them and fail on a single GPU afterwards — which is exactly
+when you reach for the checkpoint.
+
+### The epoch counter keeps moving
+
+`DistributedSampler` derives its shuffle entirely from `seed + epoch`, and the
+epoch comes from the user's own loop:
+
+```python
+for epoch in range(EPOCHS):
+    sampler.set_epoch(epoch)
+```
+
+A resumed script starts that counter at zero again. Restoring the epoch once
+fixes only the first pass; from the second onwards the run would replay epochs
+it had already done. So on resume Ravex shifts the sampler's `set_epoch` by the
+epoch the checkpoint was taken in. The user keeps counting from zero and the
+data keeps moving forward.
 
 FSDP sharded state dicts are not gathered yet.
+
+## Processes that never train
+
+The backend is not built at activation. It is built the first time something
+needs to read or write.
+
+The reason shows up as soon as you run `torchrun`: the launcher process imports
+torch inside a project that has a `ravex.yaml`, so Ravex activates there too —
+and then never sees a single step. Same for dataloader workers, and for any
+helper script in the same directory. Building a checkpoint manager eagerly
+would mean each of those creating directories and, with S3 or R2 configured,
+opening connections on behalf of a process with nothing to save.
 
 ## When it breaks
 
