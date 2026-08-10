@@ -51,6 +51,7 @@ class RavexRuntime:
         self._leader_optimizer_id: Optional[int] = None
         self._checkpoint_due = False
         self._resume_attempted = False
+        self._restoring = False
         self._last_saved_step: Optional[int] = None
         self._shutdown_done = False
         self._lock = threading.RLock()
@@ -163,6 +164,15 @@ class RavexRuntime:
         if not self._enabled:
             return
 
+        # Loading sharded optimizer state calls optimizer.step() with zero
+        # gradients, to allocate the state tensors before filling them in
+        # (torch.distributed.checkpoint.state_dict._init_optim_state). That
+        # step changes nothing and must not be counted: left unguarded, every
+        # FSDP resume silently burns one step of the budget and misnumbers
+        # every checkpoint after it, compounding on each restart.
+        if self._restoring:
+            return
+
         if self._leader_optimizer_id is None:
             self._leader_optimizer_id = id(optimizer)
         elif id(optimizer) != self._leader_optimizer_id:
@@ -237,9 +247,14 @@ class RavexRuntime:
         if not self._ensure_backend():
             return
         try:
+            # Anything the loading machinery does to the optimizer is not
+            # training; see the guard in on_step.
+            self._restoring = True
             self._resume_manager.try_resume(defer_rng=defer_rng)
         except Exception as exc:
             logger.warning("Resume failed (%s) - starting from scratch", exc)
+        finally:
+            self._restoring = False
 
     # ─── checkpointing ──────────────────────────────────────────────
 

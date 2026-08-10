@@ -287,6 +287,15 @@ class _BatchBoundaryIterator:
     def __next__(self):
         try:
             self._runtime.on_batch_boundary()
+
+            # Enforced here rather than only at the top of an epoch, so the
+            # budget is a step count and not "that many steps, rounded up to
+            # the end of whatever epoch we were in". The boundary check above
+            # runs first, so the last step's checkpoint is still collected.
+            if self._runtime.should_stop():
+                raise StopIteration
+        except StopIteration:
+            raise
         except Exception as exc:
             logger.warning("Checkpoint at batch boundary failed: %s", exc)
 

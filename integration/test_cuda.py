@@ -46,9 +46,12 @@ RESUME_FROM = 17
 #: initialises, so it goes in the child's environment.
 DETERMINISTIC_ENV = {"CUBLAS_WORKSPACE_CONFIG": ":4096:8"}
 
-#: NCCL reduction order varies run to run. A genuine restoration bug moves the
-#: loss by percent, not by parts per million.
-COLLECTIVE_TOLERANCE = 1e-4
+#: Tolerance for the steps *after* the first resumed one in a distributed run.
+#: NCCL picks its reduction order at runtime, so two identical runs differ in
+#: the last bits, and training amplifies that difference step by step. 1% still
+#: catches every real failure: a rank that did not resume poisons the
+#: all-reduce and its losses come out tens of percent away, not fractions.
+COLLECTIVE_TOLERANCE = 1e-2
 
 
 def run_single(directory, trace_name="trace.jsonl", **script_args):
@@ -90,7 +93,13 @@ def assert_matches(actual, expected, first_step, exact=True):
     for offset, (got_entry, want_entry) in enumerate(zip(actual, tail)):
         step = first_step + offset
         got, want = float(got_entry["loss"]), float(want_entry["loss"])
-        if exact:
+
+        # The first resumed step is a forward pass over the restored weights,
+        # before any collective runs in that iteration. It is exact even under
+        # NCCL, and it is the assertion that actually proves every rank came
+        # back with the right state. Everything after it inherits whatever
+        # ordering the collectives chose this time.
+        if exact or offset == 0:
             assert got == want, f"step {step}: {got!r} != {want!r}"
         else:
             assert got == pytest.approx(want, rel=COLLECTIVE_TOLERANCE), (

@@ -55,10 +55,13 @@ class ResumeManager:
         step = state.get("step", 0)
         self.registry.restore_state(state, defer_rng=defer_rng)
         self.restored_step = self.registry.step_count
+
+        sharded = len(state.get("sharded", {}))
         logger.info(
-            "Resumed at step %s (%d model(s), %d optimizer(s))",
+            "Resumed at step %s (%d model(s), %d optimizer(s), %d sharded group(s))",
             step,
             len(state.get("models", {})),
             len(state.get("optimizers", {})),
+            sharded,
         )
         return True
