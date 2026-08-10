@@ -217,6 +217,25 @@ raise, it hangs. So for sharded models the final checkpoint is skipped and the
 periodic cadence is what you get. A bounded loss of a few steps beats an
 unbounded hang.
 
+### One writer, whatever the environment says
+
+Moonclip supports genuine multi-rank checkpoints, where each rank writes its own
+shard through an explicit `create_snapshot` / `save_rank` / `finalize` flow, and
+it infers the world size from `RANK` and `WORLD_SIZE` when it is not told
+otherwise. Ravex does not use that flow: it gathers sharded state itself and
+exactly one rank writes the result. So the backend states `world_size=1` rather
+than letting the environment speak for it.
+
+Without that, every distributed run under `torchrun` produced this and nothing
+else:
+
+    Multi-rank save requires explicit create_snapshot/save_rank/finalize flow.
+    Ravex disabled (checkpoint failed) - training continues unaffected
+
+Which is the fallback behaving exactly as designed — and is also the worst
+possible outcome, since the job carries on happily with no checkpoints at all,
+on precisely the runs that are expensive enough to be worth checkpointing.
+
 ### The step that never happened
 
 Loading sharded optimizer state calls `optimizer.step()` — on purpose, with

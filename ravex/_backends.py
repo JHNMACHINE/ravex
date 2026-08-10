@@ -78,6 +78,16 @@ class MoonclipBackend(CheckpointBackend):
             "compression_level": config.compression_level,
             "max_total_snapshots": config.keep_last,
             "async_save": True,
+            # Always single-rank, stated explicitly. Moonclip otherwise infers
+            # world_size from RANK/WORLD_SIZE in the environment, and under
+            # torchrun it then rejects the single-rank save API outright:
+            # "Multi-rank save requires explicit create_snapshot/save_rank/
+            # finalize flow". Ravex does not need that flow — sharded state is
+            # gathered before it gets here and exactly one rank writes — but
+            # the mismatch is silent apart from a log line, so every
+            # distributed run would lose checkpointing altogether.
+            "world_size": 1,
+            "rank": 0,
         }
 
         if not config.delta:
