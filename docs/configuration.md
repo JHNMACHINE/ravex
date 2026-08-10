@@ -1,0 +1,103 @@
+# Configuration
+
+Ravex resolves its configuration from three places. Later ones win:
+
+1. built-in defaults
+2. `ravex.yaml` — at `RAVEX_CONFIG`, or the first one found walking up from the
+   working directory
+3. `RAVEX_*` environment variables
+
+Environment variables come last on purpose: a platform or a CI job has to be
+able to override a config file committed to the user's repository.
+
+Check what a given directory resolves to:
+
+```bash
+ravex status
+```
+
+## Options
+
+| Key | Env var | Default | What it does |
+|---|---|---|---|
+| `enabled` | `RAVEX_ENABLED` | `true` | Master switch. `RAVEX_ENABLED=0` disables Ravex for one run. |
+| `checkpoint_every` | `RAVEX_CHECKPOINT_EVERY` | `500` | Optimizer steps between checkpoints. Not micro-batches: with gradient accumulation, one accumulation cycle is one step. |
+| `checkpoint_on_exit` | `RAVEX_CHECKPOINT_ON_EXIT` | `true` | Take a final checkpoint when the process exits normally or on SIGTERM. |
+| `resume` | `RAVEX_RESUME` | `true` | Look for an existing checkpoint at startup. Set false to always start clean. |
+| `max_steps` | `RAVEX_MAX_STEPS` | `null` | Hard stop, in optimizer steps. See [Step budgets](#step-budgets). |
+| `backend` | `RAVEX_BACKEND` | `moonclip` | `moonclip` or `torch_save`. Falls back to `torch_save` if Moonclip is missing. |
+| `delta` | `RAVEX_DELTA` | `true` | Moonclip only: store deltas against the previous snapshot. |
+| `compression` | `RAVEX_COMPRESSION` | `zstd` | `zstd` or `none`. |
+| `compression_level` | `RAVEX_COMPRESSION_LEVEL` | `3` | zstd level. |
+| `keep_last` | `RAVEX_KEEP_LAST` | `5` | Checkpoints to retain. Older ones are deleted. |
+| `track_dataloaders` | `RAVEX_TRACK_DATALOADERS` | `true` | Track and restore the dataset position. |
+| `track_rng` | `RAVEX_TRACK_RNG` | `true` | Save and restore torch / CUDA / Python / NumPy RNG state. |
+| `handle_sigterm` | `RAVEX_HANDLE_SIGTERM` | `true` | Checkpoint on SIGTERM — the signal a preempted spot instance receives. Only installed if nothing else has claimed the signal. |
+| `fallback_on_error` | `RAVEX_FALLBACK_ON_ERROR` | `true` | On an unexpected error, disable Ravex and let training continue. |
+| `log_file` | `RAVEX_LOG_FILE` | `null` | Log destination. Unset means stderr, WARNING and above only. |
+| `log_level` | `RAVEX_LOG_LEVEL` | `INFO` | |
+| `run_id` | `RAVEX_RUN_ID` | `null` | Recorded in checkpoint metadata; also used as the storage prefix when none is set. |
+
+### Storage
+
+| Key | Env var | Default |
+|---|---|---|
+| `storage.type` | `RAVEX_STORAGE_TYPE` | `local` |
+| `storage.path` | `RAVEX_STORAGE_PATH` | `./checkpoints` |
+| `storage.bucket` | `RAVEX_STORAGE_BUCKET` | `null` |
+| `storage.prefix` | `RAVEX_STORAGE_PREFIX` | `""` |
+| `storage.endpoint` | `RAVEX_STORAGE_ENDPOINT` | `null` |
+| `storage.region` | `RAVEX_STORAGE_REGION` | `us-east-1` |
+| `storage.path_style` | `RAVEX_STORAGE_PATH_STYLE` | `false` |
+
+`type: s3` and `type: r2` are the same S3 protocol; R2 just needs an
+`endpoint`. With a remote store, `storage.path` stays in use as the local
+staging directory — checkpoints land on local disk first and sync from there,
+so a step is never blocked on the network.
+
+A remote type without a bucket falls back to local storage with a warning
+rather than failing the run.
+
+### Credentials
+
+Never in `ravex.yaml` — that file lives in the user's repository. Ravex reads,
+in order:
+
+1. `RAVEX_S3_ACCESS_KEY` / `RAVEX_S3_SECRET_KEY`
+2. `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`
+
+## Step budgets
+
+A resumed script runs its own loop from the top. `for epoch in range(10)` has
+no idea that 7 epochs already happened in a previous process, so it does 10
+more — from the right state, but well past the intended budget.
+
+`max_steps` fixes this from Ravex's side. Once the counter reaches it, the
+dataloaders start yielding empty epochs: remaining loop iterations fall through
+instantly and the script exits on its own terms, without Ravex raising anything
+into user code.
+
+```yaml
+max_steps: 50000
+```
+
+Total optimizer steps across every restart is then exactly 50000.
+
+## Example
+
+```yaml
+# ravex.yaml
+checkpoint_every: 250
+max_steps: 50000
+backend: moonclip
+keep_last: 3
+
+storage:
+  type: r2
+  bucket: my-training-runs
+  prefix: gpt2-wikitext
+  endpoint: https://<account>.r2.cloudflarestorage.com
+  path: /workspace/.ravex-cache
+
+log_file: /var/log/ravex.log
+```

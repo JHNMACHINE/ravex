@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ravex"
+version = "0.1.0"
+description = "Transparent checkpoint and resume for PyTorch training, with no changes to your training code"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [{ name = "JHNMACHINE" }]
+keywords = ["pytorch", "checkpoint", "training", "resume", "mlops", "preemption"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# torch is deliberately not a dependency: Ravex attaches to whatever build
+# of torch the user already has (CUDA, ROCm, CPU) and must never pull a
+# different one in.
+dependencies = ["PyYAML>=5.1"]
+
+[project.optional-dependencies]
+moonclip = ["moonclip>=0.2"]
+dev = ["pytest>=7", "numpy"]
+
+[project.urls]
+Homepage = "https://codeberg.org/JHNMACHINE/ravex"
+Source = "https://codeberg.org/JHNMACHINE/ravex"
+
+[project.scripts]
+ravex = "ravex._cli:main"
+
+[tool.setuptools]
+packages = ["ravex"]
+
+[tool.setuptools.package-data]
+ravex = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]

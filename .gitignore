@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Checkpoints and logs produced by the examples and the test suite
+checkpoints/
+*.pt
+ravex.log
+
+.vscode/
+.idea/
+.DS_Store

@@ -1,0 +1,20 @@
+# Configuration for examples/train_mlp.py.
+#
+# Its presence is also what tells Ravex to activate at all: without an explicit
+# RAVEX_ENABLED, the autoloader only wakes up for projects that have one of
+# these.
+
+checkpoint_every: 100
+backend: torch_save        # no Moonclip needed to try the example
+keep_last: 3
+
+storage:
+  type: local
+  path: ./checkpoints
+
+# Total optimizer steps across every restart. Without it, a resumed script
+# would run its own `for epoch in range(EPOCHS)` again from the top.
+max_steps: 1000
+
+log_file: ./ravex.log
+log_level: INFO
