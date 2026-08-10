@@ -51,8 +51,11 @@ def main():
 
     # A plain MLP is deterministic under these settings, so the comparison
     # against an uninterrupted run can be exact rather than approximate.
+    # CUBLAS_WORKSPACE_CONFIG has to be in the environment before CUDA starts,
+    # so the caller sets it.
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True, warn_only=True)
 
     distributed = args.mode in ("ddp", "fsdp1")
     if distributed:
@@ -97,7 +100,7 @@ def main():
     model.train()
     trace = open(args.trace, "a", buffering=1) if rank == 0 else None
 
-    local_step = 0
+    optimizer_steps = 0
     for epoch in range(args.epochs):
         if sampler is not None:
             sampler.set_epoch(epoch)
@@ -109,15 +112,26 @@ def main():
 
             optimizer.zero_grad()
             scaler.scale(loss).backward()
+
+            # An overflowing gradient makes scaler.step() skip the optimizer
+            # and back the scale off. The iteration happened; the step did not,
+            # and nothing about the model changed. The scale only ever drops on
+            # a skip, so comparing it across update() tells the two apart.
+            scale_before = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
+            stepped = scaler.get_scale() >= scale_before
             scheduler.step()
 
-            local_step += 1
+            if stepped:
+                optimizer_steps += 1
+
             if trace is not None:
                 trace.write(
                     json.dumps(
                         {
+                            "step": optimizer_steps,
+                            "stepped": stepped,
                             "loss": repr(loss.item()),
                             "lr": repr(optimizer.param_groups[0]["lr"]),
                             "scale": repr(scaler.get_scale()),
@@ -126,7 +140,7 @@ def main():
                     + "\n"
                 )
 
-            if args.die_at and local_step >= args.die_at:
+            if args.die_at and optimizer_steps >= args.die_at:
                 if trace is not None:
                     trace.flush()
                     os.fsync(trace.fileno())
@@ -136,7 +150,7 @@ def main():
         trace.close()
     if distributed:
         dist.destroy_process_group()
-    print(f"rank {rank} done after {local_step} steps")
+    print(f"rank {rank} done after {optimizer_steps} optimizer steps")
 
 
 if __name__ == "__main__":

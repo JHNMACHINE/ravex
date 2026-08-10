@@ -9,9 +9,9 @@ gloo on CPU, so this runs anywhere — the failure modes being tested are about
 process topology, not about the device.
 """
 
+import os
 import subprocess
 import sys
-from pathlib import Path
 
 import pytest
 
@@ -37,7 +37,14 @@ def torchrun(directory, script, trace_name="trace.jsonl", ranks=2, **script_args
         command += [f"--{key.replace('_', '-')}", str(value)]
 
     return subprocess.run(
-        command, cwd=directory, capture_output=True, text=True, timeout=900
+        command,
+        cwd=directory,
+        capture_output=True,
+        text=True,
+        timeout=900,
+        # Ignored on CPU; on CUDA it makes cuBLAS pick a deterministic
+        # algorithm, and it has to be set before the child initialises CUDA.
+        env={**os.environ, "CUBLAS_WORKSPACE_CONFIG": ":4096:8"},
     )
 
 
