@@ -131,17 +131,37 @@ Alpha. Works with plain PyTorch loops, and with anything built on them
 itself.
 
 Verified: plain loops, gradient accumulation, LR schedulers, AMP loss-scale
-state, `num_workers > 0`, and DDP across two ranks — a killed `torchrun` job
-resumes on *every* rank with bit-identical losses, and its checkpoint loads
-into a plain single-process model afterwards.
+state, `num_workers > 0`, DDP, and FSDP. A killed `torchrun` job resumes on
+*every* rank with bit-identical losses, sharded or not, and the checkpoint it
+leaves behind loads into a plain single-process model afterwards.
+
+### Sharded models
+
+With FSDP each rank holds a slice of every parameter, so `state_dict()` returns
+a fragment. Ravex gathers the whole thing, which makes the checkpoint
+independent of the topology that produced it: a run sharded over eight GPUs can
+be resumed on one.
+
+Two consequences worth knowing:
+
+- Collecting a checkpoint becomes a **collective**. Every rank participates in
+  the gather; only rank 0 writes.
+- There is **no final checkpoint at exit** for a sharded model. Shutdown is
+  where ranks stop being in lockstep, and a gather nobody else joins hangs.
+  Losing the last few steps is bounded; a hang is not. Set `checkpoint_every`
+  accordingly.
 
 Known limits today:
 
 - **`IterableDataset`**: no index sampler exists, so the stream position cannot
   be replayed. Everything else is still restored.
-- **FSDP**: sharded state dicts are not gathered yet.
-- **AMP on CUDA**: the scaler mechanism is tested, but only on CPU — there is
-  no GPU in the development environment, so the CUDA path is unproven.
+- **Very large sharded models**: the gather is a full state dict, so rank 0
+  needs to hold the model in CPU memory. Per-rank sharded checkpoints — which
+  Moonclip already supports — are the answer for models past that point, and
+  are not wired up yet.
+- **AMP on CUDA, and FSDP1**: tested on CPU only. There is no GPU in the
+  development environment, and FSDP1 refuses to initialise without an
+  accelerator, so the tests use FSDP2. Both go through the same gather.
 - **Your loop's bounds**: a resumed script runs its own `for epoch in
   range(N)` again from the top; it has no idea 3000 steps already happened. Set
   `max_steps` and Ravex ends the run at the right step regardless of how many

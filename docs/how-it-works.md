@@ -190,7 +190,39 @@ it had already done. So on resume Ravex shifts the sampler's `set_epoch` by the
 epoch the checkpoint was taken in. The user keeps counting from zero and the
 data keeps moving forward.
 
-FSDP sharded state dicts are not gathered yet.
+### Sharded models
+
+FSDP splits every parameter across ranks, and the optimizer's moments with it,
+so `state_dict()` on any one rank returns a fragment. Worse, the two cannot be
+collected independently: the moments are sharded against the model's flattened
+parameters, and gathering them needs both objects at once. Ravex therefore
+pairs each sharded model with the optimizers that own its parameters and hands
+both to `torch.distributed.checkpoint.state_dict`, which produces a full state
+dict with clean parameter names.
+
+The result is a checkpoint that does not remember how many GPUs wrote it. Eight
+ranks in, one rank out.
+
+Two things follow, and both are load-bearing:
+
+**Collecting becomes a collective.** The rank gate had to move: every rank
+gathers, then only rank 0 writes. Gating before the gather — the obvious
+reading of "only rank 0 checkpoints" — deadlocks, because the other ranks sit
+in an all-gather waiting for a participant that already returned.
+
+**There is no checkpoint at exit.** Shutdown is exactly where the ranks stop
+being in lockstep: user code may have called `destroy_process_group`, or one
+rank may reach `atexit` before another. A collective nobody else joins does not
+raise, it hangs. So for sharded models the final checkpoint is skipped and the
+periodic cadence is what you get. A bounded loss of a few steps beats an
+unbounded hang.
+
+Keys for sharded models are positional (`sharded_0`), not structural
+fingerprints. A fingerprint built from parameter shapes would encode the world
+size, since each rank only sees its own shard — and a run sharded over eight
+GPUs would then fail to recognise itself on four. The parameter names are
+stored alongside so a changed architecture is reported rather than surfacing as
+a shape error from inside the loader.
 
 ## Processes that never train
 

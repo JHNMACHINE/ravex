@@ -24,13 +24,32 @@ import weakref
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Set
 
-from ravex._distributed import unwrap_model
+from ravex._distributed import (
+    apply_sharded_state,
+    gather_sharded_state,
+    is_sharded,
+    unwrap_model,
+)
 
 logger = logging.getLogger("ravex")
 
 
 def _digest(text: str) -> str:
     return hashlib.blake2b(text.encode("utf-8"), digest_size=6).hexdigest()
+
+
+#: Segments the various wrappers splice into parameter names. A gathered full
+#: state dict has them stripped; a live named_parameters() may not.
+_WRAPPER_SEGMENTS = (
+    "_fsdp_wrapped_module",
+    "_checkpoint_wrapped_module",
+    "_orig_mod",
+    "module",
+)
+
+
+def _clean_fqn(name: str) -> str:
+    return ".".join(part for part in name.split(".") if part not in _WRAPPER_SEGMENTS)
 
 
 def _drop_on_death(entries: "OrderedDict[int, weakref.ref]", key: int):
@@ -299,10 +318,57 @@ class ObjectRegistry:
         return result
 
     def keyed_models(self) -> List[tuple]:
-        return self._keyed(self._root_models(), self.fingerprint_model)
+        return self._keyed(self._plain_models(), self.fingerprint_model)
 
     def keyed_optimizers(self) -> List[tuple]:
-        return self._keyed(self.optimizers, self.fingerprint_optimizer)
+        return self._keyed(self._plain_optimizers(), self.fingerprint_optimizer)
+
+    # ─── sharded models ─────────────────────────────────────────────
+
+    def sharded_groups(self) -> List[tuple]:
+        """Sharded models paired with the optimizers that own their parameters.
+
+        FSDP state cannot be collected model-first then optimizer-second: the
+        optimizer's moments are sharded against the model's flattened
+        parameters, and gathering them needs both objects at once.
+
+        Keys are positional (``sharded_0``, ``sharded_1``) rather than
+        structural. A fingerprint built from parameter shapes would encode the
+        world size — each rank sees only its shard — and a run sharded over
+        eight GPUs would then fail to match itself when resumed on four.
+        """
+        groups = []
+        for model in self._root_models():
+            if not is_sharded(model):
+                continue
+            owners = [o for o in self.optimizers if self._optimizer_owns(o, model)]
+            groups.append((f"sharded_{len(groups)}", model, owners))
+        return groups
+
+    def has_sharded_models(self) -> bool:
+        return any(is_sharded(model) for model in self._root_models())
+
+    def _plain_models(self) -> List[Any]:
+        return [model for model in self._root_models() if not is_sharded(model)]
+
+    def _plain_optimizers(self) -> List[Any]:
+        """Optimizers not already covered by a sharded group."""
+        claimed = set()
+        for _, _, owners in self.sharded_groups():
+            claimed.update(id(o) for o in owners)
+        return [o for o in self.optimizers if id(o) not in claimed]
+
+    @staticmethod
+    def _optimizer_owns(optimizer, model) -> bool:
+        model_params = {id(p) for p in model.parameters()}
+        try:
+            for group in optimizer.param_groups:
+                for param in group.get("params", []):
+                    if id(param) in model_params:
+                        return True
+        except Exception:  # pragma: no cover - defensive
+            return False
+        return False
 
     def keyed_dataloaders(self) -> List[tuple]:
         return self._keyed(self.dataloaders, self.fingerprint_dataloader)
@@ -327,6 +393,7 @@ class ObjectRegistry:
             "schedulers": {},
             "scalers": {},
             "dataloaders": {},
+            "sharded": {},
         }
 
         for key, model in self.keyed_models():
@@ -334,6 +401,18 @@ class ObjectRegistry:
 
         for key, optimizer in self.keyed_optimizers():
             state["optimizers"][key] = optimizer.state_dict()
+
+        # Sharded models go through a collective gather, so this must run on
+        # every rank even though only rank 0 will write the result.
+        for key, model, optimizers in self.sharded_groups():
+            model_state, optimizer_state = gather_sharded_state(model, optimizers)
+            state["sharded"][key] = {
+                "model": model_state,
+                "optimizer": optimizer_state,
+                # Recorded so a resume can say *what* changed rather than
+                # failing with a shape error deep inside set_state_dict.
+                "parameters": sorted(model_state.keys()),
+            }
 
         for index, scheduler in enumerate(self.schedulers):
             try:
@@ -411,6 +490,23 @@ class ObjectRegistry:
                 continue
             optimizer.load_state_dict(saved_optimizers[key])
 
+        saved_sharded = state.get("sharded", {})
+        for key, model, optimizers in self.sharded_groups():
+            saved = saved_sharded.get(key)
+            if saved is None:
+                logger.warning(
+                    "No saved state for sharded model %s - it keeps its initial "
+                    "weights",
+                    key,
+                )
+                continue
+            expected = saved.get("parameters")
+            if expected is not None:
+                self._warn_on_parameter_mismatch(key, model, expected)
+            # Collective: every rank has to reach this, which it does because
+            # the resume fires from DataLoader.__iter__ on all of them.
+            apply_sharded_state(model, optimizers, saved["model"], saved["optimizer"])
+
         saved_schedulers = state.get("schedulers", {})
         for index, scheduler in enumerate(self.schedulers):
             key = f"sched_{index}"
@@ -443,6 +539,37 @@ class ObjectRegistry:
                 self._restore_rng(torch, rng)
 
         self.resumed = True
+
+    @staticmethod
+    def _warn_on_parameter_mismatch(key: str, model: Any, expected: List[str]) -> None:
+        """Report an architecture change before set_state_dict trips over it.
+
+        Sharded keys are positional, so a changed model still matches by key and
+        the failure would otherwise surface as an opaque shape error from deep
+        inside the loading machinery.
+        """
+        try:
+            current = {_clean_fqn(name) for name, _ in model.named_parameters()}
+        except Exception:  # pragma: no cover - defensive
+            return
+
+        wanted = {_clean_fqn(name) for name in expected}
+        if current == wanted:
+            return
+
+        # Only shout when the difference is real. Wrapper infixes vary between
+        # FSDP1, FSDP2 and activation checkpointing, and _clean_fqn cannot know
+        # every one of them; a warning on every resume would train the user to
+        # ignore it.
+        if len(current) != len(wanted) or not (current & wanted):
+            logger.warning(
+                "Sharded model %s does not look like the checkpoint "
+                "(%d parameters now, %d saved). If the architecture changed, "
+                "loading is about to fail.",
+                key,
+                len(current),
+                len(wanted),
+            )
 
     def apply_pending_rng(self) -> bool:
         """Apply an RNG state held back by ``restore_state(defer_rng=True)``."""

@@ -60,6 +60,92 @@ def barrier() -> None:
         dist.barrier()
 
 
+def process_group_alive() -> bool:
+    """Whether collectives can still be issued.
+
+    Checked before any gather: user code often calls
+    ``dist.destroy_process_group()`` before the interpreter exits, and a
+    collective issued after that either raises or hangs.
+    """
+    dist = _dist()
+    return dist is not None and dist.is_available() and dist.is_initialized()
+
+
+def is_sharded(model) -> bool:
+    """Whether this model's parameters are split across ranks.
+
+    Covers both generations: FSDP1 wraps modules in
+    ``FullyShardedDataParallel``, while FSDP2's ``fully_shard`` leaves the
+    module in place and turns its parameters into ``DTensor``s. Either way an
+    ordinary ``state_dict()`` yields this rank's shard, which is useless on its
+    own.
+    """
+    try:
+        import torch
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+    # FSDP2 / any DTensor-parameterised module.
+    try:
+        from torch.distributed.tensor import DTensor
+
+        for param in model.parameters():
+            if isinstance(param, DTensor):
+                return True
+            break  # one parameter is enough to tell
+    except Exception:
+        pass
+
+    # FSDP1, whether the root is wrapped or only some submodules are.
+    try:
+        from torch.distributed.fsdp import FullyShardedDataParallel
+
+        if isinstance(model, FullyShardedDataParallel):
+            return True
+        for module in model.modules():
+            if isinstance(module, FullyShardedDataParallel):
+                return True
+    except Exception:
+        pass
+
+    return False
+
+
+def gather_sharded_state(model, optimizers):
+    """Gather a sharded model and its optimizers into full CPU tensors.
+
+    **Collective.** Every rank must call this, at the same point, or the ones
+    that do will wait forever for the ones that did not.
+
+    The result is a full, unsharded state dict, which is what makes the
+    checkpoint independent of the topology that wrote it: a run sharded over
+    eight GPUs can be resumed on one. The cost is a gather and the peak memory
+    that comes with it, which is why ``cpu_offload`` is on.
+    """
+    from torch.distributed.checkpoint.state_dict import StateDictOptions, get_state_dict
+
+    options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+    return get_state_dict(model, list(optimizers), options=options)
+
+
+def apply_sharded_state(model, optimizers, model_state, optimizer_state) -> None:
+    """Scatter a full state dict back onto a sharded model. **Collective.**
+
+    Every rank passes the full state it read from storage, so no broadcast is
+    needed — the ranks are reading identical bytes from the same checkpoint.
+    """
+    from torch.distributed.checkpoint.state_dict import StateDictOptions, set_state_dict
+
+    options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+    set_state_dict(
+        model,
+        list(optimizers),
+        model_state_dict=model_state,
+        optim_state_dict=optimizer_state,
+        options=options,
+    )
+
+
 def unwrap_model(model):
     """Strip DDP / FSDP / compile wrappers to reach the user's module.
 

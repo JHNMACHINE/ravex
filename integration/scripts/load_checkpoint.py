@@ -26,11 +26,20 @@ def main():
         raise SystemExit("no checkpoint found")
 
     state = torch.load(files[-1], map_location="cpu", weights_only=False)
-    models = state["models"]
+
+    # DDP stores the model under "models"; FSDP under "sharded", already
+    # gathered. Either way what comes out has to be an ordinary state dict.
+    models = dict(state["models"])
+    for key, group in state.get("sharded", {}).items():
+        models[key] = group["model"]
+
     if len(models) != 1:
         raise SystemExit(f"expected exactly one model, got {list(models)}")
 
     state_dict = next(iter(models.values()))
+    for name, value in state_dict.items():
+        if not isinstance(value, torch.Tensor) or value.__class__ is not torch.Tensor:
+            raise SystemExit(f"{name} is a {type(value).__name__}, not a plain tensor")
     for key in state_dict:
         if key.startswith("module.") or key.startswith("_orig_mod."):
             raise SystemExit(f"wrapper prefix leaked into the checkpoint: {key}")

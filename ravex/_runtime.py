@@ -251,9 +251,15 @@ class RavexRuntime:
         writes in the background, so what the loop actually pays for is the
         copy, not the I/O.
         """
-        if not self._enabled or not is_main_process():
+        if not self._enabled:
             return False
-        if not self._ensure_backend():
+
+        # With a sharded model, collecting is a collective: every rank has to
+        # call it or the ones that do will block forever waiting for the ones
+        # that did not. So the rank gate moves *after* collection — every rank
+        # gathers, only rank 0 writes.
+        sharded = self.registry.has_sharded_models()
+        if not sharded and not is_main_process():
             return False
 
         step = self.registry.step_count
@@ -263,6 +269,12 @@ class RavexRuntime:
         started = time.perf_counter()
         try:
             state = self.registry.collect_state(track_rng=self.config.track_rng)
+
+            if not is_main_process():
+                self._last_saved_step = step
+                return False
+            if not self._ensure_backend():
+                return False
             metadata = {
                 "step": str(step),
                 "framework": self._framework,
@@ -323,6 +335,27 @@ class RavexRuntime:
         except (ValueError, OSError) as exc:  # pragma: no cover - platform dependent
             logger.debug("Could not install SIGTERM handler: %s", exc)
 
+    def _final_checkpoint_is_safe(self) -> bool:
+        """Whether a last checkpoint can be taken without risking a hang.
+
+        For a sharded model this needs a collective, and shutdown is precisely
+        when ranks stop being in lockstep: user code may already have called
+        ``destroy_process_group``, or one rank may exit ahead of the others. A
+        rank waiting on a gather that nobody else will join hangs until
+        something kills it.
+
+        Losing the last few steps is a known, bounded cost. A hang is not, so
+        with sharded models the periodic cadence is what you get.
+        """
+        if not self.registry.has_sharded_models():
+            return True
+        logger.info(
+            "Skipping the final checkpoint: the model is sharded and a gather "
+            "at shutdown can hang. Last periodic checkpoint stands at step %s.",
+            self._last_saved_step,
+        )
+        return False
+
     def shutdown(self) -> None:
         """Final checkpoint plus flush. Safe to call more than once."""
         with self._lock:
@@ -335,6 +368,7 @@ class RavexRuntime:
                 self.config.checkpoint_on_exit
                 and self.registry.step_count > 0
                 and self.registry.step_count != self._last_saved_step
+                and self._final_checkpoint_is_safe()
             ):
                 self.checkpoint(final=True)
             if self._backend is not None:
