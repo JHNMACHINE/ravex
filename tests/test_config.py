@@ -123,3 +123,29 @@ def test_nonsense_values_fall_back_to_defaults(
 def test_run_id_becomes_the_storage_prefix(monkeypatch):
     monkeypatch.setenv("RAVEX_RUN_ID", "run-123")
     assert RavexConfig.load().storage.prefix == "run-123"
+
+
+def test_sharded_checkpoints_defaults_to_gathering():
+    """Per-rank checkpoints give up resuming at a different number of GPUs.
+    That is not something to acquire by upgrading."""
+    assert RavexConfig.load().sharded_checkpoints == "gather"
+
+
+def test_sharded_checkpoints_reads_yaml_and_env(tmp_path, monkeypatch):
+    path = tmp_path / "ravex.yaml"
+    path.write_text("sharded_checkpoints: per_rank\n", encoding="utf-8")
+    monkeypatch.setenv("RAVEX_CONFIG", str(path))
+    assert RavexConfig.load().sharded_checkpoints == "per_rank"
+
+    monkeypatch.setenv("RAVEX_SHARDED_CHECKPOINTS", "PER_RANK")
+    assert RavexConfig.load().sharded_checkpoints == "per_rank"
+
+
+def test_an_unknown_sharded_mode_falls_back_and_says_so(tmp_path, monkeypatch):
+    path = tmp_path / "ravex.yaml"
+    path.write_text("sharded_checkpoints: per-rank\n", encoding="utf-8")
+    monkeypatch.setenv("RAVEX_CONFIG", str(path))
+
+    config = RavexConfig.load()
+    assert config.sharded_checkpoints == "gather", "a typo must not silently shard"
+    assert any("sharded_checkpoints" in problem for problem in config.problems)

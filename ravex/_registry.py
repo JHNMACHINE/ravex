@@ -25,9 +25,13 @@ from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Set
 
 from ravex._distributed import (
+    apply_local_sharded_state,
     apply_sharded_state,
     gather_sharded_state,
+    get_rank,
+    get_world_size,
     is_sharded,
+    local_sharded_state,
     unwrap_model,
 )
 
@@ -375,13 +379,19 @@ class ObjectRegistry:
 
     # ─── state ──────────────────────────────────────────────────────
 
-    def collect_state(self, track_rng: bool = True) -> Dict[str, Any]:
+    def collect_state(
+        self, track_rng: bool = True, sharded_layout: str = "gather"
+    ) -> Dict[str, Any]:
         """Snapshot everything needed to restart this run.
 
         Runs on the training thread, synchronously: the returned structure must
         be consistent with the step that just finished, and the background
         writer must not read tensors while the next step mutates them. The
         backend takes its own copy before returning.
+
+        ``sharded_layout`` picks how FSDP state is taken — ``gather`` collects
+        it all on rank 0, ``per_rank`` leaves each rank holding its own shard.
+        See :mod:`ravex._distributed`.
         """
         import torch
 
@@ -402,16 +412,27 @@ class ObjectRegistry:
         for key, optimizer in self.keyed_optimizers():
             state["optimizers"][key] = optimizer.state_dict()
 
-        # Sharded models go through a collective gather, so this must run on
-        # every rank even though only rank 0 will write the result.
-        for key, model, optimizers in self.sharded_groups():
-            model_state, optimizer_state = gather_sharded_state(model, optimizers)
+        # Sharded models go through a collective either way, so this must run
+        # on every rank — under `gather` even though only rank 0 will write the
+        # result, under `per_rank` because every rank writes its own.
+        groups = self.sharded_groups()
+        layout = self.sharded_layout(sharded_layout)
+        for key, model, optimizers in groups:
+            if layout == "per_rank":
+                model_state, optimizer_state = local_sharded_state(model, optimizers)
+            else:
+                model_state, optimizer_state = gather_sharded_state(model, optimizers)
             state["sharded"][key] = {
                 "model": model_state,
                 "optimizer": optimizer_state,
                 # Recorded so a resume can say *what* changed rather than
                 # failing with a shape error deep inside set_state_dict.
                 "parameters": sorted(model_state.keys()),
+                "layout": layout,
+                # Per-rank shards only mean anything at the topology that wrote
+                # them, so the topology is part of the checkpoint.
+                "world_size": get_world_size(),
+                "rank": get_rank(),
             }
 
         for index, scheduler in enumerate(self.schedulers):
@@ -435,6 +456,55 @@ class ObjectRegistry:
             state["rng"] = self._collect_rng(torch)
 
         return state
+
+    def sharded_layout(self, requested: str) -> str:
+        """Settle on one layout for every sharded group in this checkpoint.
+
+        All-or-nothing, and decided before anything is collected. Per group,
+        one gathering and one keeping its shard would give a checkpoint that is
+        partly topology-independent and partly not, and rank 0 would be storing
+        its own shard as if it were the whole tensor — wrong in a way nothing
+        downstream could notice.
+
+        The test is local and structural (are the parameters DTensors?), so
+        every rank reaches the same answer without communicating and the
+        collectives that follow still line up. It also decides where the
+        checkpoint is written, which is why the runtime asks the same question
+        before it opens a backend.
+        """
+        groups = self.sharded_groups()
+        if requested != "per_rank" or not groups:
+            return "gather"
+
+        from ravex._distributed import _dtensor_class
+
+        DTensor = _dtensor_class()
+        if DTensor is None:
+            self._warn_once(
+                "no-dtensor",
+                "sharded_checkpoints=per_rank needs DTensor support in torch - "
+                "gathering on rank 0 instead",
+            )
+            return "gather"
+
+        for key, model, _ in groups:
+            if not any(isinstance(p, DTensor) for p in model.parameters()):
+                self._warn_once(
+                    "not-dtensor-backed:%s" % key,
+                    "Sharded group %s is not DTensor-backed (FSDP1 with "
+                    "use_orig_params=False?) - gathering on rank 0 instead" % key,
+                )
+                return "gather"
+        return "per_rank"
+
+    def _warn_once(self, key: str, message: str) -> None:
+        """Log once per reason. This runs on every checkpoint and every resume,
+        and the same downgrade repeated 500 times buries whatever comes next."""
+        seen = self.__dict__.setdefault("_warned", set())
+        if key in seen:
+            return
+        seen.add(key)
+        logger.warning("%s", message)
 
     @staticmethod
     def _collect_rng(torch) -> Dict[str, Any]:
@@ -500,7 +570,30 @@ class ObjectRegistry:
                 self._warn_on_parameter_mismatch(key, model, expected)
             # Collective: every rank has to reach this, which it does because
             # the resume fires from DataLoader.__iter__ on all of them.
-            apply_sharded_state(model, optimizers, saved["model"], saved["optimizer"])
+            if saved.get("layout") == "per_rank":
+                written_by = int(saved.get("world_size", 0))
+                if written_by != get_world_size():
+                    # Every rank reads the same world_size out of its own
+                    # checkpoint and compares it against the same live one, so
+                    # they all skip together and no collective is stranded.
+                    logger.warning(
+                        "Sharded group %s was written per-rank by a %d-rank run "
+                        "and this run has %d. Per-rank shards cannot be "
+                        "reshaped; skipping it. Write with "
+                        "sharded_checkpoints=gather to resume at a different "
+                        "world size.",
+                        key,
+                        written_by,
+                        get_world_size(),
+                    )
+                    continue
+                apply_local_sharded_state(
+                    model, optimizers, saved["model"], saved["optimizer"]
+                )
+            else:
+                apply_sharded_state(
+                    model, optimizers, saved["model"], saved["optimizer"]
+                )
 
         self._bridge_topologies(
             unmatched_models,

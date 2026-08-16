@@ -30,6 +30,7 @@ ravex status
 | `compression` | `RAVEX_COMPRESSION` | `zstd` | `zstd` or `none`. |
 | `compression_level` | `RAVEX_COMPRESSION_LEVEL` | `3` | zstd level. |
 | `keep_last` | `RAVEX_KEEP_LAST` | `5` | Checkpoints to retain. Older ones are deleted. |
+| `sharded_checkpoints` | `RAVEX_SHARDED_CHECKPOINTS` | `gather` | How FSDP state is written: `gather` or `per_rank`. See [Sharded models](#sharded-models). |
 | `track_dataloaders` | `RAVEX_TRACK_DATALOADERS` | `true` | Track and restore the dataset position. |
 | `track_rng` | `RAVEX_TRACK_RNG` | `true` | Save and restore torch / CUDA / Python / NumPy RNG state. |
 | `handle_sigterm` | `RAVEX_HANDLE_SIGTERM` | `true` | Checkpoint on SIGTERM — the signal a preempted spot instance receives. Only installed if nothing else has claimed the signal. |
@@ -37,6 +38,47 @@ ravex status
 | `log_file` | `RAVEX_LOG_FILE` | `null` | Log destination. Unset means stderr, WARNING and above only. |
 | `log_level` | `RAVEX_LOG_LEVEL` | `INFO` | |
 | `run_id` | `RAVEX_RUN_ID` | `null` | Recorded in checkpoint metadata; also used as the storage prefix when none is set. |
+
+### Sharded models
+
+With FSDP each rank holds a slice of every parameter and of the optimizer
+moments beside it. There are two ways to turn that into a checkpoint, and they
+trade against each other.
+
+**`gather`** (default) collects the whole unsharded state on rank 0, which
+writes it. The checkpoint is then independent of the topology that produced
+it — eight GPUs in, one out — and it does not scale. Measured on 8× RTX 5060 Ti
+with a 1.48B model and Adam:
+
+| | |
+|---|---|
+| gather (16.5 GiB: 5.5 model + 11 optimizer) | 14.2 s (FSDP2), 18.3 s (FSDP1) |
+| peak RSS on rank 0 | 18.1 GiB — the entire state |
+
+At that cost a checkpoint is permanently in flight: with `checkpoint_every: 2`
+and steps of about a second, a crash at step 7 resumed from step 2. The gather
+also puts the device→host copy inside torch rather than Moonclip, so the pinned
+staging path (7.3× on the single-GPU stall) never runs.
+
+**`per_rank`** has every rank write its own shard into its own store,
+`<storage.path>/rank_<n>` (and the same suffix on `storage.prefix` for a remote
+store). Nothing is gathered, so nothing is bounded by one rank's memory, and
+each rank keeps its own background writer, delta chain and retention.
+
+What you give up is the resharding. Per-rank shards are cut for one topology
+and compose into nothing on another, so the checkpoint only resumes at the same
+world size with the same sharding. Resuming at a different one starts the run
+clean — on *every* rank, deliberately: a resume that half the ranks complete
+leaves the others in collectives nobody joins.
+
+Two further consequences worth knowing:
+
+- Ranks write independently, so a kill can leave rank 3 holding step 8 and rank
+  5 only step 6. On resume the ranks agree on the newest step *all* of them
+  have and load that one.
+- `per_rank` needs DTensor-backed shards — FSDP2, or FSDP1 with
+  `use_orig_params=True`. Anything else falls back to `gather` with a warning
+  rather than writing something unreadable.
 
 ### Storage
 

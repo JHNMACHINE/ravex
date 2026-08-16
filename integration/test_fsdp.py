@@ -149,6 +149,105 @@ def test_a_sharded_run_resumes_in_an_unsharded_one(fsdp_workspace):
         )
 
 
+# ─── per-rank checkpoints ──────────────────────────────────────────
+#
+# The other half of the trade. Gathering puts the whole state through rank 0 —
+# 14.2 s and 18.1 GiB for a 1.48B model on 8 GPUs — and buys a checkpoint that
+# resumes at any world size. Per-rank writes nothing but each rank's own shard,
+# gathers nothing, and buys a checkpoint that only resumes at the world size
+# that wrote it.
+
+
+@pytest.fixture
+def per_rank_workspace(workspace):
+    return lambda name: workspace(
+        name, max_steps=TOTAL_STEPS, sharded_checkpoints="per_rank"
+    )
+
+
+def rank_checkpoint(directory, rank):
+    files = sorted(glob.glob(str(directory / "checkpoints" / f"rank_{rank}" / "step_*.pt")))
+    assert files, f"rank {rank} wrote no checkpoint"
+    return torch.load(files[-1], map_location="cpu", weights_only=False)
+
+
+def test_every_rank_writes_its_own_shard_to_its_own_store(per_rank_workspace):
+    directory = per_rank_workspace("fsdp-per-rank-shapes")
+    result = torchrun(directory, "train_fsdp.py", epochs=3)
+    assert result.returncode == 0, result.stderr
+
+    for rank in (0, 1):
+        state = rank_checkpoint(directory, rank)
+        group = state["sharded"]["sharded_0"]
+        assert group["layout"] == "per_rank"
+        assert group["world_size"] == 2
+        assert group["rank"] == rank
+
+        # Linear(6, 12) over two ranks: (12, 6) whole, (6, 6) per rank. Storing
+        # the shard is the entire point — the gathered path stores (12, 6) and
+        # pays a collective and rank 0's memory for it.
+        weight = group["model"]["0.weight"]
+        assert weight["__ravex_shard__"] == 1
+        assert tuple(weight["local"].shape) == (6, 6)
+        assert weight["global_shape"] == [12, 6]
+
+    # Nothing gathered means nothing for one rank to hold on behalf of the
+    # others: two stores, not one shared one.
+    assert not glob.glob(str(directory / "checkpoints" / "step_*.pt"))
+
+
+def test_a_killed_per_rank_run_resumes_on_every_rank(per_rank_workspace):
+    reference = per_rank_workspace("fsdp-per-rank-reference")
+    assert torchrun(reference, "train_fsdp.py").returncode == 0
+    expected = losses(read_trace(reference))
+    assert len(expected) == TOTAL_STEPS
+
+    run = per_rank_workspace("fsdp-per-rank-interrupted")
+    killed = torchrun(run, "train_fsdp.py", die_at=CRASH_AT)
+    assert killed.returncode != 0, "expected the run to die"
+    assert losses(read_trace(run)) == expected[:CRASH_AT]
+
+    restarted = torchrun(run, "train_fsdp.py", trace_name="trace2.jsonl")
+    assert restarted.returncode == 0, restarted.stderr
+
+    after = losses(read_trace(run, "trace2.jsonl"))
+    assert after == expected[RESUME_FROM - 1 :], (
+        "a resumed per-rank run must reproduce the uninterrupted one exactly — "
+        "each rank puts back its own shard, and together they have to be the "
+        "same model the gathered path would have restored"
+    )
+
+
+def test_a_per_rank_checkpoint_is_not_half_applied_at_another_world_size(
+    per_rank_workspace,
+):
+    """The cost of not gathering, at the place someone will hit it.
+
+    A per-rank checkpoint is a set of shards cut for one topology; on another
+    one they compose into nothing. Two ranks wrote two stores, so of four ranks
+    two find a checkpoint and two find none — and the wrong outcome is not "no
+    resume", it is *half* a resume: two ranks restoring while two start from
+    random weights, which trains happily and converges to nothing.
+
+    Starting clean everywhere is the only correct answer, and the ranks have to
+    reach it together.
+    """
+    directory = per_rank_workspace("fsdp-per-rank-reshard")
+    assert torchrun(directory, "train_fsdp.py", epochs=3).returncode == 0
+    assert rank_checkpoint(directory, 0), "the 2-rank run wrote nothing to resume from"
+
+    wider = torchrun(
+        directory, "train_fsdp.py", ranks=4, epochs=2, trace_name="wide.jsonl"
+    )
+    assert wider.returncode == 0, wider.stderr
+
+    log = (directory / "ravex.log").read_text()
+    assert "Resumed at step" not in log, (
+        "some rank restored a checkpoint cut for a different world size\n" + log
+    )
+    assert "starting from scratch" in log
+
+
 def test_an_fsdp_checkpoint_loads_into_a_plain_model(fsdp_workspace):
     directory = fsdp_workspace("fsdp-portable")
     assert torchrun(directory, "train_fsdp.py", epochs=3).returncode == 0

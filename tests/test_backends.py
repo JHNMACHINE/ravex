@@ -90,3 +90,70 @@ def test_moonclip_backend_writes_under_a_torchrun_environment(
         sample_state()["models"]["model_a"]["weight"],
     )
     backend.close()
+
+
+# ─── per-rank stores ────────────────────────────────────────────────
+
+
+def test_per_rank_gives_each_rank_a_store_of_its_own(tmp_path, monkeypatch):
+    """Pointed at one store, N ranks are N writers against one manifest, each
+    reading it, adding itself and writing it back with nothing between them."""
+    monkeypatch.setenv("RANK", "3")
+    monkeypatch.setenv("WORLD_SIZE", "8")
+
+    config = make_config(tmp_path, backend="torch_save")
+    config.storage.prefix = "run-a"
+
+    shared = get_backend(config, per_rank=False)
+    assert shared.directory == str(tmp_path / "checkpoints")
+    shared.close()
+
+    mine = get_backend(config, per_rank=True)
+    assert mine.directory == str(tmp_path / "checkpoints" / "rank_3")
+    mine.close()
+
+    # The remote side has to split too, or eight ranks would sync eight
+    # different local stores onto one prefix in the bucket.
+    from ravex._backends import _per_rank_config
+
+    assert _per_rank_config(config, True).storage.prefix == "run-a/rank_3"
+
+
+def test_a_backend_can_be_asked_for_a_specific_step(tmp_path):
+    """Per-rank resume needs a step every rank holds, which is not always the
+    newest one any of them has."""
+    backend = TorchSaveBackend(make_config(tmp_path, backend="torch_save"))
+    assert backend.latest_step() is None
+
+    for step in (4, 8, 12):
+        backend.save(step, sample_state(step), {"step": str(step)})
+        backend.flush()
+
+    assert backend.latest_step() == 12
+    assert backend.load_step(8)["step"] == 8
+    assert backend.load_step(9) is None
+    backend.close()
+
+
+@pytest.mark.skipif(not HAVE_MOONCLIP, reason="moonclip not installed")
+def test_moonclip_can_be_asked_for_a_specific_step(tmp_path):
+    """The same question against the default backend, where a snapshot is
+    addressed by id and the step is metadata rather than a filename."""
+    from ravex._backends import MoonclipBackend
+
+    backend = MoonclipBackend(make_config(tmp_path, backend="moonclip"))
+    assert backend.latest_step() is None
+
+    for step in (4, 8, 12):
+        backend.save(step, sample_state(step), {"step": str(step)})
+    backend.flush()
+
+    assert backend.latest_step() == 12
+    loaded = backend.load_step(8)
+    assert loaded["step"] == 8
+    assert torch.equal(
+        loaded["models"]["model_a"]["weight"],
+        sample_state()["models"]["model_a"]["weight"],
+    )
+    assert backend.load_step(9) is None
+    backend.close()

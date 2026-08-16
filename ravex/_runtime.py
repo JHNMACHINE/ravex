@@ -125,13 +125,26 @@ class RavexRuntime:
         if not self._enabled:
             return False
         try:
-            self._backend = get_backend(self.config)
+            self._backend = get_backend(self.config, per_rank=self._per_rank_active())
             self._resume_manager = ResumeManager(self._backend, self.registry)
         except Exception as exc:
             logger.error("Could not open the checkpoint backend: %s", exc)
             self._disable("backend unavailable")
             return False
         return True
+
+    def _per_rank_active(self) -> bool:
+        """Whether this run really is checkpointing per rank.
+
+        Asking the config is not enough: ``per_rank`` downgrades to a gather
+        for a model whose shards are not DTensors, and then rank 0 is again the
+        only writer. Store layout and write path have to agree — a rank writing
+        into ``rank_3/`` that never writes leaves a store the resume will find
+        empty — so both ask the registry the same structural question.
+        """
+        if self.config.sharded_checkpoints != "per_rank" or get_world_size() <= 1:
+            return False
+        return self.registry.sharded_layout("per_rank") == "per_rank"
 
     def _disable(self, reason: str) -> None:
         if not self._enabled:
@@ -253,7 +266,9 @@ class RavexRuntime:
             # Anything the loading machinery does to the optimizer is not
             # training; see the guard in on_step.
             self._restoring = True
-            self._resume_manager.try_resume(defer_rng=defer_rng)
+            self._resume_manager.try_resume(
+                defer_rng=defer_rng, per_rank=self._per_rank_active()
+            )
         except Exception as exc:
             logger.warning("Resume failed (%s) - starting from scratch", exc)
         finally:
@@ -286,9 +301,18 @@ class RavexRuntime:
 
         started = time.perf_counter()
         try:
-            state = self.registry.collect_state(track_rng=self.config.track_rng)
+            state = self.registry.collect_state(
+                track_rng=self.config.track_rng,
+                sharded_layout=self.config.sharded_checkpoints,
+            )
 
-            if not is_main_process():
+            # Under `per_rank` there is nothing on rank 0 to write for the
+            # other ranks — each holds its own shard and writes it into its own
+            # store. The layout is read back from what was collected rather
+            # than from the config: the registry downgrades to a gather when
+            # the model cannot be split that way, and then rank 0 is once again
+            # the only one holding anything.
+            if not self._collected_per_rank(state) and not is_main_process():
                 self._last_saved_step = step
                 return False
             if not self._ensure_backend():
@@ -317,6 +341,19 @@ class RavexRuntime:
             time.perf_counter() - started,
         )
         return True
+
+    @staticmethod
+    def _collected_per_rank(state: dict) -> bool:
+        """Whether every sharded group in this state is one rank's own shard.
+
+        All-or-nothing by construction (see ``_sharded_layout``); read as a
+        conjunction anyway, because the one thing that must never happen is a
+        rank writing a checkpoint it only holds part of.
+        """
+        groups = state.get("sharded") or {}
+        return bool(groups) and all(
+            group.get("layout") == "per_rank" for group in groups.values()
+        )
 
     def flush(self) -> None:
         if self._backend is not None:

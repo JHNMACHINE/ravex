@@ -45,6 +45,19 @@ class CheckpointBackend(ABC):
     def load_latest(self) -> Optional[Dict[str, Any]]:
         """Return the most recent checkpoint, or None if there is none."""
 
+    def latest_step(self) -> Optional[int]:
+        """Step of the newest stored checkpoint, without loading its tensors."""
+        return None
+
+    def load_step(self, step: int) -> Optional[Dict[str, Any]]:
+        """Return the checkpoint written at ``step``, or None.
+
+        Only per-rank checkpointing needs this: the ranks have to agree on a
+        step every one of them holds, and "the latest" is not that step when a
+        kill landed between two ranks' writes.
+        """
+        return None
+
     @abstractmethod
     def has_checkpoint(self) -> bool:
         """Whether a resumable checkpoint exists. Cheap; no tensor loading."""
@@ -165,6 +178,30 @@ class MoonclipBackend(CheckpointBackend):
             return None
         return state
 
+    def latest_step(self) -> Optional[int]:
+        try:
+            snapshots = self._manager.list_snapshots()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Could not list snapshots: %s", exc)
+            return None
+        steps = [int(s["step"]) for s in snapshots if s.get("step") is not None]
+        return max(steps) if steps else None
+
+    def load_step(self, step: int) -> Optional[Dict[str, Any]]:
+        try:
+            snapshots = self._manager.list_snapshots()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Could not list snapshots: %s", exc)
+            return None
+        # Newest first: a step can appear more than once if a run was restarted
+        # and rewrote it, and the last write is the one that counts.
+        for snapshot in reversed(snapshots):
+            if int(snapshot.get("step", -1)) != step:
+                continue
+            loaded = self._manager.load(snapshot["id"])
+            return loaded.get(_PREFIX)
+        return None
+
     def has_checkpoint(self) -> bool:
         try:
             return bool(self._manager.list_snapshots())
@@ -276,6 +313,22 @@ class TorchSaveBackend(CheckpointBackend):
         state.pop("_ravex_metadata", None)
         return state
 
+    def latest_step(self) -> Optional[int]:
+        files = self._files()
+        if not files:
+            return None
+        return int(_STEP_FILE.search(files[-1]).group(1))
+
+    def load_step(self, step: int) -> Optional[Dict[str, Any]]:
+        import torch
+
+        path = os.path.join(self.directory, f"step_{step:012d}.pt")
+        if not os.path.exists(path):
+            return None
+        state = torch.load(path, map_location="cpu", weights_only=False)
+        state.pop("_ravex_metadata", None)
+        return state
+
     def has_checkpoint(self) -> bool:
         return bool(self._files())
 
@@ -292,13 +345,52 @@ class TorchSaveBackend(CheckpointBackend):
 # ─── selection ──────────────────────────────────────────────────────
 
 
-def get_backend(config) -> CheckpointBackend:
+def _per_rank_config(config, per_rank: bool):
+    """Give this rank a store of its own, under ``rank_<n>``.
+
+    Per-rank checkpointing has every rank writing at once. Pointed at one
+    store they would be N writers against one manifest, each reading it,
+    adding itself and writing it back with no lock between them — a lost
+    update every time two land together. Separate stores need no coordination
+    at all, and each rank keeps the background writer, the delta chain and the
+    retention it would have had on its own.
+
+    The cost is N manifests, and a resume that has to agree on a step (see
+    ``agree_on_step``).
+    """
+    from dataclasses import replace
+
+    from ravex._distributed import get_rank
+
+    if not per_rank:
+        return config
+
+    suffix = "rank_%d" % get_rank()
+    storage = replace(
+        config.storage,
+        path=os.path.join(config.storage.path, suffix),
+        prefix=(
+            "%s/%s" % (config.storage.prefix.rstrip("/"), suffix)
+            if config.storage.prefix
+            else suffix
+        ),
+    )
+    return replace(config, storage=storage)
+
+
+def get_backend(config, per_rank: bool = False) -> CheckpointBackend:
     """Build the configured backend, falling back to ``torch_save``.
 
     A missing or broken Moonclip must never stop a training run: the whole
     proposition is that Ravex is invisible when it works and harmless when
     it does not.
+
+    ``per_rank`` gives this rank a store of its own. The caller decides, not
+    the config: whether per-rank checkpointing is actually in force depends on
+    the model as well as the setting, and the store has to match what gets
+    written into it.
     """
+    config = _per_rank_config(config, per_rank)
     name = config.backend
 
     if name == "moonclip":
