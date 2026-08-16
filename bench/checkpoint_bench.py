@@ -104,14 +104,21 @@ def measure_backends(model, optimizer, hidden, device, root, repeats=4, between=
     tensor incompressible - which would measure nothing except how well zstd
     handles entropy.
 
-    Three writers, because two of them are Ravex's options and the third is
-    what Moonclip can do when it is handed tensors instead of bytes:
+    Three writers:
 
     - ``torch.save``      what the fallback backend does
-    - ``moonclip/bytes``  what Ravex's Moonclip backend does today, via
-                          flatten_state_dict
+    - ``moonclip/bytes``  flatten_state_dict to bytes, which is what the
+                          Moonclip backend did before it passed tensors
     - ``moonclip/native`` CheckpointManager.save(model=...), which passes
-                          tensors straight through to Rust
+                          tensors straight through to Rust — the same handoff
+                          the backend takes today
+
+    Each writer is timed only once every other writer is idle. Moonclip's
+    background save is a full core-saturating zstd pass, and its `submit`
+    blocks on the previous one, so timing a writer while another is still
+    draining measures the drain. That is not a small effect: it is what made
+    an earlier run of this benchmark report the tensor path as the slowest of
+    the three when, measured alone, it is the fastest by 5x.
     """
     results = {}
     paths = {name: Path(root) / name for name in ("torch_save", "moon_bytes", "moon_native")}
@@ -138,19 +145,28 @@ def measure_backends(model, optimizer, hidden, device, root, repeats=4, between=
         train_steps(model, optimizer, hidden, device, between)
         state = model.state_dict()
 
+        if moonclip is not None:
+            bytes_manager.flush()
+            native_manager.flush()
         started = time.perf_counter()
         snapshot = {k: v.detach().to("cpu", copy=True) for k, v in state.items()}
         torch.save(snapshot, paths["torch_save"] / f"step_{index}.pt")
         timings["torch.save"].append(time.perf_counter() - started)
+        del snapshot
 
         if moonclip is None:
             continue
 
+        bytes_manager.flush()
+        native_manager.flush()
         started = time.perf_counter()
         tensors, _ = moonclip.flatten_state_dict(state, "model")
         bytes_manager.save_raw(step=index, tensors=tensors)
         timings["moonclip/bytes"].append(time.perf_counter() - started)
+        del tensors
 
+        bytes_manager.flush()
+        native_manager.flush()
         started = time.perf_counter()
         native_manager.save(step=index, model=model)
         timings["moonclip/native"].append(time.perf_counter() - started)
@@ -211,12 +227,16 @@ def breakdown(model, optimizer, device):
         torch.cuda.synchronize()
     transfer = time.perf_counter() - started
 
-    # 2. host tensors -> bytes, which is what flatten_state_dict does
+    # 2. flattening the state tree, which no longer converts anything: with
+    #    as_tensors the tensors are handed over as they are, so this is dict
+    #    building and should be microseconds. It is timed anyway, because the
+    #    version of this that called .tobytes() cost 484 ms and looked just as
+    #    much like bookkeeping from the outside.
     started = time.perf_counter()
-    tensors, _ = moonclip.flatten_state_dict(on_cpu["model"], "model")
+    tensors, _ = moonclip.flatten_state_dict(on_cpu["model"], "model", as_tensors=True)
     serialise = time.perf_counter() - started
 
-    # 3. handing those bytes to Rust
+    # 3. handing those tensors to Rust — this is where the copy happens now
     root = tempfile.mkdtemp(prefix="ravex_breakdown_")
     try:
         manager = moonclip.CheckpointManager(
@@ -235,8 +255,8 @@ def breakdown(model, optimizer, device):
     print(f"  (measured on the model alone: {human_bytes(model_bytes)})")
     for label, seconds in (
         ("GPU -> CPU copy", transfer),
-        ("CPU tensors -> bytes", serialise),
-        ("hand to Rust", handoff),
+        ("flatten state tree", serialise),
+        ("copy into Rust", handoff),
         ("background write", write),
     ):
         rate = model_bytes / seconds / 1e9 if seconds > 0 else float("inf")
@@ -246,7 +266,8 @@ def breakdown(model, optimizer, device):
     print(f"  {'blocks training':<24}{blocking * 1000:8.1f} ms")
     print(
         f"\n  an async device copy could hide {transfer / blocking:.0%} of that; "
-        f"the remaining {serialise / blocking:.0%} is CPU-side serialisation"
+        f"the remaining {handoff / blocking:.0%} is the shadow copy, which is one "
+        f"pass over memory and has nowhere much left to go"
     )
 
 
