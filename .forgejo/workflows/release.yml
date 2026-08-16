@@ -50,9 +50,20 @@ jobs:
       - name: Check the artifacts before uploading
         run: twine check dist/*
 
-      - name: Publish to Codeberg Packages
+      # PyPI only. Codeberg Packages used to get a copy of the same artifacts,
+      # which bought nothing: identical bytes at an address almost nobody would
+      # point pip at, and a second token to keep alive. Note that
+      # `ravex[moonclip]` resolves its extra from PyPI, so Moonclip has to be
+      # published there before this repository is tagged.
+      - name: Publish to PyPI
         env:
-          TWINE_REPOSITORY_URL: ${{ forgejo.server_url }}/api/packages/${{ forgejo.repository_owner }}/pypi
-          TWINE_USERNAME: ${{ forgejo.repository_owner }}
-          TWINE_PASSWORD: ${{ secrets.PUBLISH_TOKEN }}
-        run: twine upload dist/*
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+        run: |
+          set -eu
+          if [ -z "${TWINE_PASSWORD:-}" ]; then
+            echo "PYPI_TOKEN is not set: a tag was pushed but nothing would" >&2
+            echo "reach PyPI. Add the secret, or remove this step on purpose." >&2
+            exit 1
+          fi
+          twine upload dist/*

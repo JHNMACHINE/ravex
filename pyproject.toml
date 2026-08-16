@@ -27,9 +27,11 @@ classifiers = [
 dependencies = ["PyYAML>=5.1"]
 
 [project.optional-dependencies]
-# 0.0.3 is the first version with the self-describing pack format and the
-# retention fix. The old `>=0.2` was not satisfiable by anything that exists.
-moonclip = ["moonclip>=0.0.3"]
+# 0.0.4, not 0.0.3: that is where `keep_last` stopped erasing the whole
+# checkpoint history instead of trimming it, and a checkpointing library that
+# loses checkpoints is not a floor worth allowing. (The old `>=0.2` was not
+# satisfiable by any version that has ever existed.)
+moonclip = ["moonclip>=0.0.4"]
 dev = ["pytest>=7", "numpy"]
 
 [project.urls]
