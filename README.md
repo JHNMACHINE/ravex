@@ -126,9 +126,25 @@ not:
 
 ## Status and limits
 
-Alpha. Works with plain PyTorch loops, and with anything built on them
-(HuggingFace `Trainer`, Lightning, Accelerate) since the hooks are on PyTorch
-itself.
+Alpha. Works with plain PyTorch loops, and with anything built on them, since
+the hooks are on PyTorch itself.
+
+### With a framework driving the loop
+
+HuggingFace `Trainer` and Lightning are covered by their own tests, and the
+result deserves to be stated precisely rather than as "it works":
+
+- **State restoration is exact.** Model, optimizer, LR scheduler and step count
+  all come back. With the per-step randomness removed, a killed run resumes
+  into a loss sequence identical to the uninterrupted one.
+- **Replay is not.** With shuffling and dropout on, the resumed run continues
+  correctly from the checkpointed state but sees a different draw. Both
+  frameworks iterate the dataloader on their own schedule and consume the
+  global RNG around the loop, so the epoch-start snapshot no longer lines up.
+
+Plain loops, DDP and FSDP *are* bit-exact with randomness on. This is a
+framework-interaction limit, not a general one, and it costs you a different
+shuffle from the resume point onwards — not a wrong model.
 
 Verified: plain loops, gradient accumulation, LR schedulers, AMP loss-scale
 state, `num_workers > 0`, DDP, and FSDP. A killed `torchrun` job resumes on

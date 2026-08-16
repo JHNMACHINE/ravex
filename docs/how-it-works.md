@@ -128,6 +128,28 @@ epoch was drawn from, how many batches were consumed)* and replays. If that
 means skipping a whole epoch, the epoch is skipped in microseconds and training
 continues with the next one.
 
+### The epoch that was already done
+
+When a checkpoint lands on an epoch boundary, the fast-forward skips every
+batch in the next pass, which then yields nothing. That looked harmless and is
+not: an empty pass is a signal frameworks act on. HuggingFace `Trainer` reads
+"no batches this epoch" as an exhausted dataset and stops training on the spot,
+so a resume that happened to land on a boundary ended the run instead of
+continuing it — silently, with a clean exit code.
+
+So the dataloader wrapper rolls straight into the next epoch instead. Two
+details make that correct rather than merely convenient:
+
+It restarts through the loader's own `__iter__`, not by re-iterating the
+sampler. That call draws a worker base seed from the global RNG exactly as the
+original run's next epoch did; imitating it by hand would be one draw off, and
+every dropout mask after the resume would differ.
+
+It also advances the sampler's epoch by hand, and widens the `set_epoch` shift
+to match. A `DistributedSampler` orders its data by epoch number, and the
+rollover runs two epochs inside one turn of the user's loop — without the
+bump it would replay the epoch it just skipped.
+
 ### The RNG draw nobody expects
 
 Building a `DataLoader` iterator draws a worker base seed from the **global**

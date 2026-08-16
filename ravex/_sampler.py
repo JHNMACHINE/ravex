@@ -34,7 +34,7 @@ def _inner_sampler(obj: Any) -> Any:
     return getattr(obj, "sampler", obj)
 
 
-def _install_epoch_offset(inner: Any, offset: int) -> None:
+def _install_epoch_offset(inner: Any, tracked: "TrackedSampler"):
     """Make ``set_epoch()`` continue the run rather than restart it.
 
     ``DistributedSampler`` derives its shuffle purely from ``seed + epoch``, and
@@ -51,21 +51,24 @@ def _install_epoch_offset(inner: Any, offset: int) -> None:
     So the sampler's ``set_epoch`` is shifted by the epoch the checkpoint was
     taken in. The user keeps counting from zero and the data keeps moving
     forward.
+
+    The shift is read from ``tracked`` on every call rather than captured once,
+    because a rollover can consume an epoch the user's loop never counted; see
+    :meth:`TrackedSampler.advance_epoch`.
     """
-    if offset <= 0:
-        return
     original = getattr(inner, "set_epoch", None)
-    if original is None or getattr(original, "_ravex_offset", None) is not None:
-        return
+    if original is None or getattr(original, "_ravex_shifted", False):
+        return original
 
     def set_epoch(epoch, *args, **kwargs):
-        return original(epoch + offset, *args, **kwargs)
+        return original(epoch + tracked.epoch_offset, *args, **kwargs)
 
-    set_epoch._ravex_offset = offset
+    set_epoch._ravex_shifted = True
     try:
         inner.set_epoch = set_epoch
     except AttributeError:  # pragma: no cover - exotic sampler
         logger.warning("Could not shift set_epoch on %r", inner)
+    return original
 
 
 def _ensure_generator(sampler: Any) -> None:
@@ -102,6 +105,14 @@ class TrackedSampler:
         self._epoch_generator_state = None
         self._pending_skip = 0
         self._pending_generator_state = None
+
+        #: True when the last __iter__ fast-forwarded past the end of the
+        #: epoch, so it will yield nothing. Read by the dataloader wrapper.
+        self.skipped_whole_epoch = False
+
+        #: How far the sampler's epoch runs ahead of the user's loop counter.
+        self.epoch_offset = 0
+        self._original_set_epoch = None
 
         _ensure_generator(_inner_sampler(original))
 
@@ -144,6 +155,15 @@ class TrackedSampler:
                 )
                 self._consumed = skipped
 
+            length = self._safe_len()
+            # The checkpoint fell on an epoch boundary, so the skip ate the
+            # whole pass and this iteration will yield nothing. That is not
+            # merely wasted work: an empty pass is a signal frameworks act on -
+            # HuggingFace `Trainer` reads "no batches this epoch" as an
+            # exhausted dataset and stops training outright. The dataloader
+            # wrapper watches this flag and starts the next epoch instead.
+            self.skipped_whole_epoch = length is not None and skipped >= length
+
         yield from iterator
 
         self._epoch_index += 1
@@ -175,6 +195,31 @@ class TrackedSampler:
     def note_consumed(self) -> None:
         """Record that the loop received one more batch."""
         self._consumed += 1
+
+    def advance_epoch(self) -> None:
+        """Account for an epoch the user's loop never counted.
+
+        When a resume lands on an epoch boundary the whole pass is skipped and
+        the dataloader wrapper rolls straight into the next epoch - inside a
+        single turn of the user's ``for epoch in ...`` loop. For a sampler
+        whose order comes from an epoch number rather than a generator
+        (``DistributedSampler``), that pass has to be moved on explicitly, and
+        the shift applied to later ``set_epoch`` calls has to grow with it, or
+        the run replays the epoch it just skipped.
+        """
+        inner = _inner_sampler(self._original)
+        setter = self._original_set_epoch or getattr(inner, "set_epoch", None)
+        if setter is None:
+            return  # order comes from the generator; draining already moved it
+
+        current = getattr(inner, "epoch", None)
+        self.epoch_offset += 1
+        if current is None:
+            return
+        try:
+            setter(int(current) + 1)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Could not advance the sampler epoch: %s", exc)
 
     # ─── state ──────────────────────────────────────────────────────
 
@@ -238,7 +283,9 @@ class TrackedSampler:
             epoch = int(state["sampler_epoch"])
             try:
                 inner.set_epoch(epoch)  # before the shift is installed
-                _install_epoch_offset(inner, epoch)
+                if epoch > 0:
+                    self._original_set_epoch = _install_epoch_offset(inner, self)
+                    self.epoch_offset = epoch
             except Exception as exc:  # pragma: no cover - defensive
                 logger.warning("set_epoch failed during restore: %s", exc)
 

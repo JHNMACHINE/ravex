@@ -200,7 +200,15 @@ class TorchSaveBackend(CheckpointBackend):
         # Serialize writes: two concurrent torch.save calls on one disk are
         # slower than one, and ordering matters for pruning.
         self.flush()
-        self._pending = self._executor.submit(self._write, torch, snapshot, path)
+        try:
+            self._pending = self._executor.submit(self._write, torch, snapshot, path)
+        except RuntimeError:
+            # "cannot schedule new futures after shutdown": concurrent.futures
+            # registers its own atexit hook, and by the time ours runs the pool
+            # is closed. This is the checkpoint_on_exit path - the last one a
+            # normally-finishing run takes - so write it here instead of losing
+            # it. Nothing is racing us: the training loop is over.
+            self._write(torch, snapshot, path)
 
     def _write(self, torch, snapshot: Dict[str, Any], path: str) -> None:
         temporary = path + ".tmp"

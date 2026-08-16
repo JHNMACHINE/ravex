@@ -248,7 +248,10 @@ def _patch_dataloader(patches: PatchSet, registry, runtime, torch) -> None:
         try:
             runtime.after_dataloader_iter()
             return _BatchBoundaryIterator(
-                iterator, runtime, getattr(self, "_ravex_sampler", None)
+                iterator,
+                runtime,
+                getattr(self, "_ravex_sampler", None),
+                restart=lambda loader=self: original_iter(loader),
             )
         except Exception as exc:
             logger.warning("Could not wrap the dataloader iterator: %s", exc)
@@ -276,13 +279,47 @@ class _BatchBoundaryIterator:
     expect.
     """
 
-    def __init__(self, inner, runtime, tracked):
+    def __init__(self, inner, runtime, tracked, restart=None):
         self._inner = inner
         self._runtime = runtime
         self._tracked = tracked
+        self._restart = restart
+        self._yielded = 0
+        self._restarted = False
 
     def __iter__(self):
         return self
+
+    def _roll_into_next_epoch(self):
+        """Start the next epoch when a resume skipped this one entirely.
+
+        A checkpoint taken on an epoch boundary makes the first pass after the
+        resume fast-forward past every batch, so it yields nothing. Frameworks
+        read that as a broken dataset - HuggingFace `Trainer` stops training on
+        the spot - so the wrapper transparently begins the next epoch instead.
+
+        It restarts through the loader's real ``__iter__`` rather than
+        re-iterating the sampler directly. That call draws a worker base seed
+        from the global RNG, exactly as the original run's next epoch did;
+        skipping it would leave the generator one draw behind and change every
+        dropout mask from here on.
+        """
+        if self._restarted or self._restart is None or self._yielded:
+            return False
+        if not getattr(self._tracked, "skipped_whole_epoch", False):
+            return False
+
+        self._restarted = True
+        # A sampler ordered by epoch number rather than by a generator has to
+        # be moved on by hand: the user's loop counted one epoch, we are about
+        # to run two.
+        try:
+            self._tracked.advance_epoch()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Could not advance the sampler epoch: %s", exc)
+
+        self._inner = self._restart()
+        return True
 
     def __next__(self):
         try:
@@ -299,8 +336,14 @@ class _BatchBoundaryIterator:
         except Exception as exc:
             logger.warning("Checkpoint at batch boundary failed: %s", exc)
 
-        batch = next(self._inner)  # StopIteration ends the epoch, as usual
+        try:
+            batch = next(self._inner)  # StopIteration ends the epoch, as usual
+        except StopIteration:
+            if not self._roll_into_next_epoch():
+                raise
+            batch = next(self._inner)
 
+        self._yielded += 1
         if self._tracked is not None:
             self._tracked.note_consumed()
         return batch

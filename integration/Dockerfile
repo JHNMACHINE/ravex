@@ -22,6 +22,13 @@ RUN pip install --no-cache-dir \
         torch==2.8.0 \
     && pip install --no-cache-dir pytest numpy
 
+# The frameworks Ravex claims to support by virtue of hooking PyTorch itself.
+# That claim is an argument until something runs it, and both of these own the
+# training loop and wrap the dataloader in ways plain PyTorch does not.
+# accelerate is what Trainer actually runs on, and it is what wraps the
+# dataloader in a subclass of its own.
+RUN pip install --no-cache-dir "transformers>=4.40" "accelerate>=1.1" "lightning>=2.2"
+
 WORKDIR /app
 COPY pyproject.toml README.md LICENSE NOTICE ./
 COPY ravex ./ravex
