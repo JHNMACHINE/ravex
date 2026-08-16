@@ -105,6 +105,50 @@ def test_no_final_checkpoint_is_attempted_at_shutdown(fsdp_workspace):
     assert "shutdown complete" in log, "shutdown still has to finish cleanly"
 
 
+def test_a_sharded_run_resumes_in_an_unsharded_one(fsdp_workspace):
+    """Eight GPUs in, one out - the claim the gathering is for.
+
+    Reading the file is not enough: the resumed process has a plain
+    `nn.Sequential` where the checkpoint has a sharded group, and the two have
+    to find each other. If they do not, the run starts from random weights and
+    says so only in a log line nobody reads.
+    """
+    directory = fsdp_workspace("fsdp-to-plain")
+
+    killed = torchrun(directory, "train_fsdp.py", die_at=CRASH_AT)
+    assert killed.returncode != 0
+
+    saved = latest_checkpoint(directory)["sharded"]["sharded_0"]["model"]
+
+    # A plain, single-process script. No torchrun, no mesh, no FSDP.
+    plain = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPTS / "train_vanilla.py"),
+            "--trace",
+            "plain.jsonl",
+            "--dump-weights",
+            "restored.pt",
+        ],
+        cwd=directory,
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    assert plain.returncode == 0, plain.stdout + plain.stderr
+
+    log = (directory / "ravex.log").read_text()
+    assert "Resumed at step" in log, "the plain run ignored the sharded checkpoint\n" + log
+
+    restored = torch.load(directory / "restored.pt", map_location="cpu")
+    assert set(restored) == set(saved), "parameter names do not line up"
+    for name, value in restored.items():
+        assert torch.equal(value, saved[name]), (
+            f"{name} is not what the sharded run saved - the plain run started "
+            f"from its own initialisation"
+        )
+
+
 def test_an_fsdp_checkpoint_loads_into_a_plain_model(fsdp_workspace):
     directory = fsdp_workspace("fsdp-portable")
     assert torchrun(directory, "train_fsdp.py", epochs=3).returncode == 0

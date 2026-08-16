@@ -31,6 +31,10 @@ def main():
     parser.add_argument("--die-at", type=int, default=0)
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=50)
+    # Writes the weights the run *starts* from, once the first batch is in
+    # hand and before anything has trained on it. On a resumed run that is
+    # whatever came out of the checkpoint.
+    parser.add_argument("--dump-weights", default=None)
     args = parser.parse_args()
 
     torch.manual_seed(SEED)
@@ -57,6 +61,9 @@ def main():
     local_step = 0
     for _ in range(args.epochs):
         for x, y in loader:
+            if args.dump_weights and local_step == 0:
+                torch.save(model.state_dict(), args.dump_weights)
+
             loss = ((model(x) - y) ** 2).mean()
             optimizer.zero_grad()
             loss.backward()

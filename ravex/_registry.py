@@ -472,14 +472,10 @@ class ObjectRegistry:
         self.step_count = int(state.get("step", 0))
 
         saved_models = state.get("models", {})
+        unmatched_models = []
         for key, model in self.keyed_models():
             if key not in saved_models:
-                logger.warning(
-                    "No saved state for model %s (%s) - it keeps its initial weights. "
-                    "Did the architecture change since the checkpoint?",
-                    key,
-                    type(unwrap_model(model)).__name__,
-                )
+                unmatched_models.append((key, model))
                 continue
             unwrap_model(model).load_state_dict(saved_models[key])
 
@@ -491,21 +487,28 @@ class ObjectRegistry:
             optimizer.load_state_dict(saved_optimizers[key])
 
         saved_sharded = state.get("sharded", {})
+        unmatched_sharded = []
+        claimed_sharded = set()
         for key, model, optimizers in self.sharded_groups():
             saved = saved_sharded.get(key)
             if saved is None:
-                logger.warning(
-                    "No saved state for sharded model %s - it keeps its initial "
-                    "weights",
-                    key,
-                )
+                unmatched_sharded.append((key, model, optimizers))
                 continue
+            claimed_sharded.add(key)
             expected = saved.get("parameters")
             if expected is not None:
                 self._warn_on_parameter_mismatch(key, model, expected)
             # Collective: every rank has to reach this, which it does because
             # the resume fires from DataLoader.__iter__ on all of them.
             apply_sharded_state(model, optimizers, saved["model"], saved["optimizer"])
+
+        self._bridge_topologies(
+            unmatched_models,
+            unmatched_sharded,
+            saved_models,
+            saved_sharded,
+            claimed_sharded,
+        )
 
         saved_schedulers = state.get("schedulers", {})
         for index, scheduler in enumerate(self.schedulers):
@@ -539,6 +542,91 @@ class ObjectRegistry:
                 self._restore_rng(torch, rng)
 
         self.resumed = True
+
+    def _bridge_topologies(
+        self,
+        unmatched_models: List[tuple],
+        unmatched_sharded: List[tuple],
+        saved_models: Dict[str, Any],
+        saved_sharded: Dict[str, Any],
+        claimed_sharded: set,
+    ) -> None:
+        """Match a checkpoint to a differently-shaped run.
+
+        The gathered state is topology-independent by construction, which is
+        the point of gathering it: eight GPUs in, one out. But the *keys* are
+        not. A sharded run files its model under ``sharded``, an ordinary run
+        under ``models``, and neither looks in the other's drawer. So resuming
+        an FSDP job in a plain single-process script found nothing, kept its
+        random initialisation, and carried on - with the step counter restored
+        and checkpoints still being written, so the only sign was one warning
+        and a loss back at its starting value.
+
+        Whatever is left unmatched on both sides is paired up here, in order.
+        """
+        leftover_sharded = [key for key in saved_sharded if key not in claimed_sharded]
+        leftover_plain = [
+            key
+            for key in saved_models
+            if key not in {k for k, _ in self.keyed_models()}
+        ]
+
+        for (key, model), saved_key in zip(unmatched_models, leftover_sharded):
+            group = saved_sharded[saved_key]
+            logger.info(
+                "Model %s takes the state saved by sharded group %s "
+                "(resuming a distributed run in a plain one)",
+                key,
+                saved_key,
+            )
+            unwrap_model(model).load_state_dict(group["model"])
+            self._bridge_optimizer(model, group)
+
+        for (key, model, optimizers), saved_key in zip(
+            unmatched_sharded, leftover_plain
+        ):
+            logger.info(
+                "Sharded group %s takes the state saved by plain model %s "
+                "(resuming a single-process run in a distributed one)",
+                key,
+                saved_key,
+            )
+            try:
+                apply_sharded_state(model, [], saved_models[saved_key], {})
+            except Exception as exc:
+                logger.warning("Could not scatter %s onto the shards: %s", saved_key, exc)
+
+        for key, model in unmatched_models[len(leftover_sharded) :]:
+            logger.warning(
+                "No saved state for model %s (%s) - it keeps its initial weights. "
+                "Did the architecture change since the checkpoint?",
+                key,
+                type(unwrap_model(model)).__name__,
+            )
+        for key, _, _ in unmatched_sharded[len(leftover_plain) :]:
+            logger.warning(
+                "No saved state for sharded model %s - it keeps its initial weights",
+                key,
+            )
+
+    def _bridge_optimizer(self, model: Any, group: Dict[str, Any]) -> None:
+        """Carry the optimizer across too, if one owns this model.
+
+        The saved optimizer state is keyed by parameter name rather than by
+        position, which is what makes it portable; translating it back onto a
+        plain optimizer is the loader's job.
+        """
+        optimizers = [o for o in self.optimizers if self._optimizer_owns(o, model)]
+        if not optimizers or not group.get("optimizer"):
+            return
+        try:
+            apply_sharded_state(model, optimizers, group["model"], group["optimizer"])
+        except Exception as exc:
+            logger.warning(
+                "Model weights were restored but the optimizer state was not (%s). "
+                "Training continues from the right weights with fresh moments.",
+                exc,
+            )
 
     @staticmethod
     def _warn_on_parameter_mismatch(key: str, model: Any, expected: List[str]) -> None:

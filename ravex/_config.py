@@ -17,7 +17,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 CONFIG_FILENAMES = ("ravex.yaml", "ravex.yml")
 
@@ -169,6 +169,10 @@ class RavexConfig:
 
     source: Optional[str] = None  # path of the yaml this came from, if any
 
+    #: Values that had to be replaced while loading. Logged by the runtime once
+    #: logging exists, so a broken config is visible instead of silent.
+    problems: List[str] = field(default_factory=list)
+
     # ─── loading ────────────────────────────────────────────────────
 
     @classmethod
@@ -201,7 +205,7 @@ class RavexConfig:
 
         known = {f.name for f in fields(self)}
         for key, value in data.items():
-            if key in known and key not in ("storage", "source"):
+            if key in known and key not in ("storage", "source", "problems"):
                 setattr(self, key, value)
 
     def _apply_env(self) -> None:
@@ -261,7 +265,73 @@ class RavexConfig:
         if (value := get("STORAGE_PATH_STYLE")) is not None:
             self.storage.path_style = _as_bool(value, self.storage.path_style)
 
+    def _coerce(self) -> None:
+        """Force every field to its declared type, replacing anything unusable.
+
+        A config file is written by hand, or by a template, or by a job runner,
+        and it arrives however it arrives. A truncated ``ravex.yaml`` - one
+        interrupted write, one bad template - used to yield ``checkpoint_every:
+        None``, which crashed the runtime on construction. The autoloader
+        swallows that exception by design, so the result was Ravex silently not
+        starting: no log file, because logging is configured after the config
+        loads, and no checkpoints, on a run that had asked for them.
+
+        Bad values are replaced with defaults and recorded in ``problems``,
+        which the runtime logs once it has somewhere to log to.
+        """
+        defaults = RavexConfig()
+        numeric = ("checkpoint_every", "keep_last", "compression_level")
+        boolean = (
+            "enabled",
+            "checkpoint_on_exit",
+            "resume",
+            "delta",
+            "track_dataloaders",
+            "track_rng",
+            "handle_sigterm",
+            "fallback_on_error",
+            "framework_auto_detect",
+        )
+
+        for name in numeric:
+            value = getattr(self, name)
+            coerced = _as_int(value, getattr(defaults, name))
+            if coerced != value:
+                self.problems.append(
+                    f"{name}={value!r} is not a number; using {coerced}"
+                )
+            setattr(self, name, coerced)
+
+        for name in boolean:
+            value = getattr(self, name)
+            if not isinstance(value, bool):
+                coerced = _as_bool(value, getattr(defaults, name))
+                self.problems.append(
+                    f"{name}={value!r} is not true/false; using {coerced}"
+                )
+                setattr(self, name, coerced)
+
+        if self.max_steps is not None:
+            self.max_steps = _as_int(self.max_steps, 0) or None
+
+        for name in ("backend", "compression", "log_level"):
+            value = getattr(self, name)
+            if not isinstance(value, str):
+                replacement = getattr(defaults, name)
+                self.problems.append(
+                    f"{name}={value!r} is not a name; using {replacement!r}"
+                )
+                setattr(self, name, replacement)
+
+        if not isinstance(self.storage.path, str):
+            self.problems.append(
+                f"storage.path={self.storage.path!r} is not a path; using "
+                f"{defaults.storage.path!r}"
+            )
+            self.storage.path = defaults.storage.path
+
     def _normalize(self) -> None:
+        self._coerce()
         self.backend = str(self.backend).strip().lower()
         self.storage.type = str(self.storage.type).strip().lower()
         self.log_level = str(self.log_level).strip().upper()

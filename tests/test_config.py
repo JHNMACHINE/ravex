@@ -1,5 +1,7 @@
 import textwrap
 
+import pytest
+
 from ravex._config import RavexConfig, find_config_file
 
 
@@ -75,6 +77,47 @@ def test_credentials_come_from_the_environment(monkeypatch):
     config = RavexConfig.load()
     assert config.storage.is_remote
     assert (config.storage.access_key, config.storage.secret_key) == ("ak", "sk")
+
+
+def test_a_truncated_config_does_not_stop_ravex(tmp_path, monkeypatch):
+    """One interrupted write must not silently disable checkpointing.
+
+    `checkpoint_every:` with nothing after it parses as None, which used to
+    raise while normalising. The autoloader swallows that by design, so the run
+    trained on with no checkpoints, no log file - logging is configured after
+    the config loads - and no way to tell.
+    """
+    path = tmp_path / "ravex.yaml"
+    path.write_text("checkpoint_every:", encoding="utf-8")  # truncated mid-write
+    monkeypatch.setenv("RAVEX_CONFIG", str(path))
+
+    config = RavexConfig.load()
+
+    assert config.checkpoint_every == 500, "should fall back to the default"
+    assert config.problems, "the substitution must be reported, not hidden"
+    assert "checkpoint_every" in config.problems[0]
+
+
+@pytest.mark.parametrize(
+    "yaml_text, field, expected",
+    [
+        ("keep_last: many\n", "keep_last", 5),
+        ("checkpoint_every: []\n", "checkpoint_every", 500),
+        ("enabled: maybe\n", "enabled", True),
+        ("backend: 7\n", "backend", "moonclip"),
+    ],
+)
+def test_nonsense_values_fall_back_to_defaults(
+    tmp_path, monkeypatch, yaml_text, field, expected
+):
+    path = tmp_path / "ravex.yaml"
+    path.write_text(yaml_text, encoding="utf-8")
+    monkeypatch.setenv("RAVEX_CONFIG", str(path))
+
+    config = RavexConfig.load()
+
+    assert getattr(config, field) == expected
+    assert any(field in problem for problem in config.problems)
 
 
 def test_run_id_becomes_the_storage_prefix(monkeypatch):

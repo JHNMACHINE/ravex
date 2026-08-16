@@ -59,6 +59,9 @@ class RavexRuntime:
 
         self._setup_logging()
 
+        for problem in self.config.problems:
+            logger.warning("Configuration: %s", problem)
+
     # ─── lifecycle ──────────────────────────────────────────────────
 
     def _setup_logging(self) -> None:

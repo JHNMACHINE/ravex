@@ -41,7 +41,9 @@ def build_model():
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--trace", required=True)
-    parser.add_argument("--mode", choices=("amp", "ddp", "fsdp1"), required=True)
+    parser.add_argument(
+        "--mode", choices=("amp", "bf16", "ddp", "fsdp1"), required=True
+    )
     parser.add_argument("--die-at", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=50)
     args = parser.parse_args()
@@ -73,6 +75,13 @@ def main():
     torch.cuda.manual_seed_all(SEED)
 
     model = build_model().to(device)
+
+    if args.mode == "bf16":
+        # Parameters themselves in bfloat16, not just autocast around fp32
+        # weights: that is what puts bf16 tensors into the checkpoint, and
+        # Moonclip has a dedicated path for them because numpy cannot
+        # represent the dtype at all.
+        model = model.to(torch.bfloat16)
 
     if args.mode == "ddp":
         from torch.nn.parallel import DistributedDataParallel
@@ -106,6 +115,8 @@ def main():
             sampler.set_epoch(epoch)
         for x, y in loader:
             x, y = x.to(device), y.to(device)
+            if args.mode == "bf16":
+                x, y = x.to(torch.bfloat16), y.to(torch.bfloat16)
 
             with torch.autocast("cuda", dtype=torch.float16, enabled=(args.mode == "amp")):
                 loss = ((model(x) - y) ** 2).mean()

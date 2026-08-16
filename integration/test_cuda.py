@@ -215,6 +215,76 @@ def test_a_killed_fsdp1_run_resumes_on_every_rank(gpu_workspace):
     assert_matches(after, expected, RESUME_FROM, exact=False)
 
 
+def test_bfloat16_weights_survive_a_restart(gpu_workspace):
+    """Parameters *in* bfloat16, not fp32 weights under autocast.
+
+    numpy has no bfloat16, so Moonclip reinterprets the buffer as int16 to move
+    it. That branch never runs on the fp32 checkpoints every other test
+    produces, and a silent misinterpretation there would come back as weights
+    that are numerically plausible and wrong.
+    """
+    reference = gpu_workspace("bf16-reference")
+    result = run_single(reference, mode="bf16")
+    assert result.returncode == 0, result.stderr
+    expected = stepped(read_trace(reference))
+    assert len(expected) == TOTAL_STEPS
+
+    run = gpu_workspace("bf16-interrupted")
+    assert run_single(run, mode="bf16", die_at=CRASH_AT).returncode == -9
+    restarted = run_single(run, trace_name="trace2.jsonl", mode="bf16")
+    assert restarted.returncode == 0, restarted.stderr
+
+    after = stepped(read_trace(run, "trace2.jsonl"))
+    assert_matches(after, expected, RESUME_FROM, exact=True)
+
+
+def test_a_run_sharded_over_every_gpu_resumes_on_one_process(gpu_workspace):
+    """The claim the gathering exists for, at full width.
+
+    Sharded over every GPU on the box, then picked up by a plain script with no
+    torchrun, no mesh, no process group - and on the CPU at that, since the
+    gathered tensors are offloaded there anyway. If the topology leaked into
+    the checkpoint, this is where it shows.
+    """
+    ranks = torch.cuda.device_count()
+    if ranks < 4:
+        pytest.skip(f"only {ranks} GPU(s); resharding is uninteresting below 4")
+
+    directory = gpu_workspace(f"reshard-{ranks}-to-1")
+    killed = torchrun(directory, "train_cuda.py", ranks=ranks, mode="fsdp1", die_at=CRASH_AT)
+    assert killed.returncode != 0, "expected the sharded run to be killed"
+
+    import glob
+
+    files = sorted(glob.glob(str(directory / "checkpoints" / "step_*.pt")))
+    assert files, "the sharded run wrote nothing"
+    saved = torch.load(files[-1], map_location="cpu", weights_only=False)
+    group = saved["sharded"]["sharded_0"]["model"]
+
+    plain = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPTS / "train_vanilla.py"),
+            "--trace",
+            "plain.jsonl",
+            "--dump-weights",
+            "restored.pt",
+        ],
+        cwd=directory,
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    assert plain.returncode == 0, plain.stdout + plain.stderr
+
+    restored = torch.load(directory / "restored.pt", map_location="cpu")
+    assert set(restored) == set(group)
+    for name, value in restored.items():
+        assert torch.equal(value, group[name]), (
+            f"{name} differs: {ranks} ranks wrote it, one process read it back wrong"
+        )
+
+
 def test_ddp_over_nccl_resumes(gpu_workspace):
     needs_two_gpus()
     reference = gpu_workspace("nccl-reference")

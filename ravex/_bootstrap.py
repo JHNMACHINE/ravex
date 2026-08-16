@@ -62,8 +62,16 @@ def _activate():
         import atexit
 
         atexit.register(runtime.shutdown)
-    except Exception:
-        # Never let the autoloader take a training run down with it.
+    except Exception as exc:
+        # Never let the autoloader take a training run down with it - but never
+        # let it disappear quietly either. Failing here means no checkpoints at
+        # all, on a run that asked for them; one line of stderr is a far
+        # smaller cost than finding out when the machine dies.
+        sys.stderr.write(
+            f"[ravex] did not start: {type(exc).__name__}: {exc}\n"
+            f"[ravex] training continues without checkpointing. "
+            f"Set RAVEX_DEBUG=1 for the traceback.\n"
+        )
         if os.environ.get("RAVEX_DEBUG"):
             import traceback
 
