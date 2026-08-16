@@ -17,13 +17,6 @@ def _dist():
     return dist
 
 
-def is_distributed() -> bool:
-    dist = _dist()
-    if dist is not None and dist.is_available() and dist.is_initialized():
-        return True
-    return int(os.environ.get("WORLD_SIZE", "1")) > 1
-
-
 def get_rank() -> int:
     """Global rank of this process, 0 when not distributed."""
     dist = _dist()
@@ -58,17 +51,6 @@ def barrier() -> None:
     dist = _dist()
     if dist is not None and dist.is_available() and dist.is_initialized():
         dist.barrier()
-
-
-def process_group_alive() -> bool:
-    """Whether collectives can still be issued.
-
-    Checked before any gather: user code often calls
-    ``dist.destroy_process_group()`` before the interpreter exits, and a
-    collective issued after that either raises or hangs.
-    """
-    dist = _dist()
-    return dist is not None and dist.is_available() and dist.is_initialized()
 
 
 def is_sharded(model) -> bool:
