@@ -63,7 +63,10 @@ def _install_epoch_offset(inner: Any, tracked: "TrackedSampler"):
     def set_epoch(epoch, *args, **kwargs):
         return original(epoch + tracked.epoch_offset, *args, **kwargs)
 
-    set_epoch._ravex_shifted = True
+    # Through setattr: the marker is a dynamic attribute on a function object,
+    # which is exactly what this is, and writing it as an assignment makes a
+    # type checker read it as a declaration that does not exist.
+    setattr(set_epoch, "_ravex_shifted", True)
     try:
         inner.set_epoch = set_epoch
     except AttributeError:  # pragma: no cover - exotic sampler

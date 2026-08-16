@@ -226,6 +226,14 @@ class MoonclipBackend(CheckpointBackend):
 _STEP_FILE = re.compile(r"step_(\d+)\.pt$")
 
 
+def _step_of(path: str) -> int:
+    """The step a checkpoint filename encodes."""
+    match = _STEP_FILE.search(path)
+    if match is None:  # pragma: no cover - _files() only yields names that match
+        raise ValueError("not a checkpoint filename: %s" % path)
+    return int(match.group(1))
+
+
 def _cpu_copy(value: Any) -> Any:
     """Deep-copy a state tree onto CPU memory.
 
@@ -293,7 +301,7 @@ class TorchSaveBackend(CheckpointBackend):
 
     def _files(self):
         files = glob.glob(os.path.join(self.directory, "step_*.pt"))
-        return sorted(files, key=lambda p: int(_STEP_FILE.search(p).group(1)))
+        return sorted(files, key=_step_of)
 
     def _prune(self) -> None:
         files = self._files()
@@ -317,7 +325,7 @@ class TorchSaveBackend(CheckpointBackend):
         files = self._files()
         if not files:
             return None
-        return int(_STEP_FILE.search(files[-1]).group(1))
+        return _step_of(files[-1])
 
     def load_step(self, step: int) -> Optional[Dict[str, Any]]:
         import torch

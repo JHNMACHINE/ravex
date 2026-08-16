@@ -23,7 +23,11 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-__version__ = "0.1.0"
+#: The one place the version is written. `pyproject.toml` reads it from here
+#: (`[tool.setuptools.dynamic]`), because declaring it in both is a pair that
+#: drifts at the first bump — and `ravex status` reports this one, so the drift
+#: shows up as the CLI stating a version nobody installed.
+__version__ = "0.2.0"
 
 __all__ = [
     "activate",

@@ -262,11 +262,16 @@ class RavexRuntime:
             return
         if not self._ensure_backend():
             return
+        # Bound locally: `_ensure_backend` sets it, but only a local name makes
+        # that visible to a type checker, and the package ships `py.typed`.
+        resume_manager = self._resume_manager
+        if resume_manager is None:  # pragma: no cover - _ensure_backend sets it
+            return
         try:
             # Anything the loading machinery does to the optimizer is not
             # training; see the guard in on_step.
             self._restoring = True
-            self._resume_manager.try_resume(
+            resume_manager.try_resume(
                 defer_rng=defer_rng, per_rank=self._per_rank_active()
             )
         except Exception as exc:
@@ -317,6 +322,9 @@ class RavexRuntime:
                 return False
             if not self._ensure_backend():
                 return False
+            backend = self._backend
+            if backend is None:  # pragma: no cover - _ensure_backend sets it
+                return False
             metadata = {
                 "step": str(step),
                 "framework": self._framework,
@@ -327,7 +335,7 @@ class RavexRuntime:
             if final:
                 metadata["final"] = "true"
 
-            self._backend.save(step, state, metadata)
+            backend.save(step, state, metadata)
             self._last_saved_step = step
         except Exception as exc:
             logger.error("Checkpoint at step %d failed: %s", step, exc, exc_info=True)

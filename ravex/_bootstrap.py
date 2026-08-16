@@ -57,6 +57,8 @@ def _activate():
         from ravex._runtime import get_runtime
 
         runtime = get_runtime()
+        if runtime is None:  # pragma: no cover - only when Ravex is disabled
+            return
         runtime.activate()
 
         import atexit

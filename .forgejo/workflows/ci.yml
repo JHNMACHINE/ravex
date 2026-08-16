@@ -1,0 +1,121 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # The engine on every interpreter we claim to support. No Moonclip here:
+  # `tests/test_backends.py` skips the Moonclip cases when it is absent, so
+  # this job covers the runtime, the patches, the sampler and the torch_save
+  # backend across the whole matrix without paying for a Rust build six times.
+  unit:
+    runs-on: codeberg-small
+    strategy:
+      fail-fast: false
+      matrix:
+        # Keep this list and the classifiers in pyproject.toml in step.
+        python: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+    container:
+      image: python:${{ matrix.python }}-bookworm
+    steps:
+      - name: Install git
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq git
+
+      - name: Checkout
+        run: |
+          git clone --depth 1 ${{ forgejo.server_url }}/${{ forgejo.repository }}.git .
+          git checkout ${{ forgejo.sha }} || true
+
+      - name: Test on Python ${{ matrix.python }}
+        run: |
+          python --version
+          # CPU wheels: these tests are about correctness, not throughput, and
+          # the CUDA build is gigabytes of download for nothing.
+          pip install --quiet --index-url https://download.pytorch.org/whl/cpu torch
+          pip install --quiet -e . pytest
+          pytest tests -v
+
+  # Moonclip is Ravex's *default* backend, so leaving it to the skip-if-absent
+  # path would mean the shipped configuration is the one nothing runs.
+  #
+  # Built from git rather than installed from an index on purpose: it makes
+  # this job independent of whether a Moonclip release happens to be published,
+  # and it tests the pairing at the commit both repositories are actually at.
+  moonclip-backend:
+    runs-on: codeberg-small
+    container:
+      image: python:3.12-bookworm
+    steps:
+      - name: Install git and Rust
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq git build-essential
+          # Debian bookworm ships rustc 1.63; Moonclip needs 1.83.
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain 1.90.0 --profile minimal
+
+      - name: Checkout
+        run: |
+          git clone --depth 1 ${{ forgejo.server_url }}/${{ forgejo.repository }}.git .
+          git checkout ${{ forgejo.sha }} || true
+
+      - name: Build Moonclip and run the full suite
+        run: |
+          . "$HOME/.cargo/env"
+          pip install --quiet --index-url https://download.pytorch.org/whl/cpu torch
+          pip install --quiet maturin pytest
+          git clone --depth 1 \
+            ${{ forgejo.server_url }}/${{ forgejo.repository_owner }}/moonclip.git /tmp/moonclip
+          pip install --quiet /tmp/moonclip
+          pip install --quiet -e .
+          python -c "import moonclip; print('moonclip', moonclip.__version__)"
+          # With Moonclip present the backend tests stop skipping: this is the
+          # only job where the default write path is exercised at all.
+          pytest tests -v
+
+  # What the unit suite structurally cannot reach: the `.pth` autoloader, config
+  # discovery from the working directory, a resume that starts from a genuinely
+  # empty interpreter, torchrun, and a crash delivered as SIGKILL. Mirrors
+  # integration/Dockerfile — keep the two in step.
+  integration:
+    runs-on: codeberg-small
+    container:
+      image: python:3.12-bookworm
+    steps:
+      - name: Install git
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq git
+
+      - name: Checkout
+        run: |
+          git clone --depth 1 ${{ forgejo.server_url }}/${{ forgejo.repository }}.git .
+          git checkout ${{ forgejo.sha }} || true
+
+      - name: Install
+        run: |
+          pip install --quiet --index-url https://download.pytorch.org/whl/cpu torch
+          pip install --quiet pytest numpy
+          # The frameworks Ravex claims to support by hooking PyTorch itself.
+          # Both own the training loop and wrap the dataloader in ways plain
+          # PyTorch does not, so the claim is an argument until this runs.
+          pip install --quiet "transformers>=4.40" "accelerate>=1.1" "lightning>=2.2"
+          pip install --quiet -e .
+
+      - name: Install the autoloader
+        # The real thing: one line in site-packages, executed at interpreter
+        # startup. From here on nothing imports ravex explicitly.
+        run: |
+          ravex enable
+          ravex status
+
+      - name: Integration suite
+        # `integration/` and `tests/` both have a conftest.py, and pytest
+        # collides on the module name if they are collected together. They are
+        # separate jobs here, so this only has to name one of them.
+        run: pytest integration -v --tb=short

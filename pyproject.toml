@@ -4,7 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ravex"
-version = "0.1.0"
+# Read from ravex/__init__.py; see [tool.setuptools.dynamic] below.
+dynamic = ["version"]
 description = "Transparent checkpoint and resume for PyTorch training, with no changes to your training code"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -26,7 +27,9 @@ classifiers = [
 dependencies = ["PyYAML>=5.1"]
 
 [project.optional-dependencies]
-moonclip = ["moonclip>=0.2"]
+# 0.0.3 is the first version with the self-describing pack format and the
+# retention fix. The old `>=0.2` was not satisfiable by anything that exists.
+moonclip = ["moonclip>=0.0.3"]
 dev = ["pytest>=7", "numpy"]
 
 [project.urls]
@@ -38,6 +41,9 @@ ravex = "ravex._cli:main"
 
 [tool.setuptools]
 packages = ["ravex"]
+
+[tool.setuptools.dynamic]
+version = { attr = "ravex.__version__" }
 
 [tool.setuptools.package-data]
 ravex = ["py.typed"]

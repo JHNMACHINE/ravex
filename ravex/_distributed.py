@@ -22,6 +22,7 @@ Sharded models have two ways through here, and they trade against each other:
 from __future__ import annotations
 
 import os
+from typing import Any, Dict, List, Tuple
 
 
 def _dist():
@@ -129,7 +130,7 @@ def gather_sharded_state(model, optimizers):
 _SHARD_TAG = "__ravex_shard__"
 
 
-def _dtensor_class():
+def _dtensor_class() -> Any:
     """``DTensor``, or None on a torch too old to have it."""
     try:
         from torch.distributed.tensor import DTensor
@@ -137,24 +138,30 @@ def _dtensor_class():
         return DTensor
     except Exception:
         pass
-    try:  # torch < 2.5 kept it private
-        from torch.distributed._tensor import DTensor
+    try:  # torch < 2.5 kept it private, and private is the whole point here
+        from torch.distributed._tensor import (
+            DTensor,  # pyright: ignore[reportPrivateImportUsage]
+        )
 
         return DTensor
     except Exception:
         return None
 
 
-def _is_sharded_tensor(value) -> bool:
+def _is_sharded_tensor(value: Any) -> bool:
     """The pre-DTensor sharded type, which this path cannot rebuild."""
     try:
-        from torch.distributed._shard.sharded_tensor import ShardedTensor
+        # Private by nature: there is no public name for the type this exists
+        # to recognise and refuse.
+        from torch.distributed._shard.sharded_tensor import (
+            ShardedTensor,  # pyright: ignore[reportPrivateImportUsage]
+        )
     except Exception:
         return False
     return isinstance(value, ShardedTensor)
 
 
-def _encode_shards(value):
+def _encode_shards(value: Any) -> Any:
     """Replace every DTensor in a state tree with this rank's own shard.
 
     What comes back is plain tensors and plain data, which is all the storage
@@ -189,7 +196,7 @@ def _encode_shards(value):
     return value
 
 
-def _rebuild_dtensor(saved: dict, live):
+def _rebuild_dtensor(saved: Dict[str, Any], live: Any) -> Any:
     """Wrap a saved local shard in the layout the live model is using now.
 
     The mesh and the placements are taken from ``live`` rather than from the
@@ -198,6 +205,8 @@ def _rebuild_dtensor(saved: dict, live):
     running, not the one that wrote the bytes.
     """
     DTensor = _dtensor_class()
+    if DTensor is None:  # pragma: no cover - `live` being a DTensor rules it out
+        raise ValueError("this torch has no DTensor to rebuild a shard into")
     reference = live.to_local()
     local = saved["local"]
 
@@ -225,7 +234,7 @@ def _rebuild_dtensor(saved: dict, live):
         return DTensor.from_local(local, live.device_mesh, live.placements)
 
 
-def _decode_shards(saved, live):
+def _decode_shards(saved: Any, live: Any) -> Any:
     """Undo :func:`_encode_shards`, walking the live state tree alongside."""
     if isinstance(saved, dict) and saved.get(_SHARD_TAG):
         DTensor = _dtensor_class()
@@ -251,7 +260,9 @@ def _decode_shards(saved, live):
     return saved
 
 
-def local_sharded_state(model, optimizers, cpu_offload: bool = True):
+def local_sharded_state(
+    model, optimizers, cpu_offload: bool = True
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """This rank's own shard of a sharded model and its optimizers.
 
     **Collective.** Every rank must call this at the same point. Nothing is
@@ -320,7 +331,8 @@ def agree_on_step(local_step: int) -> int:
     if dist is None or not dist.is_available() or not dist.is_initialized():
         return local_step
 
-    steps = [None] * dist.get_world_size()
+    # Pre-sized because `all_gather_object` fills the list in place.
+    steps: List[Any] = [None] * dist.get_world_size()
     dist.all_gather_object(steps, int(local_step))
     return min(int(step) for step in steps)
 
@@ -337,7 +349,7 @@ def all_ranks_agree(ok: bool) -> bool:
     if dist is None or not dist.is_available() or not dist.is_initialized():
         return bool(ok)
 
-    flags = [None] * dist.get_world_size()
+    flags: List[Any] = [None] * dist.get_world_size()
     dist.all_gather_object(flags, bool(ok))
     return all(bool(flag) for flag in flags)
 
