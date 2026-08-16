@@ -31,6 +31,7 @@ What it reports, per rank and for the gather:
 import argparse
 import json
 import os
+import signal
 import time
 
 import torch
@@ -114,6 +115,8 @@ def main():
     parser.add_argument("--steps", type=int, default=3)
     parser.add_argument("--batch", type=int, default=2)
     parser.add_argument("--trace", default=None)
+    parser.add_argument("--die-at", type=int, default=0)
+    parser.add_argument("--measure-gather", action="store_true")
     args = parser.parse_args()
 
     dist.init_process_group("nccl")
@@ -138,15 +141,45 @@ def main():
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
 
-    for _ in range(args.steps):
-        x = torch.randn(args.batch, args.hidden, device=device)
+    # Ravex resumes transparently before the first step, so anything it
+    # restored is already in place here. `started` therefore measures the
+    # training, not the restore; the restore shows up in ravex.log.
+    trace = None
+    if args.trace and rank == 0:
+        trace = open(args.trace, "a", buffering=1)
+
+    started_training = time.perf_counter()
+    for step in range(args.steps):
+        # The input is a function of the step, not of the RNG stream, so a
+        # resumed run sees exactly the batches the original would have. RNG
+        # restoration is covered by integration/test_cuda.py; conflating the
+        # two here would make a failure ambiguous.
+        generator = torch.Generator(device="cuda").manual_seed(1000 + step)
+        x = torch.randn(
+            args.batch, args.hidden, device=device, generator=generator
+        )
         loss = model(x).square().mean()
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
+        if trace is not None:
+            trace.write(json.dumps({"step": step, "loss": repr(loss.item())}) + "\n")
+
+        if args.die_at and step + 1 >= args.die_at:
+            if trace is not None:
+                trace.flush()
+                os.fsync(trace.fileno())
+            dist.barrier()
+            os.kill(os.getpid(), signal.SIGKILL)
+
     torch.cuda.synchronize()
     dist.barrier()
+    if rank == 0:
+        print(f"training: {args.steps} steps in "
+              f"{(time.perf_counter() - started_training):.1f} s")
+    if trace is not None:
+        trace.close()
 
     def local_bytes(p):
         """Bytes this rank actually holds.
@@ -169,6 +202,12 @@ def main():
           f"{human_bytes(reserved)} reserved on device")
 
     # ── The FSDP-specific cost ──────────────────────────────────────
+    if not args.measure_gather:
+        dist.barrier()
+        dist.destroy_process_group()
+        print(f"rank {rank} ok")
+        return
+
     import sys
     sys.path.insert(0, "/root/ravex")
     from ravex._distributed import gather_sharded_state
