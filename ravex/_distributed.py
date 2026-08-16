@@ -171,9 +171,14 @@ def _encode_shards(value):
             "placements": [str(p) for p in value.placements],
         }
     if _is_sharded_tensor(value):
+        # FSDP1, whatever `use_orig_params` is set to. Measured on torch
+        # 2.12: with `use_orig_params=True` the parameters are plain
+        # `Parameter`s and the sharded state dict still yields
+        # `ShardedTensor`, which carries no mesh and no placements and so
+        # cannot be rebuilt the way `_rebuild_dtensor` rebuilds a shard.
         raise TypeError(
             "per-rank checkpointing needs DTensor-backed shards; this model "
-            "yields ShardedTensor (FSDP1 with use_orig_params=False)"
+            "yields ShardedTensor, which is what FSDP1 gives on this torch"
         )
     if isinstance(value, dict):
         return {k: _encode_shards(v) for k, v in value.items()}
@@ -246,7 +251,7 @@ def _decode_shards(saved, live):
     return saved
 
 
-def local_sharded_state(model, optimizers):
+def local_sharded_state(model, optimizers, cpu_offload: bool = True):
     """This rank's own shard of a sharded model and its optimizers.
 
     **Collective.** Every rank must call this at the same point. Nothing is
@@ -259,10 +264,19 @@ def local_sharded_state(model, optimizers):
 
     The price is that the result only means something at the same world size,
     with the same sharding. :func:`apply_local_sharded_state` checks that.
+
+    ``cpu_offload`` decides *who* copies the shards off the device. Left on,
+    torch does it, into pageable host memory, before Moonclip is handed
+    anything — the same thing that makes the gather path immune to Moonclip's
+    pinned staging (measured at 9.4x on the transfer, 7.3x on the stall).
+    Turned off, the shards stay on the device and the staging does the copy.
+    It defaults to on because that is the conservative shape, and because the
+    claim in the sentence above is about the *gather*: whether it holds here is
+    a question for a box with GPUs on it, not for this docstring.
     """
     from torch.distributed.checkpoint.state_dict import StateDictOptions, get_state_dict
 
-    options = StateDictOptions(full_state_dict=False, cpu_offload=True)
+    options = StateDictOptions(full_state_dict=False, cpu_offload=cpu_offload)
     model_state, optimizer_state = get_state_dict(model, list(optimizers), options=options)
     return _encode_shards(model_state), _encode_shards(optimizer_state)
 

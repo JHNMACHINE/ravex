@@ -488,11 +488,17 @@ class ObjectRegistry:
             return "gather"
 
         for key, model, _ in groups:
+            # FSDP2 leaves DTensors in place of the parameters. FSDP1 does not,
+            # at any `use_orig_params` setting — measured on torch 2.12: the
+            # parameters stay plain and the sharded state dict yields
+            # `ShardedTensor`, which has no mesh to rebuild a shard against.
+            # So this test is also the FSDP1 test.
             if not any(isinstance(p, DTensor) for p in model.parameters()):
                 self._warn_once(
                     "not-dtensor-backed:%s" % key,
-                    "Sharded group %s is not DTensor-backed (FSDP1 with "
-                    "use_orig_params=False?) - gathering on rank 0 instead" % key,
+                    "Sharded group %s is not DTensor-backed - per-rank "
+                    "checkpointing needs FSDP2; gathering on rank 0 instead"
+                    % key,
                 )
                 return "gather"
         return "per_rank"

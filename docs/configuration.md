@@ -47,23 +47,34 @@ trade against each other.
 
 **`gather`** (default) collects the whole unsharded state on rank 0, which
 writes it. The checkpoint is then independent of the topology that produced
-it — eight GPUs in, one out — and it does not scale. Measured on 8× RTX 5060 Ti
-with a 1.48B model and Adam:
-
-| | |
-|---|---|
-| gather (16.5 GiB: 5.5 model + 11 optimizer) | 14.2 s (FSDP2), 18.3 s (FSDP1) |
-| peak RSS on rank 0 | 18.1 GiB — the entire state |
-
-At that cost a checkpoint is permanently in flight: with `checkpoint_every: 2`
-and steps of about a second, a crash at step 7 resumed from step 2. The gather
-also puts the device→host copy inside torch rather than Moonclip, so the pinned
-staging path (7.3× on the single-GPU stall) never runs.
+it — eight GPUs in, one out — and it does not scale.
 
 **`per_rank`** has every rank write its own shard into its own store,
 `<storage.path>/rank_<n>` (and the same suffix on `storage.prefix` for a remote
 store). Nothing is gathered, so nothing is bounded by one rank's memory, and
 each rank keeps its own background writer, delta chain and retention.
+
+Measured on 8× RTX 5060 Ti, FSDP2, a 1.48B model with Adam — 16.5 GiB of state
+(5.5 model + 11 optimizer):
+
+| collecting the state | wall time | held | peak host RSS | still on device |
+|---|---|---|---|---|
+| `gather` | 15.6 s | 16.5 GiB on rank 0 | 18.1 GiB on rank 0 | 0/44 |
+| `per_rank` | 1.5 s | 2.1 GiB per rank | 6.1 GiB, every rank alike | 0/44 |
+| `per_rank`, shards left on device | 4 ms | 2.1 GiB per rank | 6.1 GiB | 44/44 |
+
+Three things in that table are worth naming. The gather is **10× slower** than
+taking the same state per rank, and it is slower on the rank that then has to
+do the writing. Its 18.1 GiB of resident memory is the whole state on one
+process; per-rank, no rank grows at all past the model it already had. And the
+last row is not really a copy: `to_local()` is a view, so 4 ms is bookkeeping
+and nothing else — the device→host copy has not happened yet, which is the
+point. Under `gather` torch does that copy itself, into pageable memory, before
+Moonclip is handed anything; left on the device it goes through Moonclip's
+pinned staging instead (9.4× on the transfer, measured separately).
+
+Ravex uses the middle row today: shards are taken with `cpu_offload=True`. The
+bottom row is what the plumbing allows, not what it does.
 
 What you give up is the resharding. Per-rank shards are cut for one topology
 and compose into nothing on another, so the checkpoint only resumes at the same
@@ -76,9 +87,12 @@ Two further consequences worth knowing:
 - Ranks write independently, so a kill can leave rank 3 holding step 8 and rank
   5 only step 6. On resume the ranks agree on the newest step *all* of them
   have and load that one.
-- `per_rank` needs DTensor-backed shards — FSDP2, or FSDP1 with
-  `use_orig_params=True`. Anything else falls back to `gather` with a warning
-  rather than writing something unreadable.
+- `per_rank` needs FSDP2. FSDP1 falls back to `gather` with a warning —
+  including with `use_orig_params=True`, which is worth stating because it
+  sounds like it should be enough: measured on torch 2.12, FSDP1 leaves the
+  parameters as plain `Parameter`s and hands back a sharded state dict of
+  `ShardedTensor`, which carries no mesh and no placements and so cannot be
+  put back shard by shard.
 
 ### Storage
 

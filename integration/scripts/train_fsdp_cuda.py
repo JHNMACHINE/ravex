@@ -19,13 +19,28 @@ card cannot hold the run: 1.5B parameters in fp32 is 6 GiB of weights, and Adam
 brings the total past 24 GiB against a 16 GiB card. If it runs, FSDP is doing
 the work.
 
-What it reports, per rank and for the gather:
+What it reports, per rank:
 
 * device memory after sharding — evidence the shards are actually split
-* the wall time of `gather_sharded_state`, which is the FSDP-specific cost and
-  is *not* the one the pinned staging speeds up: that gather is done inside
-  torch, with cpu_offload, before Moonclip is handed anything
-* peak host RSS on rank 0 while the full state exists there
+* the wall time of collecting the state, and the peak host RSS it costs
+* how much of what was collected is still on the device, which is the
+  condition for Moonclip's pinned staging to be worth anything
+
+`--measure both` runs the comparison the per-rank work exists for:
+
+    torchrun --nproc_per_node=8 train_fsdp_cuda.py --measure both \\
+        --trace measure.json --ravex-path /root/ravex
+
+    gather                  whole state through rank 0, cpu_offload
+    per_rank offload=on     this rank's shard, torch copies it to host
+    per_rank offload=off    this rank's shard, left on the device
+
+The third line is the one with an open question attached. With cpu_offload the
+device-to-host copy happens inside torch, into pageable memory, before Moonclip
+sees anything — which is why the gather path cannot benefit from the pinned
+staging (9.4x on the transfer, 7.3x on the single-GPU stall). Without it the
+shards arrive on the device and the staging does the copy. Whether that holds
+in practice is what the box is for.
 """
 
 import argparse
@@ -117,7 +132,17 @@ def main():
     parser.add_argument("--trace", default=None)
     parser.add_argument("--die-at", type=int, default=0)
     parser.add_argument("--measure-gather", action="store_true")
+    parser.add_argument(
+        "--measure",
+        choices=["none", "gather", "per_rank", "both"],
+        default=None,
+        help="which collection path to time; 'both' is the comparison",
+    )
+    parser.add_argument("--ravex-path", default="/root/ravex")
     args = parser.parse_args()
+
+    if args.measure is None:
+        args.measure = "gather" if args.measure_gather else "none"
 
     dist.init_process_group("nccl")
     rank = dist.get_rank()
@@ -202,48 +227,110 @@ def main():
           f"{human_bytes(reserved)} reserved on device")
 
     # ── The FSDP-specific cost ──────────────────────────────────────
-    if not args.measure_gather:
+    if args.measure == "none":
         dist.barrier()
         dist.destroy_process_group()
         print(f"rank {rank} ok")
         return
 
     import sys
-    sys.path.insert(0, "/root/ravex")
-    from ravex._distributed import gather_sharded_state
+    sys.path.insert(0, args.ravex_path)
+    from ravex._distributed import gather_sharded_state, local_sharded_state
 
-    dist.barrier()
-    started = time.perf_counter()
-    model_state, optimizer_state = gather_sharded_state(model, [optimizer])
-    gather_seconds = time.perf_counter() - started
+    def tree_bytes(tree):
+        """Bytes a collected state tree holds, shard records included."""
+        if torch.is_tensor(tree):
+            return tree.numel() * tree.element_size()
+        if isinstance(tree, dict):
+            return sum(tree_bytes(v) for v in tree.values())
+        if isinstance(tree, (list, tuple)):
+            return sum(tree_bytes(v) for v in tree)
+        return 0
+
+    def tensors_on_device(tree):
+        """How much of what was collected is still on the GPU.
+
+        The number the pinned staging turns on. Anything already copied to host
+        by torch is a copy Moonclip did not get to make, at 1.5 GB/s through
+        pageable memory instead of 14.1 GB/s through pinned buffers.
+        """
+        if torch.is_tensor(tree):
+            return (1, 1 if tree.is_cuda else 0)
+        children = ()
+        if isinstance(tree, dict):
+            children = tree.values()
+        elif isinstance(tree, (list, tuple)):
+            children = tree
+        total = cuda = 0
+        for child in children:
+            child_total, child_cuda = tensors_on_device(child)
+            total += child_total
+            cuda += child_cuda
+        return (total, cuda)
+
+    def timed(label, collect):
+        """Run one collection path on every rank and report it from rank 0.
+
+        Timed after a barrier and reported per rank: under `per_rank` there is
+        no single rank doing the work, so a number taken only on rank 0 would
+        be describing whichever rank happened to be fastest.
+        """
+        dist.barrier()
+        torch.cuda.synchronize()
+        before_rss = peak_rss_bytes()
+        started = time.perf_counter()
+        model_state, optimizer_state = collect()
+        torch.cuda.synchronize()
+        seconds = time.perf_counter() - started
+
+        held = tree_bytes(model_state) + tree_bytes(optimizer_state)
+        total, on_cuda = tensors_on_device(model_state)
+        rss = peak_rss_bytes()
+
+        # Every rank prints: the whole question is whether one rank is carrying
+        # the run, and only rank 0's line cannot answer it.
+        print(f"[{label}] rank {rank}: {seconds * 1000:.0f} ms, "
+              f"holds {human_bytes(held)}, "
+              f"{on_cuda}/{total} model tensors still on device, "
+              f"peak RSS {human_bytes(rss)} (was {human_bytes(before_rss)})")
+
+        del model_state, optimizer_state
+        dist.barrier()
+        return {
+            "seconds": seconds,
+            "held_bytes": held,
+            "model_tensors": total,
+            "model_tensors_on_cuda": on_cuda,
+            "peak_rss_bytes": rss,
+        }
+
+    results = {}
+    if args.measure in ("gather", "both"):
+        results["gather"] = timed(
+            "gather", lambda: gather_sharded_state(model, [optimizer])
+        )
+    if args.measure in ("per_rank", "both"):
+        # Both offload settings, because the difference between them is the
+        # open question: with cpu_offload torch copies the shards to pageable
+        # host memory itself, and Moonclip's pinned staging never sees a device
+        # tensor. Without it, the staging does the copy.
+        results["per_rank_cpu_offload"] = timed(
+            "per_rank offload=on",
+            lambda: local_sharded_state(model, [optimizer], cpu_offload=True),
+        )
+        results["per_rank_on_device"] = timed(
+            "per_rank offload=off",
+            lambda: local_sharded_state(model, [optimizer], cpu_offload=False),
+        )
 
     if rank == 0:
-        def tree_bytes(tree):
-            if torch.is_tensor(tree):
-                return tree.numel() * tree.element_size()
-            if isinstance(tree, dict):
-                return sum(tree_bytes(v) for v in tree.values())
-            if isinstance(tree, (list, tuple)):
-                return sum(tree_bytes(v) for v in tree)
-            return 0
-
-        model_bytes = tree_bytes(model_state)
-        optim_bytes = tree_bytes(optimizer_state)
-        gathered = model_bytes + optim_bytes
-        on_cuda = sum(
-            1 for v in model_state.values()
-            if torch.is_tensor(v) and v.is_cuda
-        )
-        print(f"\ngather: {gather_seconds * 1000:.0f} ms for "
-              f"{human_bytes(gathered)} "
-              f"({human_bytes(model_bytes)} model + "
-              f"{human_bytes(optim_bytes)} optimizer) "
-              f"— {gathered / gather_seconds / 1e9:.2f} GB/s")
-        print(f"        {len(model_state)} tensors, {on_cuda} still on the device")
-        print(f"        peak host RSS on rank 0: {human_bytes(peak_rss_bytes())}")
-        print("\n        cpu_offload=True means torch did the device-to-host "
-              "copy itself,\n        which is why the pinned staging in Moonclip "
-              "cannot help this path.")
+        print()
+        for label, result in results.items():
+            print(f"{label:24s} {result['seconds'] * 1000:8.0f} ms  "
+                  f"{human_bytes(result['held_bytes']):>10s}  "
+                  f"peak RSS {human_bytes(result['peak_rss_bytes']):>10s}  "
+                  f"{result['model_tensors_on_cuda']}/{result['model_tensors']} "
+                  f"on device")
 
         if args.trace:
             with open(args.trace, "w") as fh:
@@ -252,12 +339,10 @@ def main():
                         "api": args.api,
                         "params": dense_params,
                         "world_size": world_size,
-                        "gather_seconds": gather_seconds,
-                        "gathered_bytes": gathered,
-                        "tensors_on_cuda_after_gather": on_cuda,
-                        "peak_rss_bytes": peak_rss_bytes(),
+                        "results": results,
                     },
                     fh,
+                    indent=2,
                 )
 
     dist.barrier()
