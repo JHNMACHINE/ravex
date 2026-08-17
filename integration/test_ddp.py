@@ -71,11 +71,15 @@ def test_two_ranks_train_and_only_rank_zero_writes(ddp_workspace):
 
     log = (directory / "ravex.log").read_text()
     # Both ranks run the runtime — rank 1 has to resume even though it never
-    # writes. The torchrun launcher process activates too (rank=0/1, before it
-    # sets WORLD_SIZE); it never trains, and _ensure_backend keeps it from
-    # opening any storage.
+    # writes.
     assert "rank=0/2" in log and "rank=1/2" in log
     assert "Checkpoint at step" in log
+
+    # One runtime per rank and not one more. The torchrun launcher imports torch
+    # to parse its own arguments, so it used to come through the autoloader as
+    # well and announce itself as `rank=0/1` before the ranks existed — a
+    # process that will never train, holding a runtime.
+    assert log.count("Ravex active") == 2, log
 
 
 def test_a_killed_ddp_run_resumes_on_every_rank(ddp_workspace):

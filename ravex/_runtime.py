@@ -305,11 +305,13 @@ class RavexRuntime:
             return False
 
         started = time.perf_counter()
+        phases: dict = {}
         try:
             state = self.registry.collect_state(
                 track_rng=self.config.track_rng,
                 sharded_layout=self.config.sharded_checkpoints,
             )
+            phases["collect"] = time.perf_counter() - started
 
             # Under `per_rank` there is nothing on rank 0 to write for the
             # other ranks — each holds its own shard and writes it into its own
@@ -335,7 +337,7 @@ class RavexRuntime:
             if final:
                 metadata["final"] = "true"
 
-            backend.save(step, state, metadata)
+            phases.update(backend.save(step, state, metadata) or {})
             self._last_saved_step = step
         except Exception as exc:
             logger.error("Checkpoint at step %d failed: %s", step, exc, exc_info=True)
@@ -343,10 +345,15 @@ class RavexRuntime:
                 self._disable("checkpoint failed")
             return False
 
+        # The breakdown, not just the total: a handoff that costs seconds is
+        # seconds the training loop is stopped, and every investigation of one
+        # so far has started by re-running the job to find out which phase it
+        # was. Two perf_counter calls per phase is a cheap way not to.
         logger.info(
-            "Checkpoint at step %d handed off in %.3fs",
+            "Checkpoint at step %d handed off in %.3fs (%s)",
             step,
             time.perf_counter() - started,
+            ", ".join("%s %.3fs" % item for item in phases.items()),
         )
         return True
 

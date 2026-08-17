@@ -24,6 +24,57 @@ import sys
 _FALSE = ("0", "false", "no", "off")
 _CONFIG_NAMES = ("ravex.yaml", "ravex.yml")
 
+#: Modules that are a launcher when run as ``__main__``.
+_LAUNCHER_MODULES = ("torch.distributed.run", "torch.distributed.launch")
+
+#: Console scripts that are a launcher. Matched on the stem of ``argv[0]``, so
+#: ``torchrun.exe`` counts.
+_LAUNCHER_SCRIPTS = ("torchrun",)
+
+
+def _is_launcher_process():
+    """Whether this process is a distributed launcher rather than a rank.
+
+    ``torchrun`` imports torch to parse its own arguments, so the launcher goes
+    through the autoloader like everything else: every distributed run had one
+    more Ravex instance than it had ranks, announcing itself a few seconds ahead
+    of the real ones as ``rank=0/1`` — before ``WORLD_SIZE`` exists.
+
+    Nothing has gone wrong because of it: the launcher holds no model and no
+    optimizer, so it never checkpoints and never reaches ``_ensure_backend``.
+    But that is harmless *by construction*, not by design, and it is precisely
+    what ``_ensure_backend`` exists to prevent. One future path that opens the
+    backend before any object is registered, and the launcher starts creating
+    directories — or opening S3 connections — for a process that will never
+    train a step.
+
+    Deliberately structural rather than a guess at intent: a worker's argv is
+    the user's script and its ``LOCAL_RANK`` is set, so nothing a rank does can
+    look like this.
+    """
+    if os.environ.get("LOCAL_RANK") is not None:
+        return False  # a worker torchrun started, and workers do train
+
+    # `python -m torch.distributed.run` has to be read off the *original*
+    # command line, because neither `sys.argv` nor ``__main__.__spec__`` knows
+    # yet: runpy imports `torch.distributed` while it is still resolving which
+    # module to run, so torch — and with it this hook — fires before runpy
+    # rewrites either. Measured at that instant: ``argv == ['-m', ...]`` and
+    # ``__main__.__spec__ is None``.
+    #
+    # `sys.orig_argv` is 3.10+; on 3.9 the `-m` form goes undetected, which
+    # leaves the status quo rather than a wrong answer.
+    arguments = list(getattr(sys, "orig_argv", ()))[1:]  # [0] is the interpreter
+    for flag, value in zip(arguments, arguments[1:]):
+        if flag == "-m":
+            return value in _LAUNCHER_MODULES
+        if not flag.startswith("-"):
+            break  # past the interpreter's own options; the rest is the script's
+
+    # The console script, where argv[0] is the `torchrun` wrapper itself.
+    argv0 = sys.argv[0] if sys.argv else ""
+    return os.path.splitext(os.path.basename(argv0))[0] in _LAUNCHER_SCRIPTS
+
 
 def _has_config_file():
     explicit = os.environ.get("RAVEX_CONFIG")
@@ -53,6 +104,11 @@ def should_activate():
 
 def _activate():
     """Build the runtime and patch torch. Called once torch is loaded."""
+    if _is_launcher_process():
+        if os.environ.get("RAVEX_DEBUG"):
+            sys.stderr.write("[ravex] not activating: this is a launcher process\n")
+        return
+
     try:
         from ravex._runtime import get_runtime
 
