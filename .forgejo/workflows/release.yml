@@ -41,18 +41,13 @@ jobs:
           fi
           echo "$(git rev-parse --short HEAD) is on main"
 
-      - name: Build sdist and wheel
-        run: |
-          set -eu
-          pip install --quiet build twine
-          python -m build
-          echo "=== Built ==="
-          ls -la dist/
-
       # The tag is what a user installs; the metadata is what pip believes.
       # They are written in one place (`ravex/__init__.py`, read by
       # `[tool.setuptools.dynamic]`), and this makes sure the tag agrees with
       # it — a mismatch here means publishing a version nobody asked for.
+      #
+      # Ahead of the build, and of the token check below, because both cost
+      # nothing and the mistake they catch cannot be undone.
       - name: Tag must match the package version
         run: |
           set -eu
@@ -63,6 +58,27 @@ jobs:
             echo "Tag $TAG does not match ravex.__version__ ($VERSION)" >&2
             exit 1
           fi
+
+      - name: The publish token must be present
+        env:
+          PYPI_TOKEN: ${{ secrets.RAVEX_PYPI_TOKEN }}
+        run: |
+          set -eu
+          if [ -z "${PYPI_TOKEN:-}" ]; then
+            echo "RAVEX_PYPI_TOKEN is not set: a tag was pushed but nothing" >&2
+            echo "would reach PyPI. Add the secret on the repository, delete the" >&2
+            echo "tag and push it again." >&2
+            exit 1
+          fi
+          echo "token present"
+
+      - name: Build sdist and wheel
+        run: |
+          set -eu
+          pip install --quiet build twine
+          python -m build
+          echo "=== Built ==="
+          ls -la dist/
 
       - name: Check the artifacts before uploading
         run: twine check dist/*
@@ -78,9 +94,4 @@ jobs:
           TWINE_PASSWORD: ${{ secrets.RAVEX_PYPI_TOKEN }}
         run: |
           set -eu
-          if [ -z "${TWINE_PASSWORD:-}" ]; then
-            echo "RAVEX_PYPI_TOKEN is not set: a tag was pushed but nothing" >&2
-            echo "reach PyPI. Add the secret, or remove this step on purpose." >&2
-            exit 1
-          fi
           twine upload dist/*
