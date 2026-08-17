@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Run it by hand, without inventing a commit to trigger it. The need showed up
+  # the first time this repository had Actions switched on after the pushes had
+  # already happened: main was untested and there was no event left to replay.
+  workflow_dispatch:
 
 jobs:
   # The engine on every interpreter we claim to support. No Moonclip here:
