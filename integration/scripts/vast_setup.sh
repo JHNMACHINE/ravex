@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # Set up a rented multi-GPU box to measure the sharded checkpoint paths.
 #
+# **For measuring a released version, use `measure_handoff.sh` instead**: since
+# 2026-08-17 both libraries are on PyPI, so `pip install "ravex[moonclip]"` gets
+# compiled wheels and none of the copying or Rust building below is needed. This
+# script is what you want when the change under measurement is *not* released —
+# it copies the working trees as they are and builds Moonclip from them.
+#
 # Run this *on the box*, after the working trees have been copied there:
 #
 #   rsync -az --exclude .git --exclude target --exclude .venv \

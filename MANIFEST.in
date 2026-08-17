@@ -1,0 +1,5 @@
+# The sdist gets README, LICENSE and NOTICE from pyproject.toml, but not the
+# changelog: setuptools has no field for it. Which meant the source archive —
+# the thing a distribution packager or an auditor reads — was the one place the
+# release notes were missing.
+include CHANGELOG.md
