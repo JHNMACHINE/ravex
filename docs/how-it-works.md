@@ -185,6 +185,19 @@ tensors named `ravex/models/<key>/<param>`, stable across steps, which is what
 per-tensor delta tracking keys on. Unchanged weights cost zero I/O on the next
 checkpoint.
 
+That wall time is time the loop is stopped, so the log line for each checkpoint
+carries the breakdown rather than only the total — the shape of it being:
+
+```
+Checkpoint at step 240 handed off in 0.412s (collect 0.031s, flatten 0.220s, store 0.161s)
+```
+
+`collect` is gathering the state, `flatten` the walk through the state tree, and
+`store` the shadow copy — plus, if the previous checkpoint's writer has not
+drained, however long that took: Moonclip allows one write in flight. Setting
+`MOONCLIP_PROFILE=1` separates those two. The `torch_save` backend reports `copy`
+and `queue` instead, which is the same split.
+
 ## Distributed
 
 Rank 0 writes; every rank resumes. That asymmetry matters: a rank that came
@@ -294,12 +307,20 @@ a shape error from inside the loader.
 The backend is not built at activation. It is built the first time something
 needs to read or write.
 
-The reason shows up as soon as you run `torchrun`: the launcher process imports
-torch inside a project that has a `ravex.yaml`, so Ravex activates there too —
-and then never sees a single step. Same for dataloader workers, and for any
-helper script in the same directory. Building a checkpoint manager eagerly
-would mean each of those creating directories and, with S3 or R2 configured,
-opening connections on behalf of a process with nothing to save.
+The reason is every process that imports torch inside a project with a
+`ravex.yaml` and then never sees a single step: dataloader workers, and any
+helper script in the same directory. Building a checkpoint manager eagerly would
+mean each of those creating directories and, with S3 or R2 configured, opening
+connections on behalf of a process with nothing to save.
+
+The `torchrun` launcher used to be the clearest example — it imports torch to
+parse its own arguments, so a run with eight ranks announced nine runtimes. That
+one is now recognised at the autoloader and never activates at all. Recognising
+it means reading `sys.orig_argv`: under `python -m torch.distributed.run`, runpy
+imports `torch.distributed` while resolving which module to run, so torch — and
+with it the autoloader — fires before `sys.argv[0]` or `__main__.__spec__` say
+anything useful. A worker is never mistaken for it: `LOCAL_RANK` is set, and that
+answer comes first.
 
 ## When it breaks
 

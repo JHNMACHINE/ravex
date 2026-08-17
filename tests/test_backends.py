@@ -92,6 +92,40 @@ def test_moonclip_backend_writes_under_a_torchrun_environment(
     backend.close()
 
 
+# ─── where the handoff spends its time ──────────────────────────────
+
+
+def test_the_handoff_says_which_phase_it_spent_its_time_in(tmp_path):
+    """A handoff costs the training loop wall time, and the total alone never
+    says where it went.
+
+    The measured 10.6 s per checkpoint on 8× RTX 5060 Ti took three A/B runs to
+    *not* explain — thread count, compression level and cadence each moved it by
+    under a second. The phases are what turns the next such number into a
+    diagnosis instead of another round of experiments.
+    """
+    backend = TorchSaveBackend(make_config(tmp_path, backend="torch_save"))
+    phases = backend.save(1, sample_state(1), {"step": "1"})
+    backend.close()
+
+    assert list(phases) == ["copy", "queue"]
+    assert all(seconds >= 0 for seconds in phases.values())
+
+
+@pytest.mark.skipif(not HAVE_MOONCLIP, reason="moonclip not installed")
+def test_the_moonclip_handoff_separates_flattening_from_storing(tmp_path):
+    """The two halves answer different questions: `flatten` is Python walking
+    the state tree, `store` is the shadow copy plus any writer still draining."""
+    from ravex._backends import MoonclipBackend
+
+    backend = MoonclipBackend(make_config(tmp_path, backend="moonclip"))
+    phases = backend.save(1, sample_state(1), {"step": "1"})
+    backend.close()
+
+    assert list(phases) == ["flatten", "store"]
+    assert all(seconds >= 0 for seconds in phases.values())
+
+
 # ─── per-rank stores ────────────────────────────────────────────────
 
 

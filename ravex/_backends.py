@@ -17,6 +17,13 @@ Two implementations ship with Ravex:
 Both copy the state to CPU memory *before* returning from ``save``. That copy
 is the whole point: it lets the training loop mutate the live tensors while the
 writer is still working, without the writer reading half-updated weights.
+
+``save`` reports how long each phase of that handoff took, and the runtime puts
+those numbers in its per-checkpoint log line. On 8× RTX 5060 Ti the handoff came
+out at 10.6 s against 1.5 s of state collection, and three A/B runs against the
+suspects — thread count, compression level, checkpoint cadence — each moved it
+by under a second. Guessing has a poor record here; the breakdown is cheap
+enough to always be on.
 """
 
 from __future__ import annotations
@@ -26,6 +33,7 @@ import inspect
 import logging
 import os
 import re
+import time
 from abc import ABC, abstractmethod
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Dict, Optional
@@ -37,9 +45,18 @@ class CheckpointBackend(ABC):
     """Storage interface used by the runtime."""
 
     @abstractmethod
-    def save(self, step: int, state: Dict[str, Any], metadata: Dict[str, str]) -> None:
+    def save(
+        self, step: int, state: Dict[str, Any], metadata: Dict[str, str]
+    ) -> Dict[str, float]:
         """Persist ``state``. Returns once the state has been copied, not
-        once it has been written."""
+        once it has been written.
+
+        The return value is how long each phase of that copy took, in seconds,
+        in the order the phases ran. It exists so the runtime's log line can say
+        *where* a slow handoff went instead of only how long it took — the
+        difference between a number that ends an investigation and one that
+        starts another.
+        """
 
     @abstractmethod
     def load_latest(self) -> Optional[Dict[str, Any]]:
@@ -144,7 +161,9 @@ class MoonclipBackend(CheckpointBackend):
                 "will block the training loop for roughly 5x longer per save"
             )
 
-    def save(self, step: int, state: Dict[str, Any], metadata: Dict[str, str]) -> None:
+    def save(
+        self, step: int, state: Dict[str, Any], metadata: Dict[str, str]
+    ) -> Dict[str, float]:
         # `as_tensors` hands Moonclip the tensors and lets it take the shadow
         # copy itself, on all cores with the GIL released. Flattening to bytes
         # here instead cost two serial copies of the whole state — one in
@@ -155,13 +174,24 @@ class MoonclipBackend(CheckpointBackend):
         # contract this class documents. It just happens one line later, inside
         # `save_raw`. That matters because for a model already on CPU the dict
         # below aliases live parameter memory rather than owning a copy of it.
+        started = time.perf_counter()
         if self._as_tensors:
             tensors, _ = self._moonclip.flatten_state_dict(
                 state, _PREFIX, as_tensors=True
             )
         else:
             tensors, _ = self._moonclip.flatten_state_dict(state, _PREFIX)
+        flattened = time.perf_counter()
         self._manager.save_raw(step=step, tensors=tensors, metadata=metadata)
+        # `store` is not the write: that runs in the background. It is the
+        # shadow copy, plus however long the previous checkpoint's writer still
+        # needed — Moonclip allows one save in flight, so a writer that has not
+        # drained is backpressure landing on this line. `MOONCLIP_PROFILE=1`
+        # separates the two.
+        return {
+            "flatten": flattened - started,
+            "store": time.perf_counter() - flattened,
+        }
 
     def load_latest(self) -> Optional[Dict[str, Any]]:
         snapshots = self._manager.list_snapshots()
@@ -265,12 +295,16 @@ class TorchSaveBackend(CheckpointBackend):
         )
         self._pending: Optional[Future] = None
 
-    def save(self, step: int, state: Dict[str, Any], metadata: Dict[str, str]) -> None:
+    def save(
+        self, step: int, state: Dict[str, Any], metadata: Dict[str, str]
+    ) -> Dict[str, float]:
         import torch
 
+        started = time.perf_counter()
         snapshot = _cpu_copy(state)
         snapshot["_ravex_metadata"] = dict(metadata)
         path = os.path.join(self.directory, f"step_{step:012d}.pt")
+        copied = time.perf_counter()
 
         # Serialize writes: two concurrent torch.save calls on one disk are
         # slower than one, and ordering matters for pruning.
@@ -284,6 +318,13 @@ class TorchSaveBackend(CheckpointBackend):
             # normally-finishing run takes - so write it here instead of losing
             # it. Nothing is racing us: the training loop is over.
             self._write(torch, snapshot, path)
+
+        # `queue` is the previous checkpoint's `torch.save` finishing: one
+        # writer thread, and `flush()` above waits for it.
+        return {
+            "copy": copied - started,
+            "queue": time.perf_counter() - copied,
+        }
 
     def _write(self, torch, snapshot: Dict[str, Any], path: str) -> None:
         temporary = path + ".tmp"
