@@ -4,6 +4,10 @@ on:
   push:
     tags:
       - 'v*'
+  # A manual run is a rehearsal: it builds and checks the artifacts and stops
+  # before the upload. A workflow that only triggers on tags can otherwise only
+  # be tested by spending a version number. Publishing still requires a tag.
+  workflow_dispatch:
 
 jobs:
   build-and-publish:
@@ -21,16 +25,19 @@ jobs:
 
       # Full history on purpose: the check below has to prove the tagged commit
       # is on main, and a shallow clone cannot answer that question.
+      # By sha rather than by ref name, so a manual rehearsal — where the ref is
+      # a branch and not a tag — checks out the same way a release does.
       - name: Checkout
         run: |
-          git clone --branch ${{ forgejo.ref_name }} \
-            ${{ forgejo.server_url }}/${{ forgejo.repository }}.git .
+          git clone ${{ forgejo.server_url }}/${{ forgejo.repository }}.git .
+          git checkout ${{ forgejo.sha }}
 
       # A tag can be pushed from any commit in the repository, including one on
       # a branch that was never reviewed or merged. Publishing is the one action
       # here that cannot be undone — PyPI refuses to reuse a version number — so
       # the tag has to name a commit that reached main.
       - name: Tag must be on main
+        if: ${{ forgejo.event_name == 'push' }}
         run: |
           set -eu
           if ! git merge-base --is-ancestor HEAD origin/main; then
@@ -49,6 +56,7 @@ jobs:
       # Ahead of the build, and of the token check below, because both cost
       # nothing and the mistake they catch cannot be undone.
       - name: Tag must match the package version
+        if: ${{ forgejo.event_name == 'push' }}
         run: |
           set -eu
           VERSION=$(python -c "import ravex; print(ravex.__version__)")
@@ -89,6 +97,7 @@ jobs:
       # `ravex[moonclip]` resolves its extra from PyPI, so Moonclip has to be
       # published there before this repository is tagged.
       - name: Publish to PyPI
+        if: ${{ forgejo.event_name == 'push' }}
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.RAVEX_PYPI_TOKEN }}
