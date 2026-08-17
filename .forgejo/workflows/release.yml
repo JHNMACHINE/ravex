@@ -103,4 +103,13 @@ jobs:
           TWINE_PASSWORD: ${{ secrets.RAVEX_PYPI_TOKEN }}
         run: |
           set -eu
-          twine upload dist/*
+          # `--skip-existing` so a re-run is harmless. Without it, uploading a
+          # file PyPI already holds is a 400 whose body twine reports as just
+          # "Bad Request" — which is how this pipeline's first run ever ended,
+          # having raced a manual upload of the same 0.0.2 by forty seconds.
+          #
+          # What it costs: re-publishing a version with different content becomes
+          # silence rather than an error. PyPI never overwrites a filename
+          # anyway, so the content cannot really differ; what is lost is the loud
+          # complaint, and that is a fair trade for a re-runnable release.
+          twine upload --skip-existing dist/*
