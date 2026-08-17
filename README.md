@@ -8,6 +8,13 @@ pip install ravex
 ravex enable
 ```
 
+Ravex itself is pure Python and installs anywhere. Its default checkpoint engine,
+[Moonclip](https://codeberg.org/JHNMACHINE/moonclip), ships wheels for Linux
+x86_64 only — so `pip install "ravex[moonclip]"` is a Linux thing, and on any
+other platform Ravex falls back to `torch_save` on its own. What changed between
+versions is in
+[CHANGELOG.md](https://codeberg.org/JHNMACHINE/ravex/src/branch/main/CHANGELOG.md).
+
 Drop a `ravex.yaml` next to your code and run what you always ran:
 
 ```bash
@@ -65,6 +72,7 @@ storage:
   path: ./checkpoints
 keep_last: 5
 max_steps: null              # optional hard stop, see below
+sharded_checkpoints: gather  # gather | per_rank, for FSDP — see below
 ```
 
 Every option also reads from `RAVEX_*` environment variables, which win over
@@ -154,27 +162,32 @@ leaves behind loads into a plain single-process model afterwards.
 ### Sharded models
 
 With FSDP each rank holds a slice of every parameter, so `state_dict()` returns
-a fragment. Ravex gathers the whole thing, which makes the checkpoint
-independent of the topology that produced it: a run sharded over eight GPUs can
-be resumed on one.
+a fragment. Two ways to turn that into a checkpoint, picked with
+`sharded_checkpoints`:
 
-Two consequences worth knowing:
+**`gather`** (default) rebuilds the whole state on rank 0, which writes it. The
+checkpoint is then independent of the topology that produced it — eight GPUs in,
+one out — and it does not scale: rank 0 has to hold the entire model and
+optimizer in host memory, and it is the rank that then does the writing.
 
-- Collecting a checkpoint becomes a **collective**. Every rank participates in
-  the gather; only rank 0 writes.
-- There is **no final checkpoint at exit** for a sharded model. Shutdown is
-  where ranks stop being in lockstep, and a gather nobody else joins hangs.
-  Losing the last few steps is bounded; a hang is not. Set `checkpoint_every`
-  accordingly.
+**`per_rank`** has every rank write its own shard into its own store,
+`<storage.path>/rank_<n>`. Nothing is gathered, so nothing is bounded by one
+rank's memory, and on a 1.48B model collecting the state went from 15.6 s to
+1.5 s. What you give up is the resharding: those shards are cut for one topology,
+so the checkpoint resumes at the same world size and starts clean at any other.
+Needs FSDP2 — under FSDP1 Ravex degrades to `gather` and says so.
+
+Either way, collecting is a **collective**: every rank participates, and there is
+**no final checkpoint at exit** for a sharded model. Shutdown is where ranks stop
+being in lockstep, and a collective nobody else joins hangs. Losing the last few
+steps is bounded; a hang is not. Set `checkpoint_every` accordingly.
+
+Numbers and the FSDP1 details: [docs/configuration.md](docs/configuration.md).
 
 Known limits today:
 
 - **`IterableDataset`**: no index sampler exists, so the stream position cannot
   be replayed. Everything else is still restored.
-- **Very large sharded models**: the gather is a full state dict, so rank 0
-  needs to hold the model in CPU memory. Per-rank sharded checkpoints — which
-  Moonclip already supports — are the answer for models past that point, and
-  are not wired up yet.
 - **Your loop's bounds**: a resumed script runs its own `for epoch in
   range(N)` again from the top; it has no idea 3000 steps already happened. Set
   `max_steps` and Ravex ends the run at the right step regardless of how many
