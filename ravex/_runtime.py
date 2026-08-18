@@ -90,6 +90,10 @@ class RavexRuntime:
         self._resume_attempted = False
         self._restoring = False
         self._last_saved_step: Optional[int] = None
+        # For the cadence warning: when the previous handoff finished,
+        # and whether the observation has already been made.
+        self._last_checkpoint_end: Optional[float] = None
+        self._cadence_warned = False
         self._shutdown_done = False
         self._lock = threading.RLock()
         self._framework = "unknown"
@@ -389,13 +393,62 @@ class RavexRuntime:
         # seconds the training loop is stopped, and every investigation of one
         # so far has started by re-running the job to find out which phase it
         # was. Two perf_counter calls per phase is a cheap way not to.
+        finished = time.perf_counter()
         logger.info(
             "Checkpoint at step %d handed off in %.3fs (%s)",
             step,
-            time.perf_counter() - started,
+            finished - started,
             ", ".join("%s %.3fs" % item for item in phases.items()),
         )
+        self._warn_if_cadence_is_expensive(step, started, finished, phases)
         return True
+
+    #: Fraction of wall time going into checkpoint handoff above which the
+    #: cadence is worth mentioning. A fifth is the point where a reader would
+    #: rather have been told: below it the cost reads as overhead, above it as
+    #: a choice.
+    _CADENCE_WARN_FRACTION = 0.2
+
+    def _warn_if_cadence_is_expensive(
+        self, step: int, started: float, finished: float, phases: dict
+    ) -> None:
+        """Say what fraction of the loop is going into checkpoints. Once.
+
+        Deliberately a statement of what happened, not a prediction. Measured on
+        8x RTX 5060 Ti with a 1.5B model: at ``checkpoint_every=2`` the handoff
+        is a third of wall time and nothing breaks — the writer keeps up, the
+        run is simply slower than the author probably meant it to be. So this
+        does not claim the cadence is unsustainable, and it does not silently
+        raise it. Both would be guesses about a machine this process cannot
+        see; the ratio is a fact it can.
+
+        ``drain`` is excluded on purpose. That phase is the training loop's own
+        queued GPU work coming due, not a cost of checkpointing, and counting it
+        would make every cadence look expensive on a fast writer.
+        """
+        previous = self._last_checkpoint_end
+        self._last_checkpoint_end = finished
+        if previous is None or self._cadence_warned:
+            return
+
+        interval = finished - previous
+        cost = sum(v for k, v in phases.items() if k != "drain")
+        if interval <= 0 or cost / interval < self._CADENCE_WARN_FRACTION:
+            return
+
+        self._cadence_warned = True
+        logger.warning(
+            "checkpoint_every=%d is costing %.0f%% of wall time: %.1fs of "
+            "handoff per %.1fs between checkpoints, at step %d. The run will "
+            "still complete and checkpoints are still durable - it is just "
+            "spending that share on them. Raising checkpoint_every reduces it "
+            "proportionally; the trade is how much progress a crash costs.",
+            self.config.checkpoint_every,
+            100 * cost / interval,
+            cost,
+            interval,
+            step,
+        )
 
     @staticmethod
     def _collected_per_rank(state: dict) -> bool:
