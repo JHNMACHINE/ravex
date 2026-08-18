@@ -41,5 +41,20 @@ jobs:
       - name: Unit suite on 3.12
         run: |
           set -eu
+          # torch is not a dependency of Ravex - it is the thing Ravex hooks,
+          # and declaring it would decide the build (CPU or CUDA) for everyone
+          # who installs. But five test modules import it at module scope, so
+          # without it this job collected nothing and reported five collection
+          # errors. It had never been green.
+          #
+          # Same index pair as ci.yml, for the same reason: `--index-url` alone
+          # replaces PyPI and pip then cannot find torch's build dependencies.
+          #
+          # `--no-cache-dir` because this runs on codeberg-small, whose 2 GB
+          # quota counts filesystem writes as well as memory: torch is 750 MB
+          # installed (876 MB of site-packages all told) and the cache would
+          # keep a second copy of the wheel on top. Nothing here is ever reused
+          # - the container is thrown away - so the cache buys nothing.
+          pip install --quiet --no-cache-dir --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple torch
           pip install --quiet -e . pytest
           pytest tests -q
