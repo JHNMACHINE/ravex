@@ -51,7 +51,12 @@ jobs:
           python --version
           # CPU wheels: these tests are about correctness, not throughput, and
           # the CUDA build is gigabytes of download for nothing.
-          pip install --quiet --index-url https://download.pytorch.org/whl/cpu torch
+          # `--index-url` *replaces* PyPI rather than adding to it, so pip could
+          # not find the build backends torch's own dependencies need
+          # (flit_core) and every job died in six seconds. `--extra-index-url`
+          # puts PyPI back alongside it. The CPU build still wins: `+cpu` is a
+          # PEP 440 local version and sorts above the plain one on PyPI.
+          pip install --quiet --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple torch
           pip install --quiet -e . pytest
           pytest tests -v
 
@@ -88,7 +93,7 @@ jobs:
       - name: Build Moonclip and run the full suite
         run: |
           . "$HOME/.cargo/env"
-          pip install --quiet --index-url https://download.pytorch.org/whl/cpu torch
+          pip install --quiet --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple torch
           pip install --quiet maturin pytest
           git clone --depth 1 \
             ${{ forgejo.server_url }}/${{ forgejo.repository_owner }}/moonclip.git /tmp/moonclip
@@ -126,12 +131,8 @@ jobs:
 
       - name: Install
         run: |
-          pip install --quiet --index-url https://download.pytorch.org/whl/cpu torch
+          pip install --quiet --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple torch
           pip install --quiet pytest numpy
-          # The frameworks Ravex claims to support by hooking PyTorch itself.
-          # Both own the training loop and wrap the dataloader in ways plain
-          # PyTorch does not, so the claim is an argument until this runs.
-          pip install --quiet "transformers>=4.40" "accelerate>=1.1" "lightning>=2.2"
           pip install --quiet -e .
 
       - name: Install the autoloader
@@ -145,4 +146,49 @@ jobs:
         # `integration/` and `tests/` both have a conftest.py, and pytest
         # collides on the module name if they are collected together. They are
         # separate jobs here, so this only has to name one of them.
-        run: pytest integration -v --tb=short
+        #
+        # test_frameworks.py is excluded because it is the only file that needs
+        # transformers, accelerate and lightning — it has its own job below.
+        run: pytest integration -v --tb=short --ignore=integration/test_frameworks.py
+
+  # Split out of `integration` because that job hit the ten-minute wall on
+  # `codeberg-medium` — 602 seconds, the limit to the second — and was cancelled
+  # on every run.
+  #
+  # The split works because it *removes* cost rather than dividing it:
+  # transformers, accelerate and lightning are hundreds of megabytes, and
+  # `test_frameworks.py` is the only file in the suite that imports them. The
+  # job above no longer pays for them at all, and this one runs a single file.
+  integration-frameworks:
+    runs-on: codeberg-medium
+    container:
+      image: python:3.12-bookworm
+    steps:
+      - name: Install git
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq git
+
+      - name: Checkout
+        run: |
+          set -eu
+          git clone ${{ forgejo.server_url }}/${{ forgejo.repository }}.git .
+          git checkout ${{ forgejo.sha }}
+
+      - name: Install
+        run: |
+          pip install --quiet --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple torch
+          pip install --quiet pytest numpy
+          # The frameworks Ravex claims to support by hooking PyTorch itself.
+          # Both own the training loop and wrap the dataloader in ways plain
+          # PyTorch does not, so the claim is an argument until this runs.
+          pip install --quiet "transformers>=4.40" "accelerate>=1.1" "lightning>=2.2"
+          pip install --quiet -e .
+
+      - name: Install the autoloader
+        run: |
+          ravex enable
+          ravex status
+
+      - name: Framework integration suite
+        run: pytest integration/test_frameworks.py -v --tb=short

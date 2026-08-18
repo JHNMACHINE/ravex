@@ -5,7 +5,10 @@ are all about *not* acting: not for a process that never opted in, and not for
 one that starts a training run without ever doing any training itself.
 """
 
+import os
 import sys
+
+import pytest
 
 from ravex import _bootstrap
 
@@ -51,6 +54,24 @@ def test_the_torchrun_launcher_is_not_a_rank(monkeypatch):
     # and argv[0] is what gives it away.
     launched_as(monkeypatch, "/usr/local/bin/torchrun", "-c", argv0="/usr/local/bin/torchrun")
     assert _bootstrap._is_launcher_process()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="a backslash separates paths only on Windows")
+def test_the_windows_console_script_is_recognised_too(monkeypatch):
+    """Split out of the test above because it can only pass where it is true.
+
+    ``_is_launcher_process`` splits ``argv[0]`` with ``os.path``, which is
+    ``ntpath`` on Windows and ``posixpath`` everywhere else. On POSIX a
+    backslash is an ordinary character in a filename rather than a separator,
+    so a Windows path stays whole and never matches ``torchrun``.
+
+    That is the right answer, not a gap to paper over in the library: such a
+    path cannot be ``argv[0]`` on a POSIX interpreter, and splitting on
+    backslashes there would mis-read a legitimate filename. Asserting it
+    unguarded is what turned the CI red on Linux while it passed on the
+    developer's Windows box.
+    """
+    monkeypatch.delenv("LOCAL_RANK", raising=False)
     launched_as(monkeypatch, r"C:\venv\Scripts\torchrun.exe", argv0=r"C:\venv\Scripts\torchrun.exe")
     assert _bootstrap._is_launcher_process()
 
