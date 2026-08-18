@@ -1,9 +1,14 @@
 name: CI
 
+# Only `main`. Between the six-interpreter matrix, the job that builds Moonclip
+# from source and the integration suite, a pull request and its merge ran the
+# whole thing twice for one change. `checks.yml` covers the branch cheaply
+# instead.
+#
+# The cost, stated plainly: a branch is not proven against every interpreter
+# before merging, so a 3.9-only or integration-only failure lands on main.
 on:
   push:
-    branches: [main]
-  pull_request:
     branches: [main]
   # Run it by hand, without inventing a commit to trigger it. The need showed up
   # the first time this repository had Actions switched on after the pushes had

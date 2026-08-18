@@ -1,0 +1,45 @@
+name: Checks
+
+# The branch guard. `ci.yml` runs the full thing and only on main, so this is
+# what a branch is judged by — it has to be quick enough that nobody is tempted
+# to skip it.
+#
+# One interpreter instead of six, and the unit suite only. What it does *not*
+# cover is exactly what makes ci.yml slow and is worth keeping there: the other
+# five interpreters, the job that builds Moonclip from source, and the
+# integration suite. Those still gate nothing until main — that is the trade
+# taken when the pipeline moved off pull requests.
+#
+# 3.12 is the version to run here because it is the one the Moonclip backend
+# and the integration jobs also use, so a break there is the likeliest to be
+# caught by this rather than only later.
+on:
+  push:
+    branches-ignore: [main]
+  workflow_dispatch:
+
+jobs:
+  unit:
+    runs-on: codeberg-small
+    container:
+      image: python:3.12-bookworm
+    steps:
+      - name: Install git
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq git
+
+      # Not shallow: `--depth 1` fetches only the default branch's tip, so the
+      # pushed commit is missing from the clone and the job quietly tests main
+      # instead. Same reasoning as ci.yml.
+      - name: Checkout
+        run: |
+          set -eu
+          git clone ${{ forgejo.server_url }}/${{ forgejo.repository }}.git .
+          git checkout ${{ forgejo.sha }}
+
+      - name: Unit suite on 3.12
+        run: |
+          set -eu
+          pip install --quiet -e . pytest
+          pytest tests -q
