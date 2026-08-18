@@ -27,11 +27,21 @@ classifiers = [
 dependencies = ["PyYAML>=5.1"]
 
 [project.optional-dependencies]
-# 0.0.4, not 0.0.3: that is where `keep_last` stopped erasing the whole
-# checkpoint history instead of trimming it, and a checkpointing library that
-# loses checkpoints is not a floor worth allowing. (The old `>=0.2` was not
-# satisfiable by any version that has ever existed.)
-moonclip = ["moonclip>=0.0.4"]
+# 0.0.7, and the floor has moved twice for the same reason: each time, the
+# version below it loses or wedges something Ravex's own defaults walk straight
+# into.
+#
+#   >=0.0.4  `keep_last` stopped erasing the whole checkpoint history instead
+#            of trimming it. (The old `>=0.2` was not satisfiable by any
+#            version that has ever existed.)
+#   >=0.0.7  two things. `save` could deadlock the interpreter — it blocked on
+#            a Moonclip rayon worker waiting for work only that worker could
+#            finish, which wedged roughly one run in three. And a merge could
+#            unlink a snapshot a reader was still inside. Ravex is the caller
+#            that makes both likely: `sharded_checkpoints: per_rank` has every
+#            rank on the node saving at once, and the merger runs against
+#            stores that a resume may be reading.
+moonclip = ["moonclip>=0.0.7"]
 dev = ["pytest>=7", "numpy"]
 
 [project.urls]
