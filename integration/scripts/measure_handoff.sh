@@ -72,16 +72,45 @@ phases() {
     grep -h "waited .* for the previous one" "$dir"/ravex.log "$dir"/stderr.txt 2>/dev/null || true
 }
 
+# Free GiB on the filesystem the runs write to.
+free_gib() { df -PBG "$RUNS" | awk 'NR==2 {gsub(/G/,"",$4); print $4}'; }
+
+# Below this a phase cannot write a full set of shards and would be measuring
+# ENOSPC instead of the handoff.
+NEED_GIB=${NEED_GIB:-40}
+
+# Each phase writes N shards of the whole model and keeps `keep_last` of them,
+# which on 8 ranks at 1.5B is tens of GiB — enough that four phases in a row
+# fill an ordinary box disk. The first phase to hit ENOSPC does not stop: Ravex
+# reports the failed checkpoint, disables itself and lets training continue, so
+# the phase still prints timings — for the checkpoints that happened, on a full
+# filesystem. That is a measurement of the disk wearing the costume of a
+# measurement of the handoff, and it is not obvious from the numbers alone.
+#
+# So each phase drops its own checkpoints as soon as its numbers have been
+# read, and refuses to start if the space is not there. The logs stay: they are
+# kilobytes, and they are the payload.
 run() {
     local name="$1"; shift
     local dir
     dir=$(workspace "$name" "$EVERY")
-    echo "→ $name  ($*)"
-    ( cd "$dir" && env "$@" torchrun --nproc_per_node="$N" --master_port=29566 \
-        "$SCRIPT" --params "$PARAMS" --api fsdp2 --steps "$STEPS" \
-        >stdout.txt 2>stderr.txt ) || {
+    local before; before=$(free_gib)
+    if [ "$before" -lt "$NEED_GIB" ]; then
+        echo "  SKIPPED $name: ${before} GiB free, needs $NEED_GIB." >&2
+        echo "  Free space or lower --params; raising NEED_GIB only hides it." >&2
+        return 1
+    fi
+    echo "→ $name  ($*)   [${before} GiB free]"
+    ( cd "$dir" && env "$@" torchrun --nproc_per_node="$N" --master_port=29566         "$SCRIPT" --params "$PARAMS" --api fsdp2 --steps "$STEPS"         >stdout.txt 2>stderr.txt ) || {
             echo "  FAILED — tail of stderr:"; tail -20 "$dir/stderr.txt"; }
+    # ENOSPC never fails the run, so the log has to be asked directly — before
+    # anybody reads the timings as an answer.
+    if grep -qs "No space left on device" "$dir"/ravex.log "$dir"/stderr.txt; then
+        echo "  DISK FULL during $name — these timings measure the filesystem." >&2
+    fi
     phases "$dir"
+    rm -rf "$dir/checkpoints"
+    echo "  (freed $name's checkpoints — $(free_gib) GiB free)"
 }
 
 section "1. baseline: per-rank, defaults"
