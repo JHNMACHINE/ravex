@@ -149,6 +149,32 @@ class RavexConfig:
     compression_level: int = 3
     keep_last: int = 5
 
+    # Whether Moonclip keeps the last full snapshot's bytes resident so the
+    # next delta can be computed without reading them back from storage.
+    #
+    # It costs **exactly one extra copy of the saved state** — about +11 GiB
+    # for a 1B model with its Adam state — and that copy appears only after
+    # the first checkpoint of a run. Which is what makes it the first suspect
+    # in GPU-54: `collect` costs half as much at step 2, before any base is
+    # retained, as it does from step 4 on. Turning it off is how that
+    # hypothesis gets tested, and on a box where host memory is the binding
+    # constraint it is also how the memory gets bought back.
+    #
+    # Defaults to Moonclip's own default rather than to what an experiment
+    # would prefer.
+    keep_base_in_memory: bool = True
+
+    # Whether Moonclip writes in the background. On, the training loop pays
+    # only for the shadow copy and the write drains behind it — which is the
+    # entire premise of the handoff being cheap, so this is not a knob to turn
+    # off casually.
+    #
+    # It exists because "off" is the only way to ask whether the *next*
+    # collection is competing with the previous write. With it on there is a
+    # writer running during every collection except the first, which is exactly
+    # the shape GPU-54 measures.
+    async_save: bool = True
+
     # How a sharded (FSDP) model gets written.
     #
     # ``gather``    the whole state is collected on rank 0, which writes it.
@@ -249,6 +275,10 @@ class RavexConfig:
             self.compression_level = _as_int(value, self.compression_level)
         if (value := get("KEEP_LAST")) is not None:
             self.keep_last = _as_int(value, self.keep_last)
+        if (value := get("KEEP_BASE_IN_MEMORY")) is not None:
+            self.keep_base_in_memory = _as_bool(value, self.keep_base_in_memory)
+        if (value := get("ASYNC_SAVE")) is not None:
+            self.async_save = _as_bool(value, self.async_save)
         if (value := get("SHARDED_CHECKPOINTS")) is not None:
             self.sharded_checkpoints = value
         if (value := get("TRACK_DATALOADERS")) is not None:
@@ -303,6 +333,8 @@ class RavexConfig:
             "checkpoint_on_exit",
             "resume",
             "delta",
+            "keep_base_in_memory",
+            "async_save",
             "track_dataloaders",
             "track_rng",
             "handle_sigterm",

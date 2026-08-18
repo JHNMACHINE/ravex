@@ -37,6 +37,43 @@ logger = logging.getLogger("ravex")
 _LOG_FORMAT = "%(asctime)s [ravex] %(levelname)s %(message)s"
 
 
+def _drain_accelerator() -> None:
+    """Wait for this rank's queued device work, and let the caller bill it.
+
+    The training loop is asynchronous: Python runs ahead of the device, so when
+    a checkpoint is taken there is still work in flight, and none of the state
+    can be read until it lands. Something has to wait for it. The question is
+    only what the waiting gets called.
+
+    Measured on 8x RTX 5060 Ti with a 1.5B model, FSDP2 per-rank: this drain is
+    2.98 s at the first checkpoint of a run and ~7.1 s at every one after, while
+    the collection it precedes — `get_state_dict` plus the device-to-host copy —
+    is 1.55 s and does not move. Folded together, as they were, `collect` read
+    5 s and then 10 s, and the doubling looked like a defect in the collection.
+    It was the loop's lead over the device growing from one queued step to two.
+
+    Timing it separately costs nothing and stops the phase breakdown from
+    charging training compute to the checkpoint. The wall time is unchanged:
+    this synchronize is the one `collect_state` would have done implicitly a
+    moment later.
+
+    Silent when there is no accelerator, and deliberately not `torch.cuda`
+    specific — a CPU run has nothing to drain and must not import cuda to find
+    that out.
+    """
+    torch = sys.modules.get("torch")
+    if torch is None:  # pragma: no cover - checkpointing implies torch
+        return
+    try:
+        accelerator = getattr(torch, "accelerator", None)
+        if accelerator is not None and accelerator.is_available():
+            accelerator.synchronize()
+        elif torch.cuda.is_available():
+            torch.cuda.synchronize()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("Could not drain the accelerator queue: %s", exc)
+
+
 class RavexRuntime:
     """Singleton runtime. Build it through :func:`get_runtime`."""
 
@@ -306,12 +343,15 @@ class RavexRuntime:
 
         started = time.perf_counter()
         phases: dict = {}
+        _drain_accelerator()
+        collect_started = time.perf_counter()
+        phases["drain"] = collect_started - started
         try:
             state = self.registry.collect_state(
                 track_rng=self.config.track_rng,
                 sharded_layout=self.config.sharded_checkpoints,
             )
-            phases["collect"] = time.perf_counter() - started
+            phases["collect"] = time.perf_counter() - collect_started
 
             # Under `per_rank` there is nothing on rank 0 to write for the
             # other ranks — each holds its own shard and writes it into its own

@@ -95,6 +95,25 @@ class CheckpointBackend(ABC):
 _PREFIX = "ravex"
 
 
+def _accepts(obj, name: str) -> bool:
+    """Whether ``obj`` takes a keyword argument called ``name``.
+
+    Moonclip's surface has grown parameters since its first release, and this
+    backend runs against whatever build happens to be installed. Handing an
+    unknown keyword to a PyO3 constructor is a TypeError raised in the middle
+    of a training run, so every optional parameter gets asked about once, here,
+    rather than guessed at later.
+
+    Introspection does work on PyO3 callables, but nothing promises it always
+    will; failing to introspect is therefore read as "does not take it", which
+    is the answer that keeps the run alive.
+    """
+    try:
+        return name in inspect.signature(obj).parameters
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        return False
+
+
 class MoonclipBackend(CheckpointBackend):
     """Default backend, built on the Moonclip checkpoint engine."""
 
@@ -108,7 +127,7 @@ class MoonclipBackend(CheckpointBackend):
             "storage_root": storage.path,
             "compression_level": config.compression_level,
             "max_total_snapshots": config.keep_last,
-            "async_save": True,
+            "async_save": config.async_save,
             # Always single-rank, stated explicitly. Moonclip otherwise infers
             # world_size from RANK/WORLD_SIZE in the environment, and under
             # torchrun it then rejects the single-rank save API outright:
@@ -120,6 +139,24 @@ class MoonclipBackend(CheckpointBackend):
             "world_size": 1,
             "rank": 0,
         }
+
+        # Passed only when it differs from Moonclip's own default, so a build
+        # that predates the parameter behaves exactly as it did before and only
+        # a run that explicitly asked to turn retention off is told it cannot.
+        if not config.keep_base_in_memory:
+            if _accepts(moonclip.CheckpointManager, "keep_base_in_memory"):
+                kwargs["keep_base_in_memory"] = False
+            else:
+                logger.warning(
+                    "keep_base_in_memory=false was requested but this Moonclip "
+                    "build does not take the option; the base will be retained"
+                )
+
+        if not config.async_save:
+            logger.warning(
+                "async_save=false: the training loop will block until each "
+                "checkpoint is durable, not just copied"
+            )
 
         if not config.delta:
             # No dedicated switch in Moonclip: a full snapshot on every step is
@@ -145,16 +182,9 @@ class MoonclipBackend(CheckpointBackend):
 
         self._manager = moonclip.CheckpointManager(**kwargs)
 
-        # `as_tensors` arrived after the first released Moonclip. Passing it to
-        # a build that predates it is a TypeError in the middle of a training
-        # run, which is exactly the failure mode this backend exists to avoid,
-        # so ask once here rather than guess later.
-        try:
-            self._as_tensors = "as_tensors" in inspect.signature(
-                moonclip.flatten_state_dict
-            ).parameters
-        except (TypeError, ValueError):  # pragma: no cover - defensive
-            self._as_tensors = False
+        # `as_tensors` arrived after the first released Moonclip, so it gets the
+        # same treatment.
+        self._as_tensors = _accepts(moonclip.flatten_state_dict, "as_tensors")
         if not self._as_tensors:
             logger.info(
                 "Moonclip predates flatten_state_dict(as_tensors=); checkpoints "

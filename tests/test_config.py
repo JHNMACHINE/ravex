@@ -149,3 +149,27 @@ def test_an_unknown_sharded_mode_falls_back_and_says_so(tmp_path, monkeypatch):
     config = RavexConfig.load()
     assert config.sharded_checkpoints == "gather", "a typo must not silently shard"
     assert any("sharded_checkpoints" in problem for problem in config.problems)
+
+
+def test_keep_base_in_memory_reads_yaml_and_env(tmp_path, monkeypatch):
+    assert RavexConfig().keep_base_in_memory, "must default to Moonclip's default"
+
+    path = tmp_path / "ravex.yaml"
+    path.write_text("keep_base_in_memory: false", encoding="utf-8")
+    monkeypatch.setenv("RAVEX_CONFIG", str(path))
+    assert RavexConfig.load().keep_base_in_memory is False
+
+    # The env var is what an A/B run on a rented box actually uses: two
+    # otherwise identical invocations, one variable between them.
+    monkeypatch.setenv("RAVEX_KEEP_BASE_IN_MEMORY", "true")
+    assert RavexConfig.load().keep_base_in_memory is True
+
+
+def test_a_junk_keep_base_value_falls_back_and_says_so(tmp_path, monkeypatch):
+    path = tmp_path / "ravex.yaml"
+    path.write_text("keep_base_in_memory: maybe", encoding="utf-8")
+    monkeypatch.setenv("RAVEX_CONFIG", str(path))
+
+    config = RavexConfig.load()
+    assert config.keep_base_in_memory is True, "a typo must not drop the base"
+    assert any("keep_base_in_memory" in problem for problem in config.problems)
