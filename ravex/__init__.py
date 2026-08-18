@@ -27,7 +27,7 @@ from typing import Any, Dict, Optional
 #: (`[tool.setuptools.dynamic]`), because declaring it in both is a pair that
 #: drifts at the first bump — and `ravex status` reports this one, so the drift
 #: shows up as the CLI stating a version nobody installed.
-__version__ = "0.0.2"
+__version__ = "0.0.3"
 
 __all__ = [
     "activate",

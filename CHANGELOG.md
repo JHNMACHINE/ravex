@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.0.3 — 2026-08-18
+
+**No changes to the library.** `git diff v0.0.2..v0.0.3 -- ravex/` is empty: the
+package you install is byte-for-byte the 0.0.2 one. This release exists to carry
+the packaging fix below and to put the release pipeline through a real
+publication for the first time, which is a thing worth knowing about a version
+before you wonder what it changed.
+
+### Fixed
+
+- **The source archive contains the changelog again.** Setuptools takes the
+  readme and the licences from `pyproject.toml` but has no field for a changelog,
+  so `ravex-0.0.2.tar.gz` shipped without one — the sdist being exactly the copy
+  a distribution packager or an auditor reads, and the one that survives if the
+  repository does not. A line of `MANIFEST.in` fixes it; this is the first
+  release built with it, and the archive was checked rather than assumed.
+
+### Infrastructure
+
+Not shipped, but this is the release where CI started meaning something. Every
+job had been failing: `--index-url` for the CPU torch wheels *replaces* PyPI
+instead of adding to it, so pip could not find the build backends torch's own
+dependencies need and the six interpreter jobs died in six seconds each. The
+integration job hit the ten-minute runner limit to the second, and now runs in
+under five with the framework tests split into a job of their own. One unit test
+asserted Windows path semantics on a POSIX interpreter and had never run
+anywhere it could fail.
+
 ## 0.0.2 — 2026-08-17
 
 First release on PyPI: `pip install ravex`, or `pip install "ravex[moonclip]"` on
