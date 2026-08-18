@@ -21,7 +21,7 @@ jobs:
   # this job covers the runtime, the patches, the sampler and the torch_save
   # backend across the whole matrix without paying for a Rust build six times.
   unit:
-    runs-on: codeberg-small
+    runs-on: codeberg-medium
     strategy:
       fail-fast: false
       matrix:
@@ -62,7 +62,7 @@ jobs:
   # this job independent of whether a Moonclip release happens to be published,
   # and it tests the pairing at the commit both repositories are actually at.
   moonclip-backend:
-    runs-on: codeberg-small
+    runs-on: codeberg-medium
     container:
       image: python:3.12-bookworm
     steps:
@@ -104,7 +104,7 @@ jobs:
   # empty interpreter, torchrun, and a crash delivered as SIGKILL. Mirrors
   # integration/Dockerfile — keep the two in step.
   integration:
-    runs-on: codeberg-small
+    runs-on: codeberg-medium
     container:
       image: python:3.12-bookworm
     steps:
