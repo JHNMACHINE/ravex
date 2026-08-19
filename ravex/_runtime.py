@@ -152,9 +152,51 @@ class RavexRuntime:
                 get_rank(),
                 get_world_size(),
             )
+            self._warn_if_split_across_machines()
         except Exception as exc:
             logger.error("Activation failed: %s", exc, exc_info=True)
             self._disable("activation failed")
+
+    def _warn_if_split_across_machines(self) -> None:
+        """Say, before the first checkpoint, that this one will not be resumable.
+
+        A multi-machine job writing per-rank checkpoints to local disks leaves
+        each machine holding a different part of one checkpoint. It resumes
+        only if every machine gets the same ranks back, which no launcher
+        promises, and it survives losing a machine not at all — the shards that
+        went with it are disjoint slices no other rank can rebuild.
+
+        Reproduced on 2026-08-19: four nodes, one killed mid-run, 2260 steps
+        unrecoverable on three intact disks.
+
+        Said **here** rather than at the resume that fails, because by then the
+        checkpoints have been written to the wrong places for hours and the
+        warning has nothing left to prevent. Once per machine, not once per
+        rank: it is a statement about a filesystem.
+        """
+        from ravex._distributed import (
+            is_local_main_process,
+            local_world_size,
+            spans_several_machines,
+        )
+
+        if self.config.storage.is_remote or not spans_several_machines():
+            return
+        if not is_local_main_process():
+            return
+
+        per_machine = max(local_world_size(), 1)
+        machines = -(-get_world_size() // per_machine)
+        logger.warning(
+            "This job spans %d machines and writes checkpoints to local "
+            "storage (%s). Each machine holds only its own ranks' shards, so "
+            "the checkpoint resumes only if every machine is given the same "
+            "ranks again - which no launcher promises - and not at all if one "
+            "machine is lost. Point storage at S3, or at a filesystem every "
+            "node shares.",
+            machines,
+            self.config.storage.path,
+        )
 
     def _ensure_backend(self) -> bool:
         """Build the checkpoint backend on first real use.

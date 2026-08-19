@@ -19,6 +19,7 @@ import pytest
 from ravex._backends import visible_rank_stores
 from ravex._config import RavexConfig
 from ravex._resume import ResumeManager
+from ravex._runtime import RavexRuntime
 
 
 def store_for(base, rank, files=("step_000000000004.pt",)):
@@ -206,6 +207,69 @@ class TestWhyThereIsNothingToResume:
 
         text = self.explain(local_config(tmp_path))
         assert "starting from scratch" in text
+
+
+class TestTheWarningBeforeTheFirstCheckpoint:
+    """Said at activation, where it can still prevent something.
+
+    At the resume that fails, hours of checkpoints have already gone to the
+    wrong machines. See ``_warn_if_split_across_machines``.
+    """
+
+    def warn(self, monkeypatch, config, world, local, local_rank=0):
+        monkeypatch.setenv("WORLD_SIZE", str(world))
+        monkeypatch.setenv("LOCAL_WORLD_SIZE", str(local))
+        monkeypatch.setenv("LOCAL_RANK", str(local_rank))
+        monkeypatch.setattr("ravex._distributed._dist", lambda: None)
+
+        runtime = RavexRuntime.__new__(RavexRuntime)
+        runtime.config = config
+
+        logger = logging.getLogger("ravex")
+        captured = Captured()
+        logger.addHandler(captured)
+        previous = logger.level
+        logger.setLevel(logging.INFO)
+        try:
+            runtime._warn_if_split_across_machines()
+        finally:
+            logger.removeHandler(captured)
+            logger.setLevel(previous)
+        return captured.text
+
+    def test_local_storage_across_machines_is_warned_about(
+        self, tmp_path, monkeypatch
+    ):
+        text = self.warn(monkeypatch, local_config(tmp_path), world=32, local=8)
+
+        assert "spans 4 machines" in text
+        assert "not at all if one machine is lost" in text
+
+    def test_one_machine_is_not_warned_about(self, tmp_path, monkeypatch):
+        """Eight ranks on one box is the ordinary case and needs no noise."""
+        text = self.warn(monkeypatch, local_config(tmp_path), world=8, local=8)
+
+        assert text == ""
+
+    def test_remote_storage_is_not_warned_about(self, tmp_path, monkeypatch):
+        """The case that works. Every node writes to the same bucket."""
+        config = local_config(tmp_path)
+        config.storage.type = "s3"
+        config.storage.bucket = "checkpoints"
+
+        assert self.warn(monkeypatch, config, world=32, local=8) == ""
+
+    def test_it_is_said_once_per_machine_not_once_per_rank(
+        self, tmp_path, monkeypatch
+    ):
+        """It is a statement about a filesystem, not about a process.
+
+        Eight ranks per node repeating it would put it on screen 32 times.
+        """
+        text = self.warn(monkeypatch, local_config(tmp_path), world=32, local=8,
+                         local_rank=3)
+
+        assert text == ""
 
 
 def _install(monkeypatch, seen, world):

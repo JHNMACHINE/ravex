@@ -62,6 +62,48 @@ def is_main_process() -> bool:
     return get_rank() == 0
 
 
+def local_world_size() -> int:
+    """Ranks sharing this machine, as the launcher reports it.
+
+    ``torchrun`` sets ``LOCAL_WORLD_SIZE``; SLURM's equivalent is
+    ``SLURM_NTASKS_PER_NODE``. Read from the environment rather than derived,
+    because the process group knows how many ranks there are and nothing about
+    which of them share a filesystem.
+
+    Falls back to the whole world, which makes a single-node job the assumption
+    when nothing says otherwise — the reading that raises no false alarm.
+    """
+    for var in ("LOCAL_WORLD_SIZE", "SLURM_NTASKS_PER_NODE"):
+        value = os.environ.get(var)
+        if value is not None:
+            try:
+                return int(value)
+            except ValueError:
+                continue
+    return get_world_size()
+
+
+def spans_several_machines() -> bool:
+    """Whether this job runs on more than one machine."""
+    return get_world_size() > local_world_size()
+
+
+def is_local_main_process() -> bool:
+    """First rank on this machine. ``True`` when nothing says otherwise.
+
+    For things that are true once per machine rather than once per rank —
+    anything about the local filesystem — where logging per rank would repeat
+    itself once per GPU.
+    """
+    value = os.environ.get("LOCAL_RANK")
+    if value is None:
+        return is_main_process()
+    try:
+        return int(value) == 0
+    except ValueError:
+        return is_main_process()
+
+
 def barrier() -> None:
     """Synchronize all ranks, if a process group is up."""
     dist = _dist()
