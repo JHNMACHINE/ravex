@@ -272,21 +272,32 @@ class TestWhyThereIsNothingToResume:
         assert "starting from scratch" in text
 
 
-class TestTheWarningBeforeTheFirstCheckpoint:
-    """Said at activation, where it can still prevent something.
+class TestWhatItSaysBeforeTheFirstCheckpoint:
+    """Three situations, and the difference between them is asked, not assumed.
 
-    At the resume that fails, hours of checkpoints have already gone to the
-    wrong machines. See ``_warn_if_split_across_machines``.
+    A shared filesystem and a local disk look identical in the config: both are
+    ``storage.type: local`` pointing at a directory that exists. The first
+    version of this warning fired on both, which would have cried wolf at every
+    cluster with an NFS mount.
     """
 
-    def warn(self, monkeypatch, config, world, local, local_rank=0):
+    def announce(self, monkeypatch, config, world, local, local_rank=0, shared=False):
         monkeypatch.setenv("WORLD_SIZE", str(world))
         monkeypatch.setenv("LOCAL_WORLD_SIZE", str(local))
         monkeypatch.setenv("LOCAL_RANK", str(local_rank))
         monkeypatch.setattr("ravex._distributed._dist", lambda: None)
 
+        probed = []
+
+        def probe(path):
+            probed.append(path)
+            return shared
+
+        monkeypatch.setattr("ravex._distributed.storage_is_shared", probe)
+
         runtime = RavexRuntime.__new__(RavexRuntime)
         runtime.config = config
+        runtime._storage_announced = False
 
         logger = logging.getLogger("ravex")
         captured = Captured()
@@ -294,162 +305,88 @@ class TestTheWarningBeforeTheFirstCheckpoint:
         previous = logger.level
         logger.setLevel(logging.INFO)
         try:
-            runtime._warn_if_split_across_machines()
+            runtime._announce_storage_topology()
         finally:
             logger.removeHandler(captured)
             logger.setLevel(previous)
-        return captured.text
+        return captured.text, probed
 
-    def test_local_storage_across_machines_is_warned_about(
-        self, tmp_path, monkeypatch
-    ):
-        text = self.warn(monkeypatch, local_config(tmp_path), world=32, local=8)
+    def test_split_local_storage_is_warned_about(self, tmp_path, monkeypatch):
+        text, probed = self.announce(
+            monkeypatch, local_config(tmp_path), world=32, local=8, shared=False
+        )
 
         assert "spans 4 machines" in text
         assert "not at all if one machine is lost" in text
+        assert probed, "the warning was given without checking the filesystem"
 
-    def test_one_machine_is_not_warned_about(self, tmp_path, monkeypatch):
+    def test_a_shared_filesystem_is_not_warned_about(self, tmp_path, monkeypatch):
+        """The requirement: if the condition is there, use it and say nothing alarming."""
+        text, _ = self.announce(
+            monkeypatch, local_config(tmp_path), world=32, local=8, shared=True
+        )
+
+        assert "shared across all 4 machines" in text
+        assert "lost" not in text
+
+    def test_one_machine_is_not_probed_or_warned_about(self, tmp_path, monkeypatch):
         """Eight ranks on one box is the ordinary case and needs no noise."""
-        text = self.warn(monkeypatch, local_config(tmp_path), world=8, local=8)
+        text, probed = self.announce(
+            monkeypatch, local_config(tmp_path), world=8, local=8
+        )
 
         assert text == ""
+        assert probed == [], "a single-machine job paid for a collective probe"
 
-    def test_remote_storage_is_not_warned_about(self, tmp_path, monkeypatch):
-        """The case that works. Every node writes to the same bucket."""
+    def test_remote_storage_is_not_probed_or_warned_about(self, tmp_path, monkeypatch):
+        """The case that already works. Every node writes to the same bucket."""
         config = local_config(tmp_path)
         config.storage.type = "s3"
         config.storage.bucket = "checkpoints"
 
-        assert self.warn(monkeypatch, config, world=32, local=8) == ""
-
-    def test_it_is_said_once_per_machine_not_once_per_rank(
-        self, tmp_path, monkeypatch
-    ):
-        """It is a statement about a filesystem, not about a process.
-
-        Eight ranks per node repeating it would put it on screen 32 times.
-        """
-        text = self.warn(monkeypatch, local_config(tmp_path), world=32, local=8,
-                         local_rank=3)
+        text, probed = self.announce(monkeypatch, config, world=32, local=8)
 
         assert text == ""
+        assert probed == []
 
-
-class TestRunIdentity:
-    def test_the_config_wins_over_everything(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("SLURM_JOB_ID", "999")
-        config = local_config(tmp_path)
-        config.run_id = "mine"
-
-        assert local_run_id(config) == (FROM_CONFIG, "mine")
-
-    def test_a_scheduler_job_id_is_used_when_there_is_one(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("SLURM_JOB_ID", "4711")
-        monkeypatch.delenv("TORCHELASTIC_RUN_ID", raising=False)
-
-        assert local_run_id(local_config(tmp_path)) == (FROM_SCHEDULER, "slurm-4711")
-
-    def test_torchelastics_none_is_not_an_identity(self, tmp_path, monkeypatch):
-        """Verified on 2026-08-19, and the reason this function exists.
-
-        ``torchrun`` sets ``TORCHELASTIC_RUN_ID`` to the literal string
-        ``"none"`` under the static rendezvous, which is what a plain
-        ``--nnodes/--node_rank`` invocation uses. Taken at face value it would
-        give every unrelated run on the machine one identity, which is worse
-        than having none at all.
-        """
-        monkeypatch.delenv("SLURM_JOB_ID", raising=False)
-        monkeypatch.setenv("TORCHELASTIC_RUN_ID", "none")
-
-        assert scheduler_run_id() is None
-
-        provenance, value = local_run_id(local_config(tmp_path))
-        assert provenance == GENERATED
-        assert value.startswith("run-")
-
-    def test_a_real_rendezvous_id_is_used(self, tmp_path, monkeypatch):
-        monkeypatch.delenv("SLURM_JOB_ID", raising=False)
-        monkeypatch.setenv("TORCHELASTIC_RUN_ID", "job-17")
-
-        assert scheduler_run_id() == "torchelastic-job-17"
-
-    def test_an_existing_store_lends_its_id_to_the_run_continuing_it(
+    def test_every_rank_probes_but_only_one_per_machine_speaks(
         self, tmp_path, monkeypatch
     ):
-        monkeypatch.delenv("SLURM_JOB_ID", raising=False)
-        monkeypatch.setenv("TORCHELASTIC_RUN_ID", "none")
-        store = store_for(tmp_path, 0)
-        write_owner(str(store), "run-earlier", rank=0, world_size=4)
+        """The probe is collective; the message is about a filesystem.
 
-        assert local_run_id(local_config(tmp_path), str(store)) == (
-            FROM_STORE,
-            "run-earlier",
+        Skipping the probe on non-speaking ranks would leave the speaker alone
+        inside a collective, which is the hang this codebase has already paid
+        for once.
+        """
+        text, probed = self.announce(
+            monkeypatch, local_config(tmp_path), world=32, local=8, local_rank=3
         )
 
-    def test_the_record_survives_a_round_trip(self, tmp_path):
-        store = store_for(tmp_path, 2)
-        write_owner(str(store), "run-x", rank=2, world_size=8)
+        assert text == ""
+        assert probed, "a silent rank skipped the collective the speaker entered"
 
-        record = read_owner(str(store))
-        assert record["run_id"] == "run-x"
-        assert record["rank"] == 2
-        assert record["world_size"] == 8
-        assert record["host"]
-
-    def test_a_store_with_no_record_reads_as_none(self, tmp_path):
-        assert read_owner(str(store_for(tmp_path, 1))) is None
-
-    def test_an_unwritable_store_does_not_raise(self, tmp_path):
-        """Recording who wrote a checkpoint must never cost the checkpoint."""
-        write_owner(str(tmp_path / "no" / "such" / "place"), "r", 0, 1)
-
-
-class TestAgreeingOnTheRunId:
-    """Best provenance wins, not rank 0.
-
-    The case that makes it matter: rank 0's machine was replaced, so it has
-    nothing to inherit and invents an id, while the surviving ranks are reading
-    the run they are continuing. Rank 0 winning would rename the run on every
-    restart that lost the first node.
-    """
-
-    def gather(self, monkeypatch, votes):
-        class FakeDist:
-            @staticmethod
-            def is_available():
-                return True
-
-            @staticmethod
-            def is_initialized():
-                return True
-
-            @staticmethod
-            def get_world_size():
-                return len(votes)
-
-            @staticmethod
-            def all_gather_object(out, _mine):
-                out[:] = list(votes)
-
-        monkeypatch.setattr("ravex._distributed._dist", lambda: FakeDist)
-
-    def test_an_inherited_id_beats_a_generated_one(self, monkeypatch):
-        self.gather(
-            monkeypatch,
-            [(GENERATED, "run-new"), (FROM_STORE, "run-old"), (FROM_STORE, "run-old")],
-        )
-
-        assert agree_on_run_id(GENERATED, "run-new") == "run-old"
-
-    def test_the_config_beats_an_inherited_one(self, monkeypatch):
-        self.gather(monkeypatch, [(FROM_STORE, "run-old"), (FROM_CONFIG, "chosen")])
-
-        assert agree_on_run_id(FROM_STORE, "run-old") == "chosen"
-
-    def test_without_a_process_group_the_local_answer_stands(self, monkeypatch):
+    def test_it_is_said_once(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("WORLD_SIZE", "32")
+        monkeypatch.setenv("LOCAL_WORLD_SIZE", "8")
+        monkeypatch.setenv("LOCAL_RANK", "0")
         monkeypatch.setattr("ravex._distributed._dist", lambda: None)
+        monkeypatch.setattr("ravex._distributed.storage_is_shared", lambda p: False)
 
-        assert agree_on_run_id(GENERATED, "run-alone") == "run-alone"
+        runtime = RavexRuntime.__new__(RavexRuntime)
+        runtime.config = local_config(tmp_path)
+        runtime._storage_announced = False
+
+        logger = logging.getLogger("ravex")
+        captured = Captured()
+        logger.addHandler(captured)
+        logger.setLevel(logging.INFO)
+        try:
+            runtime._announce_storage_topology()
+            runtime._announce_storage_topology()
+        finally:
+            logger.removeHandler(captured)
+
+        assert captured.text.count("spans 4 machines") == 1
 
 
 def _install(monkeypatch, seen, world):

@@ -93,6 +93,7 @@ class RavexRuntime:
         self._patches = None
         self._backend = None
         self._resume_manager: Optional[ResumeManager] = None
+        self._storage_announced = False
         self._leader_optimizer_id: Optional[int] = None
         self._checkpoint_due = False
         self._resume_attempted = False
@@ -152,48 +153,69 @@ class RavexRuntime:
                 get_rank(),
                 get_world_size(),
             )
-            self._warn_if_split_across_machines()
         except Exception as exc:
             logger.error("Activation failed: %s", exc, exc_info=True)
             self._disable("activation failed")
 
-    def _warn_if_split_across_machines(self) -> None:
-        """Say, before the first checkpoint, that this one will not be resumable.
+    def _announce_storage_topology(self) -> None:
+        """Say which of the three situations this multi-machine job is in.
 
-        A multi-machine job writing per-rank checkpoints to local disks leaves
-        each machine holding a different part of one checkpoint. It resumes
-        only if every machine gets the same ranks back, which no launcher
-        promises, and it survives losing a machine not at all — the shards that
-        went with it are disjoint slices no other rank can rebuild.
+        A shared filesystem and a local disk are indistinguishable from the
+        configuration — both are ``storage.type: local`` pointing at a
+        directory that exists — so this asks the filesystem instead of
+        guessing. Guessing wrong costs either a false alarm on a cluster that
+        is perfectly safe, or silence on a job whose checkpoint is being split
+        across disks that cannot see each other.
 
-        Reproduced on 2026-08-19: four nodes, one killed mid-run, 2260 steps
-        unrecoverable on three intact disks.
+        Said before the first checkpoint, which is the only moment it can
+        prevent anything: after that the shards have been written to the wrong
+        places and the warning has nothing left to do. Not at activation
+        though — Ravex activates on import, before the training script calls
+        ``init_process_group``, and the probe is a collective.
 
-        Said **here** rather than at the resume that fails, because by then the
-        checkpoints have been written to the wrong places for hours and the
-        warning has nothing left to prevent. Once per machine, not once per
-        rank: it is a statement about a filesystem.
+        Every rank probes; one rank per machine speaks. Gating the probe on the
+        local rank would leave the others waiting inside a collective the
+        speaker alone entered.
         """
         from ravex._distributed import (
             is_local_main_process,
             local_world_size,
             spans_several_machines,
+            storage_is_shared,
         )
 
+        if self._storage_announced:
+            return
+        self._storage_announced = True
+
+        # Both conditions come from config and launcher environment, identical
+        # on every rank, so the ranks take this branch together or not at all.
         if self.config.storage.is_remote or not spans_several_machines():
             return
+
+        shared = storage_is_shared(self.config.storage.path)
+
         if not is_local_main_process():
             return
 
-        per_machine = max(local_world_size(), 1)
-        machines = -(-get_world_size() // per_machine)
+        machines = -(-get_world_size() // max(local_world_size(), 1))
+        if shared:
+            logger.info(
+                "Checkpoint storage (%s) is shared across all %d machines - "
+                "per-rank checkpoints resume no matter which machine gets "
+                "which ranks.",
+                self.config.storage.path,
+                machines,
+            )
+            return
+
         logger.warning(
-            "This job spans %d machines and writes checkpoints to local "
-            "storage (%s). Each machine holds only its own ranks' shards, so "
-            "the checkpoint resumes only if every machine is given the same "
-            "ranks again - which no launcher promises - and not at all if one "
-            "machine is lost. Point storage at S3, or at a filesystem every "
-            "node shares.",
+            "This job spans %d machines and each writes checkpoints to its own "
+            "local storage (%s) - verified, not assumed. Every machine holds "
+            "only its own ranks' shards, so the checkpoint resumes only if "
+            "every machine is given the same ranks again - which no launcher "
+            "promises - and not at all if one machine is lost. Point storage "
+            "at S3, or at a filesystem every node shares.",
             machines,
             self.config.storage.path,
         )
@@ -350,6 +372,10 @@ class RavexRuntime:
 
     def _try_resume(self, defer_rng: bool = False) -> None:
         self._resume_attempted = True
+        # Before the `resume` guard: a run that never resumes still deserves to
+        # be told its checkpoints are being split, and this is the first point
+        # where the process group is up to find out.
+        self._announce_storage_topology()
         if not self.config.resume:
             return
         if not self._ensure_backend():

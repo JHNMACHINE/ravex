@@ -437,6 +437,60 @@ def agree_on_run_id(provenance: int, candidate: str) -> str:
     return best[1] if best else candidate
 
 
+def storage_is_shared(path: str) -> bool:
+    """Whether every machine in this job sees the same directory. **Collective.**
+
+    Asked rather than deduced. A path on a local disk and a path on an NFS or
+    Lustre mount are indistinguishable from the configuration — both are
+    ``storage.type: local`` pointing at a directory that exists — and guessing
+    wrong is expensive in both directions: a false alarm on a cluster that is
+    fine, or silence on a job whose checkpoint is being split across disks.
+
+    Every rank drops a uniquely named marker and then looks for everyone
+    else's. ``all_gather_object`` is the synchronisation: a rank's name only
+    reaches the others after it has written the file, so by the time the list
+    comes back every marker exists on the filesystem that will hold it.
+
+    A directory that cannot be written to answers False. That is the safe
+    reading — it makes the caller assume the checkpoint is split — and an
+    unwritable checkpoint directory is a larger problem that the backend will
+    report on its own.
+    """
+    import uuid
+
+    dist = _dist()
+    marker = ".ravex-shared-%s" % uuid.uuid4().hex[:12]
+
+    try:
+        os.makedirs(path, exist_ok=True)
+        with open(os.path.join(path, marker), "w", encoding="utf-8") as handle:
+            handle.write("probe")
+    except OSError:
+        return False
+
+    try:
+        if dist is None or not dist.is_available() or not dist.is_initialized():
+            # One process sees whatever it wrote, which is the honest answer
+            # for a job that is not distributed at all.
+            return True
+
+        names: List[Any] = [None] * dist.get_world_size()
+        dist.all_gather_object(names, marker)
+        shared = all(
+            isinstance(name, str) and os.path.exists(os.path.join(path, name))
+            for name in names
+        )
+
+        # Nobody removes a marker another rank is still looking for.
+        barrier()
+        return shared
+    finally:
+        try:
+            os.remove(os.path.join(path, marker))
+        except OSError:
+            pass
+
+
 def all_ranks_agree(ok: bool) -> bool:
     """Whether *every* rank reports success. **Collective.**
 
