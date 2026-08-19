@@ -332,9 +332,33 @@ def fixed_chunks(blocks, size: int):
         yield bytes(buffer)
 
 
+def recovery_roles(rank, send_to, receive_from, needs, holds):
+    """What this rank does in a recovery pass: ``(should_send, should_receive)``.
+
+    ``needs[r]`` is whether rank *r* came up without its own store — a machine
+    that was replaced. ``holds[r]`` is whether rank *r* is holding a **whole**
+    copy of the rank it received from, which under the ring is the rank that
+    sends to it.
+
+    Recovery runs the ring backwards: a copy travels back to the rank it
+    belongs to. So this rank receives from the peer it normally sends to, and
+    sends to the peer it normally receives from.
+
+    Both sides work this out from the same gathered lists, which is what makes
+    the pairing exact. A send posted without a matching receive would sit there
+    until the job died — and this runs at startup, before anyone is watching.
+    """
+    if not (0 <= rank < len(needs)) or len(holds) != len(needs):
+        return False, False
+
+    should_receive = bool(needs[rank]) and bool(holds[send_to])
+    should_send = bool(needs[receive_from]) and bool(holds[rank])
+    return should_send, should_receive
+
+
 def exchange_stores(
-    source: str,
-    destination: str,
+    source: "str | None",
+    destination: "str | None",
     send_to: int,
     receive_from: int,
     chunk: int = CHUNK,
@@ -342,31 +366,45 @@ def exchange_stores(
 ) -> bool:
     """Trade one store for another around the ring. **Collective in effect.**
 
-    Every rank sends its own store to ``send_to`` and receives one from
-    ``receive_from``, at the same time. Blocking sends would deadlock the whole
-    ring — each rank would sit in ``send`` waiting for a receiver that is
-    itself sitting in ``send`` — so the send is posted non-blocking and waited
-    on beside the receive.
+    Either direction may be switched off by passing ``None`` for its path, and
+    the recovery pass in :func:`fetch_missing_stores` needs that: there, only
+    the ranks that lost a store receive, and only the ranks holding what they
+    lost send. Both ends work out the same pairs beforehand, so a send is never
+    posted without a receive waiting for it.
 
-    Returns whether the store arrived whole. The caller must not treat that as
-    the answer for everybody: a round is only a recovery point if *every* rank
-    succeeded, which is a separate agreement.
+    Blocking sends would stall the whole ring — every rank sitting in ``send``
+    waiting for a receiver who is itself sitting in ``send`` — so the send is
+    posted non-blocking and waited on beside the receive.
+
+    Returns whether the incoming store arrived whole, and ``True`` when nothing
+    was expected. The caller must not read that as the answer for everybody: a
+    round is a recovery point only if every rank succeeded, which is a separate
+    agreement.
     """
     import torch
     import torch.distributed as dist
 
-    outgoing = encoded_size(source)
-    lengths = torch.zeros(2, dtype=torch.int64)
-    lengths[0] = outgoing
+    sending = source is not None
+    receiving = destination is not None
+    if not sending and not receiving:
+        return True
 
-    # Sizes first, so the receiver can allocate before anything large moves.
-    sending = dist.isend(lengths[0:1].clone(), dst=send_to, group=group)
-    dist.recv(lengths[1:2], src=receive_from, group=group)
-    sending.wait()
-    incoming = int(lengths[1].item())
+    outgoing = encoded_size(source) if sending else 0
+    incoming = 0
 
-    mine = fixed_chunks(encode_store(source, chunk=chunk), chunk)
-    writer = StoreWriter(destination)
+    # Sizes first, so the receiver allocates before anything large moves.
+    if sending:
+        size = torch.tensor([outgoing], dtype=torch.int64)
+        handle = dist.isend(size, dst=send_to, group=group)
+    if receiving:
+        size_in = torch.zeros(1, dtype=torch.int64)
+        dist.recv(size_in, src=receive_from, group=group)
+        incoming = int(size_in[0].item())
+    if sending:
+        handle.wait()
+
+    mine = fixed_chunks(encode_store(source, chunk=chunk), chunk) if sending else None
+    writer = StoreWriter(destination) if receiving else None
 
     my_chunks = -(-outgoing // chunk) if outgoing else 0
     their_chunks = -(-incoming // chunk) if incoming else 0
@@ -390,7 +428,11 @@ def exchange_stores(
 
             if handle is not None:
                 handle.wait()
+
+        if writer is None:
+            return True
         writer.close()
         return writer.commit()
     finally:
-        writer.close()
+        if writer is not None:
+            writer.close()

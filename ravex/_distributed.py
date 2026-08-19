@@ -491,6 +491,23 @@ def storage_is_shared(path: str) -> bool:
             pass
 
 
+def gather_objects(value):
+    """One small picklable value from every rank, in rank order. **Collective.**
+
+    For facts the ranks must agree on before pairing up point-to-point sends:
+    who lost a store, who holds a whole copy of whose. Both ends deciding from
+    the same list is what keeps a send from being posted with no receive
+    waiting for it.
+    """
+    dist = _dist()
+    if dist is None or not dist.is_available() or not dist.is_initialized():
+        return [value]
+
+    gathered: List[Any] = [None] * dist.get_world_size()
+    dist.all_gather_object(gathered, value)
+    return gathered
+
+
 def all_ranks_agree(ok: bool) -> bool:
     """Whether *every* rank reports success. **Collective.**
 

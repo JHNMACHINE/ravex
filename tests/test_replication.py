@@ -19,6 +19,7 @@ from ravex._replication import (
     encode_store,
     machine_count,
     machine_of,
+    recovery_roles,
     replica_is_complete,
     replication_ring,
     store_files,
@@ -333,3 +334,90 @@ class TestAReplicaThatCanBeTrusted:
         writer.close()
 
         assert not replica_is_complete(str(destination))
+
+
+class TestWhoSendsWhatBackToWhom:
+    """Recovery runs the ring backwards, and the pairs must match exactly.
+
+    A send posted with no receive waiting hangs at startup, before anyone is
+    watching. Both ends decide from the same two lists, so this is where that
+    agreement is checked.
+    """
+
+    def roles(self, world, local, needs, holds):
+        out = {}
+        for rank in range(world):
+            send_to, receive_from = replication_ring(rank, world, local)
+            out[rank] = recovery_roles(rank, send_to, receive_from, needs, holds)
+        return out
+
+    def test_nobody_moves_when_every_rank_has_its_store(self):
+        world, local = 4, 1
+        roles = self.roles(world, local, [False] * 4, [True] * 4)
+
+        assert all(role == (False, False) for role in roles.values())
+
+    def test_one_lost_machine_makes_exactly_one_pair(self):
+        """Rank 2's machine was replaced. Rank 3 has been holding its copy."""
+        world, local = 4, 1
+        needs = [False, False, True, False]
+        roles = self.roles(world, local, needs, [True] * 4)
+
+        assert roles[2] == (False, True), "the replaced rank must receive"
+        assert roles[3] == (True, False), "its copy holder must send"
+        assert roles[0] == (False, False)
+        assert roles[1] == (False, False)
+
+    def test_every_send_has_a_receive_and_the_other_way(self):
+        """The property that matters; checked over every pattern of loss."""
+        import itertools
+
+        world, local = 4, 1
+        for pattern in itertools.product([False, True], repeat=world):
+            roles = self.roles(world, local, list(pattern), [True] * world)
+            for rank in range(world):
+                send_to, receive_from = replication_ring(rank, world, local)
+                sends, _ = roles[rank]
+                _, peer_receives = roles[receive_from]
+                assert sends == peer_receives, (
+                    "with %s rank %d sends=%s but rank %d receives=%s"
+                    % (list(pattern), rank, sends, receive_from, peer_receives)
+                )
+
+    def test_a_torn_copy_is_not_offered(self):
+        """Rank 2 lost its store and rank 3's copy of it is incomplete.
+
+        Nothing moves: half a store is not a store, and sending it would put a
+        checkpoint that cannot be loaded where a missing one used to be.
+        """
+        world, local = 4, 1
+        needs = [False, False, True, False]
+        holds = [True, True, True, False]
+        roles = self.roles(world, local, needs, holds)
+
+        assert roles[2] == (False, False)
+        assert roles[3] == (False, False)
+
+    def test_two_machines_lost_at_once_recover_independently(self):
+        world, local = 4, 1
+        needs = [True, False, True, False]
+        roles = self.roles(world, local, needs, [True] * 4)
+
+        assert roles[0][1] and roles[2][1], "both replaced ranks receive"
+        assert roles[1][0] and roles[3][0], "both holders send"
+
+    def test_a_rank_can_both_send_and_receive_in_one_pass(self):
+        """Neighbours replaced together: rank 1 needs one and owes one.
+
+        Both happen in the same exchange, which is why the send is posted
+        non-blocking rather than completed before the receive begins.
+        """
+        world, local = 4, 1
+        needs = [True, True, False, False]
+        roles = self.roles(world, local, needs, [True] * 4)
+
+        assert roles[1] == (True, True)
+
+    def test_nonsense_input_moves_nothing(self):
+        assert recovery_roles(0, 1, 3, [], []) == (False, False)
+        assert recovery_roles(0, 1, 3, [True, True], [True]) == (False, False)

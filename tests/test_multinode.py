@@ -349,14 +349,49 @@ class TestWhatItSaysBeforeTheFirstCheckpoint:
             logger.setLevel(previous)
         return captured.text, probed
 
-    def test_split_local_storage_is_warned_about(self, tmp_path, monkeypatch):
-        text, probed = self.announce(
-            monkeypatch, local_config(tmp_path), world=32, local=8, shared=False
-        )
+    def test_split_storage_with_copies_running_is_not_alarming(
+        self, tmp_path, monkeypatch
+    ):
+        """Split disks stop being a warning once the copies are going.
+
+        Losing a machine costs an interval, not the run — proven on the bench
+        on 2026-08-19, where a replaced node took its store back from a peer
+        and all four ranks resumed. Saying "not at all if one machine is lost"
+        after that would be false.
+        """
+        config = local_config(tmp_path)
+        config.replicate_every = 10
+        text, probed = self.announce(monkeypatch, config, world=32, local=8)
 
         assert "spans 4 machines" in text
+        assert "every 10 checkpoints" in text
+        assert "at most that much progress" in text
+        assert "not at all if one machine is lost" not in text
+        assert probed, "it spoke without checking the filesystem"
+
+    def test_split_storage_with_copies_off_is_warned_about(
+        self, tmp_path, monkeypatch
+    ):
+        config = local_config(tmp_path)
+        config.replicate_every = 0
+        text, _ = self.announce(monkeypatch, config, world=32, local=8)
+
         assert "not at all if one machine is lost" in text
-        assert probed, "the warning was given without checking the filesystem"
+        assert "replicate_every=0" in text
+
+    def test_copies_asked_for_but_impossible_says_which(self, tmp_path, monkeypatch):
+        """Wanting copies and not being able to place them is the silent case.
+
+        With ranks spread unevenly no peer can be shown to be on a different
+        machine, so nothing is copied. A run that asked for protection and did
+        not get it must not read the same as one that never asked.
+        """
+        config = local_config(tmp_path)
+        config.replicate_every = 10
+        text, _ = self.announce(monkeypatch, config, world=12, local=8)
+
+        assert "not spread evenly" in text
+        assert "not at all if one machine is lost" in text
 
     def test_a_shared_filesystem_is_not_warned_about(self, tmp_path, monkeypatch):
         """The requirement: if the condition is there, use it and say nothing alarming."""

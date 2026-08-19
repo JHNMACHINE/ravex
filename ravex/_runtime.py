@@ -215,15 +215,49 @@ class RavexRuntime:
             )
             return
 
+        from ravex._replication import replication_ring
+
+        ring = replication_ring(get_rank(), get_world_size(), local_world_size())
+        replicating = self.config.replicate_every > 0 and ring is not None
+
+        if replicating:
+            logger.info(
+                "This job spans %d machines and each writes checkpoints to its "
+                "own local storage (%s) - verified, not assumed. Each rank's "
+                "store is copied to a peer on another machine every %d "
+                "checkpoints, so losing one machine costs at most that much "
+                "progress. Keeping the checkpoints after the run ends is "
+                "yours: copy them off before the machines go away, or point "
+                "storage at S3.",
+                machines,
+                self.config.storage.path,
+                self.config.replicate_every,
+            )
+            return
+
+        # Off, and the two reasons are not the same. Saying which one matters:
+        # a layout that cannot be replicated looks exactly like one nobody
+        # asked to replicate, and only one of them is the user's doing.
+        if ring is None and self.config.replicate_every > 0:
+            reason = (
+                "copies between machines are switched on but cannot be placed "
+                "here: the ranks are not spread evenly over the machines, so "
+                "no peer can be shown to be on a different one"
+            )
+        else:
+            reason = "copies between machines are off (replicate_every=0)"
+
         logger.warning(
             "This job spans %d machines and each writes checkpoints to its own "
             "local storage (%s) - verified, not assumed. Every machine holds "
-            "only its own ranks' shards, so the checkpoint resumes only if "
-            "every machine is given the same ranks again - which no launcher "
-            "promises - and not at all if one machine is lost. Point storage "
-            "at S3, or at a filesystem every node shares.",
+            "only its own ranks' shards, and %s, so the checkpoint resumes "
+            "only if every machine is given the same ranks again - which no "
+            "launcher promises - and not at all if one machine is lost. Set "
+            "replicate_every, or point storage at a filesystem every node "
+            "shares.",
             machines,
             self.config.storage.path,
+            reason,
         )
 
     def _ensure_backend(self) -> bool:
@@ -386,6 +420,9 @@ class RavexRuntime:
             return
         if not self._ensure_backend():
             return
+        # Before anything asks what is on disk: a machine that was replaced has
+        # nothing of its own, and its copy is one rank away.
+        self._recover_missing_stores()
         # Bound locally: `_ensure_backend` sets it, but only a local name makes
         # that visible to a type checker, and the package ships `py.typed`.
         resume_manager = self._resume_manager
@@ -538,6 +575,95 @@ class RavexRuntime:
             ", ".join("%s %.3fs" % item for item in phases.items()),
         )
         return True
+
+    def _recover_missing_stores(self) -> None:
+        """Give a replaced machine back the store it never had.
+
+        The ring run backwards. A rank that comes up with nothing — its machine
+        was preempted and a fresh one took its place — pulls its store from the
+        peer that has been holding a copy of it all along. Without this the
+        copies exist and nobody reads them, which protects the bytes and not
+        the run.
+
+        Every rank takes part, and the pairs are worked out from lists all of
+        them have: who is missing a store, and who holds a whole copy of whose.
+        A send posted without a receive waiting would hang here at startup,
+        before anyone is watching.
+
+        Best-effort. Failing to recover means starting from scratch, which is
+        what would have happened anyway; failing loudly at startup would not.
+        """
+        from ravex._backends import (
+            per_rank_store_path,
+            replica_store_path,
+            visible_rank_stores,
+        )
+        from ravex._distributed import gather_objects, local_world_size
+        from ravex._replication import (
+            exchange_stores,
+            recovery_roles,
+            replica_is_complete,
+            replication_ring,
+        )
+
+        if not self._storage_split or not self._per_rank_active():
+            return
+
+        rank = get_rank()
+        ring = replication_ring(rank, get_world_size(), local_world_size())
+        if ring is None:
+            return
+        send_to, receive_from = ring
+
+        own = per_rank_store_path(self.config, rank)
+        held = replica_store_path(self.config, receive_from)
+
+        try:
+            needs_mine = rank not in visible_rank_stores(self.config)
+            holds_whole = replica_is_complete(held)
+        except Exception:  # pragma: no cover - never worth the run
+            needs_mine, holds_whole = False, False
+
+        # Unconditional, and before any of the decisions below: the pairing is
+        # only exact if every rank contributes to the same picture.
+        state = gather_objects((bool(needs_mine), bool(holds_whole)))
+        needs = [bool(entry[0]) for entry in state]
+        holds = [bool(entry[1]) for entry in state]
+
+        if not any(needs):
+            return
+
+        do_send, do_receive = recovery_roles(rank, send_to, receive_from, needs, holds)
+
+        try:
+            # Backwards: the copy travels to the rank it belongs to, so this
+            # sends to the peer it normally receives from, and the other way.
+            ok = exchange_stores(
+                held if do_send else None,
+                own if do_receive else None,
+                send_to=receive_from,
+                receive_from=send_to,
+            )
+        except Exception as exc:
+            logger.warning("Recovering this rank's store from a copy failed: %s", exc)
+            return
+
+        if do_receive and ok:
+            logger.info(
+                "This rank had no store of its own and took one back from rank "
+                "%d, where a copy had been kept.",
+                send_to,
+            )
+            # Rebuilt because the backend read the store when it was empty.
+            self._backend = None
+            self._resume_manager = None
+            self._ensure_backend()
+        elif do_receive:
+            logger.warning(
+                "This rank has no store and the copy on rank %d could not be "
+                "brought back whole - starting from scratch.",
+                send_to,
+            )
 
     def _replicate_if_due(self, step: int) -> None:
         """Trade stores around the ring, so no machine is the only copy.
