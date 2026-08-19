@@ -379,12 +379,14 @@ def agree_on_step(local_step: int) -> int:
     return min(int(step) for step in steps)
 
 
-def gather_visible_stores(visible: "set[int]") -> "list[set[int]]":
+def gather_visible_stores(visible):
     """What every rank can reach on its own machine. **Collective.**
 
-    One entry per rank, in rank order. Ranks on the same machine report the
-    same set — that is not waste, it is how the picture stays readable without
-    anyone having to know which ranks are co-located.
+    Takes and returns a mapping of rank to that store's owner record, or any
+    container of rank numbers. One entry per rank, in rank order. Ranks on the
+    same machine report the same thing — that is not waste, it is how the
+    picture stays readable without anyone having to know which ranks are
+    co-located.
 
     Payload is a handful of integers per rank, so this costs what
     :func:`agree_on_step` costs. It is deliberately *not* a way to move
@@ -394,11 +396,45 @@ def gather_visible_stores(visible: "set[int]") -> "list[set[int]]":
     """
     dist = _dist()
     if dist is None or not dist.is_available() or not dist.is_initialized():
-        return [set(visible)]
+        return [visible]
 
     seen: List[Any] = [None] * dist.get_world_size()
-    dist.all_gather_object(seen, set(visible))
-    return [set(entry or ()) for entry in seen]
+    dist.all_gather_object(seen, visible)
+    return [entry if entry else {} for entry in seen]
+
+
+def agree_on_run_id(provenance: int, candidate: str) -> str:
+    """The run identity every rank will use. **Collective.**
+
+    Not simply rank 0's answer. A rank that inherited an id from its own store
+    is naming the history this job is continuing; a rank that had to invent one
+    is naming nothing. So the best-sourced candidate wins, and ties go to the
+    lowest rank for determinism — see the provenance constants in
+    :mod:`ravex._identity`.
+
+    The case that makes this worth the care: rank 0's machine was replaced, so
+    it generates, while ranks 1..n read the id of the run they are resuming. If
+    rank 0 won, a resumed run would rename itself on every restart that lost
+    the first node, and the lineage would be unreadable exactly when it matters.
+    """
+    dist = _dist()
+    if dist is None or not dist.is_available() or not dist.is_initialized():
+        return candidate
+
+    votes: List[Any] = [None] * dist.get_world_size()
+    dist.all_gather_object(votes, (int(provenance), str(candidate)))
+
+    best = None
+    for entry in votes:
+        if not entry:
+            continue
+        try:
+            rank_provenance, value = int(entry[0]), str(entry[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if best is None or rank_provenance < best[0]:
+            best = (rank_provenance, value)
+    return best[1] if best else candidate
 
 
 def all_ranks_agree(ok: bool) -> bool:

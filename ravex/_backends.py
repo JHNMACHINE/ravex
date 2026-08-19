@@ -444,7 +444,7 @@ def _per_rank_config(config, per_rank: bool):
     if not per_rank:
         return config
 
-    suffix = "rank_%d" % get_rank()
+    suffix = rank_suffix(get_rank())
     storage = replace(
         config.storage,
         path=os.path.join(config.storage.path, suffix),
@@ -455,6 +455,22 @@ def _per_rank_config(config, per_rank: bool):
         ),
     )
     return replace(config, storage=storage)
+
+
+def rank_suffix(rank: int) -> str:
+    """The directory one rank's store lives in, under the configured path."""
+    return "rank_%d" % rank
+
+
+def per_rank_store_path(config, rank: int) -> str:
+    """Where one rank's store is on this machine.
+
+    Only meaningful for local storage; the caller is expected to have checked.
+    Here rather than rebuilt by callers so the layout has one definition — the
+    resume diagnosis and the owner record both need it, and a second copy of
+    ``rank_%d`` is a second thing to keep in step with ``_per_rank_config``.
+    """
+    return os.path.join(config.storage.path, rank_suffix(rank))
 
 
 def visible_rank_stores(config) -> "set[int]":
@@ -494,6 +510,23 @@ def visible_rank_stores(config) -> "set[int]":
         except OSError:
             continue
     return found
+
+
+def visible_store_owners(config) -> "dict[int, dict]":
+    """:func:`visible_rank_stores`, plus who wrote each one.
+
+    The record is what turns "rank 2's store is not here" into "rank 2's store
+    was written on node0, which is not running rank 2 now" — the difference
+    between knowing something is wrong and knowing where to look. Missing or
+    unreadable records map to an empty dict: the store is still present, and
+    saying so with less detail beats not mentioning it.
+    """
+    from ravex._identity import read_owner
+
+    return {
+        rank: (read_owner(per_rank_store_path(config, rank)) or {})
+        for rank in visible_rank_stores(config)
+    }
 
 
 def get_backend(config, per_rank: bool = False) -> CheckpointBackend:

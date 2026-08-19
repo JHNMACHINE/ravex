@@ -17,6 +17,17 @@ import logging
 import pytest
 
 from ravex._backends import visible_rank_stores
+from ravex._distributed import agree_on_run_id
+from ravex._identity import (
+    FROM_CONFIG,
+    FROM_SCHEDULER,
+    FROM_STORE,
+    GENERATED,
+    local_run_id,
+    read_owner,
+    scheduler_run_id,
+    write_owner,
+)
 from ravex._config import RavexConfig
 from ravex._resume import ResumeManager
 from ravex._runtime import RavexRuntime
@@ -192,6 +203,58 @@ class TestWhyThereIsNothingToResume:
         assert "part of it is gone" in text
         assert "rank(s) 2" in text
 
+    def test_it_names_the_machine_that_wrote_the_stranded_stores(
+        self, tmp_path, monkeypatch
+    ):
+        """Which box to put back, not merely that the placement moved."""
+        _install(
+            monkeypatch,
+            seen=[
+                {2: {"host": "node1"}, 3: {"host": "node1"}},
+                {2: {"host": "node1"}, 3: {"host": "node1"}},
+                {0: {"host": "node0"}, 1: {"host": "node0"}},
+                {0: {"host": "node0"}, 1: {"host": "node0"}},
+            ],
+            world=4,
+        )
+        text = self.explain(local_config(tmp_path))
+
+        assert "this topology cannot reach it" in text
+        assert "written on node0, node1" in text
+
+    def test_stores_that_never_recorded_an_owner_still_get_a_sentence(
+        self, tmp_path, monkeypatch
+    ):
+        """A checkpoint from before owner records degrades, it does not break."""
+        _install(monkeypatch, seen=[{2: {}, 3: {}}, {2: {}, 3: {}},
+                                    {0: {}, 1: {}}, {0: {}, 1: {}}], world=4)
+        text = self.explain(local_config(tmp_path))
+
+        assert "this topology cannot reach it" in text
+        assert "written on" not in text
+
+    def test_two_runs_on_one_disk_are_called_out(self, tmp_path, monkeypatch):
+        """The phase-4 situation: an accidental history beside the real one.
+
+        A restart that began from scratch wrote into the same directory names,
+        and from then on nothing on disk said the two were unrelated. The ids
+        are what make it sayable.
+        """
+        _install(
+            monkeypatch,
+            seen=[
+                {2: {"host": "n1", "run_id": "run-b"}},
+                {2: {"host": "n1", "run_id": "run-b"}},
+                {0: {"host": "n0", "run_id": "run-a"}},
+                {0: {"host": "n0", "run_id": "run-a"}},
+            ],
+            world=4,
+        )
+        text = self.explain(local_config(tmp_path))
+
+        assert "2 different runs" in text
+        assert "run-a" in text and "run-b" in text
+
     def test_the_diagnosis_never_costs_the_run(self, tmp_path, monkeypatch):
         """A scan that raises must not turn a fresh start into a crash.
 
@@ -272,10 +335,132 @@ class TestTheWarningBeforeTheFirstCheckpoint:
         assert text == ""
 
 
+class TestRunIdentity:
+    def test_the_config_wins_over_everything(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SLURM_JOB_ID", "999")
+        config = local_config(tmp_path)
+        config.run_id = "mine"
+
+        assert local_run_id(config) == (FROM_CONFIG, "mine")
+
+    def test_a_scheduler_job_id_is_used_when_there_is_one(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SLURM_JOB_ID", "4711")
+        monkeypatch.delenv("TORCHELASTIC_RUN_ID", raising=False)
+
+        assert local_run_id(local_config(tmp_path)) == (FROM_SCHEDULER, "slurm-4711")
+
+    def test_torchelastics_none_is_not_an_identity(self, tmp_path, monkeypatch):
+        """Verified on 2026-08-19, and the reason this function exists.
+
+        ``torchrun`` sets ``TORCHELASTIC_RUN_ID`` to the literal string
+        ``"none"`` under the static rendezvous, which is what a plain
+        ``--nnodes/--node_rank`` invocation uses. Taken at face value it would
+        give every unrelated run on the machine one identity, which is worse
+        than having none at all.
+        """
+        monkeypatch.delenv("SLURM_JOB_ID", raising=False)
+        monkeypatch.setenv("TORCHELASTIC_RUN_ID", "none")
+
+        assert scheduler_run_id() is None
+
+        provenance, value = local_run_id(local_config(tmp_path))
+        assert provenance == GENERATED
+        assert value.startswith("run-")
+
+    def test_a_real_rendezvous_id_is_used(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("SLURM_JOB_ID", raising=False)
+        monkeypatch.setenv("TORCHELASTIC_RUN_ID", "job-17")
+
+        assert scheduler_run_id() == "torchelastic-job-17"
+
+    def test_an_existing_store_lends_its_id_to_the_run_continuing_it(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.delenv("SLURM_JOB_ID", raising=False)
+        monkeypatch.setenv("TORCHELASTIC_RUN_ID", "none")
+        store = store_for(tmp_path, 0)
+        write_owner(str(store), "run-earlier", rank=0, world_size=4)
+
+        assert local_run_id(local_config(tmp_path), str(store)) == (
+            FROM_STORE,
+            "run-earlier",
+        )
+
+    def test_the_record_survives_a_round_trip(self, tmp_path):
+        store = store_for(tmp_path, 2)
+        write_owner(str(store), "run-x", rank=2, world_size=8)
+
+        record = read_owner(str(store))
+        assert record["run_id"] == "run-x"
+        assert record["rank"] == 2
+        assert record["world_size"] == 8
+        assert record["host"]
+
+    def test_a_store_with_no_record_reads_as_none(self, tmp_path):
+        assert read_owner(str(store_for(tmp_path, 1))) is None
+
+    def test_an_unwritable_store_does_not_raise(self, tmp_path):
+        """Recording who wrote a checkpoint must never cost the checkpoint."""
+        write_owner(str(tmp_path / "no" / "such" / "place"), "r", 0, 1)
+
+
+class TestAgreeingOnTheRunId:
+    """Best provenance wins, not rank 0.
+
+    The case that makes it matter: rank 0's machine was replaced, so it has
+    nothing to inherit and invents an id, while the surviving ranks are reading
+    the run they are continuing. Rank 0 winning would rename the run on every
+    restart that lost the first node.
+    """
+
+    def gather(self, monkeypatch, votes):
+        class FakeDist:
+            @staticmethod
+            def is_available():
+                return True
+
+            @staticmethod
+            def is_initialized():
+                return True
+
+            @staticmethod
+            def get_world_size():
+                return len(votes)
+
+            @staticmethod
+            def all_gather_object(out, _mine):
+                out[:] = list(votes)
+
+        monkeypatch.setattr("ravex._distributed._dist", lambda: FakeDist)
+
+    def test_an_inherited_id_beats_a_generated_one(self, monkeypatch):
+        self.gather(
+            monkeypatch,
+            [(GENERATED, "run-new"), (FROM_STORE, "run-old"), (FROM_STORE, "run-old")],
+        )
+
+        assert agree_on_run_id(GENERATED, "run-new") == "run-old"
+
+    def test_the_config_beats_an_inherited_one(self, monkeypatch):
+        self.gather(monkeypatch, [(FROM_STORE, "run-old"), (FROM_CONFIG, "chosen")])
+
+        assert agree_on_run_id(FROM_STORE, "run-old") == "chosen"
+
+    def test_without_a_process_group_the_local_answer_stands(self, monkeypatch):
+        monkeypatch.setattr("ravex._distributed._dist", lambda: None)
+
+        assert agree_on_run_id(GENERATED, "run-alone") == "run-alone"
+
+
 def _install(monkeypatch, seen, world):
-    """Stand in for the two collectives, which need a process group."""
+    """Stand in for the two collectives, which need a process group.
+
+    ``seen`` is passed through untouched: entries may be plain rank sets, or
+    the rank-to-owner-record mappings the real discovery returns, and coercing
+    one into the other here would quietly drop the records the messages read.
+    """
     monkeypatch.setattr(
-        "ravex._distributed.gather_visible_stores", lambda mine: [set(s) for s in seen]
+        "ravex._distributed.gather_visible_stores", lambda mine: list(seen)
     )
     monkeypatch.setattr("ravex._distributed.get_world_size", lambda: world)
 

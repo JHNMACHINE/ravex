@@ -18,6 +18,56 @@ logger = logging.getLogger("ravex")
 STATE_VERSION = 1
 
 
+def _records(seen):
+    """Every owner record on every machine, once each."""
+    for entry in seen or ():
+        if isinstance(entry, dict):
+            for record in entry.values():
+                if isinstance(record, dict) and record:
+                    yield record
+
+
+def _where_written(seen, ranks) -> str:
+    """" (written on node0, node1)", or nothing if the stores never said.
+
+    Naming the machine is the difference between knowing the placement moved
+    and knowing which box to put back. Empty when the stores predate owner
+    records, so an older checkpoint degrades the sentence rather than breaking
+    it.
+    """
+    wanted = set(ranks)
+    hosts = []
+    for entry in seen or ():
+        if not isinstance(entry, dict):
+            continue
+        for rank, record in entry.items():
+            if rank in wanted and isinstance(record, dict):
+                host = record.get("host")
+                if host and host not in hosts:
+                    hosts.append(str(host))
+    if not hosts:
+        return ""
+    return " (written on %s)" % ", ".join(sorted(hosts))
+
+
+def _several_runs(seen) -> str:
+    """A sentence about two histories sharing these disks, or nothing.
+
+    A run that starts from scratch beside an older one writes into the same
+    directory names, and from then on the disk holds two unrelated trainings.
+    Reproduced on 2026-08-19, where a later restart resumed the accidental one
+    while the original sat beside it. The ids are what make it sayable.
+    """
+    ids = {str(record["run_id"]) for record in _records(seen) if record.get("run_id")}
+    if len(ids) < 2:
+        return ""
+    return (
+        " These machines hold stores from %d different runs (%s), so some of "
+        "what is here belongs to a training this one is not continuing."
+        % (len(ids), ", ".join(sorted(ids)))
+    )
+
+
 class ResumeManager:
     def __init__(self, backend, registry, config=None):
         self.backend = backend
@@ -29,6 +79,8 @@ class ResumeManager:
         self.config = config
         self.attempted = False
         self.restored_step: Optional[int] = None
+        #: Set once the ranks have agreed; see :meth:`_settle_run_identity`.
+        self.run_id: Optional[str] = None
 
     def try_resume(self, defer_rng: bool = False, per_rank: bool = False) -> bool:
         """Restore the latest checkpoint into the live objects.
@@ -73,29 +125,83 @@ class ResumeManager:
         local = self.backend.latest_step()
         step = agree_on_step(local if local is not None else -1)
 
-        if step < 0:
-            # Reached by every rank or by none: `step` is the agreed minimum,
-            # so it is the same number everywhere. Which is what makes it safe
-            # to run another collective in here.
-            self._explain_nothing_to_resume(local)
-            return False
-        if local != step:
-            logger.info(
-                "Resuming at step %s, the newest every rank has (this rank had %s)",
-                step,
-                local,
-            )
+        resumed = False
+        try:
+            if step < 0:
+                # Reached by every rank or by none: `step` is the agreed
+                # minimum, so it is the same number everywhere. Which is what
+                # makes it safe to run another collective in here.
+                self._explain_nothing_to_resume(local)
+                return False
+            if local != step:
+                logger.info(
+                    "Resuming at step %s, the newest every rank has (this rank had %s)",
+                    step,
+                    local,
+                )
 
-        state = self.backend.load_step(step)
-        if not all_ranks_agree(bool(state)):
-            logger.warning(
-                "Step %s could not be read on every rank - starting from "
-                "scratch on all of them",
-                step,
-            )
-            return False
+            state = self.backend.load_step(step)
+            if not all_ranks_agree(bool(state)):
+                logger.warning(
+                    "Step %s could not be read on every rank - starting from "
+                    "scratch on all of them",
+                    step,
+                )
+                return False
 
-        return self._apply(state, defer_rng)
+            resumed = self._apply(state, defer_rng)
+            return resumed
+        finally:
+            # After the verdict, because whether this run continues an existing
+            # history or begins a new one is exactly what the identity records.
+            # Every rank arrives here, and with the same `resumed`: each return
+            # above is taken by all of them together or by none.
+            self._settle_run_identity(resumed)
+
+    def _settle_run_identity(self, resumed: bool) -> None:
+        """Agree on which run this is, and record it beside this rank's store.
+
+        A run that resumed **continues** the history it read, so it keeps that
+        history's id. A run that started from scratch is a new one, even when
+        it writes into directories an older run left behind — and that is the
+        case worth separating. Reproduced on 2026-08-19: a restart with a
+        different rank-to-node placement began again from zero next to a
+        checkpoint at step 24, and a later restart resumed the accidental
+        history instead. With distinct ids the two are tellable apart; without,
+        nothing on disk says they are different runs at all.
+
+        Inheritance is therefore offered only when this rank actually resumed.
+        The agreement then prefers an inherited id over an invented one, so a
+        run that lost one machine and resumed on the rest keeps its name rather
+        than taking the replacement's.
+
+        Best-effort throughout: an identity that cannot be worked out or
+        written costs a future diagnosis, not this run.
+        """
+        from ravex._backends import per_rank_store_path
+        from ravex._distributed import agree_on_run_id, get_rank, get_world_size
+        from ravex._identity import local_run_id, write_owner
+
+        if self.config is None:
+            return
+
+        try:
+            store = (
+                None
+                if self.config.storage.is_remote
+                else per_rank_store_path(self.config, get_rank())
+            )
+            provenance, candidate = local_run_id(
+                self.config, store if resumed else None
+            )
+        except Exception:  # pragma: no cover - never worth the run
+            return
+
+        # Collective, and unconditional for the same reason as the two above.
+        self.run_id = agree_on_run_id(provenance, candidate)
+
+        if store is not None:
+            write_owner(store, self.run_id, get_rank(), get_world_size())
 
     def _explain_nothing_to_resume(self, local) -> None:
         """Say *why* nothing is being resumed, because it is not one situation.
@@ -118,13 +224,13 @@ class ResumeManager:
         :func:`gather_visible_stores` on why it is not the way to move the
         checkpoints themselves.
         """
-        from ravex._backends import visible_rank_stores
+        from ravex._backends import visible_store_owners
         from ravex._distributed import gather_visible_stores, get_world_size
 
         try:
-            mine = visible_rank_stores(self.config) if self.config is not None else set()
+            mine = visible_store_owners(self.config) if self.config is not None else {}
         except Exception:  # pragma: no cover - diagnosis must not cost the run
-            mine = set()
+            mine = {}
 
         # Unconditional: a rank that skipped it would strand the others here,
         # at the one moment they are all waiting to agree on something.
@@ -164,12 +270,14 @@ class ResumeManager:
             logger.warning(
                 "A checkpoint exists but this topology cannot reach it - "
                 "starting from scratch. The stores for rank(s) %s are on "
-                "machines other than the ones now running them, which is what "
-                "happens when the nodes come back in a different order. "
+                "machines other than the ones now running them%s, which is "
+                "what happens when the nodes come back in a different order. "
                 "Nothing was lost: rerun with the previous rank-to-node "
                 "placement, or use remote storage, which does not depend on "
-                "where a rank lands.",
+                "where a rank lands.%s",
                 ", ".join(str(rank) for rank in stranded),
+                _where_written(seen, stranded),
+                _several_runs(seen),
             )
             return
 
@@ -181,9 +289,10 @@ class ResumeManager:
                 "machine that held them is not in this job. Their shards "
                 "cannot be rebuilt from the others, and the rest of the "
                 "checkpoint is unusable without them. Remote storage, or a "
-                "copy on a second machine, is what survives losing one.",
+                "copy on a second machine, is what survives losing one.%s",
                 ", ".join(str(rank) for rank in gap),
                 highest,
+                _several_runs(seen),
             )
             return
 
@@ -192,7 +301,7 @@ class ResumeManager:
                 "No store anywhere for rank(s) %s - starting from scratch. "
                 "Either the run that wrote these had fewer ranks, or the "
                 "machines holding the last ones are gone; from here the two "
-                "look the same.%s",
+                "look the same.%s%s",
                 ", ".join(str(rank) for rank in missing),
                 (
                     " The stores that do exist go up to rank %d, past this "
@@ -200,6 +309,7 @@ class ResumeManager:
                     if beyond
                     else ""
                 ),
+                _several_runs(seen),
             )
             return
 
@@ -208,8 +318,9 @@ class ResumeManager:
         logger.info(
             "No checkpoint that every rank holds (this rank had %s) - "
             "starting from scratch, because a partial resume would be worse "
-            "than none.",
+            "than none.%s",
             local,
+            _several_runs(seen),
         )
 
     def _apply(self, state: Dict[str, Any], defer_rng: bool) -> bool:
