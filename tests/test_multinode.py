@@ -17,7 +17,7 @@ import logging
 import pytest
 
 from ravex._backends import visible_rank_stores
-from ravex._distributed import agree_on_run_id
+from ravex._distributed import agree_on_run_id, storage_is_shared
 from ravex._identity import (
     FROM_CONFIG,
     FROM_SCHEDULER,
@@ -270,6 +270,44 @@ class TestWhyThereIsNothingToResume:
 
         text = self.explain(local_config(tmp_path))
         assert "starting from scratch" in text
+
+
+class TestTheSharedStorageProbe:
+    """Asked of the filesystem, because the config cannot answer it.
+
+    The collective half — every rank dropping a marker and looking for the
+    others' — is covered end-to-end in Docker: two containers on separate
+    volumes answer False, the same two on one volume answer True and then
+    resume across a swapped placement. What is here is the rest.
+    """
+
+    def test_a_lone_process_sees_what_it_wrote(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("ravex._distributed._dist", lambda: None)
+
+        assert storage_is_shared(str(tmp_path / "checkpoints")) is True
+
+    def test_it_leaves_no_marker_behind(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("ravex._distributed._dist", lambda: None)
+        path = tmp_path / "checkpoints"
+
+        storage_is_shared(str(path))
+
+        assert list(path.iterdir()) == [], "the probe left its marker on disk"
+
+    def test_a_directory_it_cannot_write_answers_no(self, tmp_path, monkeypatch):
+        """False is the safe reading: it makes the caller assume the split.
+
+        An unwritable checkpoint directory is a larger problem, and the backend
+        reports it. This must not raise on the way to finding that out.
+        """
+        monkeypatch.setattr("ravex._distributed._dist", lambda: None)
+
+        def refuse(*args, **kwargs):
+            raise OSError("read-only file system")
+
+        monkeypatch.setattr("os.makedirs", refuse)
+
+        assert storage_is_shared(str(tmp_path / "nope")) is False
 
 
 class TestWhatItSaysBeforeTheFirstCheckpoint:
