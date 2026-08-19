@@ -27,6 +27,8 @@ ravex status
 | `max_steps` | `RAVEX_MAX_STEPS` | `null` | Hard stop, in optimizer steps. See [Step budgets](#step-budgets). |
 | `backend` | `RAVEX_BACKEND` | `moonclip` | `moonclip` or `torch_save`. Falls back to `torch_save` if Moonclip is missing. |
 | `delta` | `RAVEX_DELTA` | `true` | Moonclip only: store deltas against the previous snapshot. |
+| `keep_base_in_memory` | `RAVEX_KEEP_BASE_IN_MEMORY` | `true` | Moonclip only: keep the last full snapshot's bytes resident so the next delta does not have to read them back. Costs a copy of the saved state. See [The write path](#the-write-path). |
+| `async_save` | `RAVEX_ASYNC_SAVE` | `true` | Moonclip only: write in the background. Off, the loop stops until the checkpoint is durable. Diagnostic; see [The write path](#the-write-path). |
 | `compression` | `RAVEX_COMPRESSION` | `zstd` | `zstd` or `none`. |
 | `compression_level` | `RAVEX_COMPRESSION_LEVEL` | `3` | zstd level. |
 | `keep_last` | `RAVEX_KEEP_LAST` | `5` | Checkpoints to retain. Older ones are deleted. |
@@ -34,10 +36,11 @@ ravex status
 | `track_dataloaders` | `RAVEX_TRACK_DATALOADERS` | `true` | Track and restore the dataset position. |
 | `track_rng` | `RAVEX_TRACK_RNG` | `true` | Save and restore torch / CUDA / Python / NumPy RNG state. |
 | `handle_sigterm` | `RAVEX_HANDLE_SIGTERM` | `true` | Checkpoint on SIGTERM — the signal a preempted spot instance receives. Only installed if nothing else has claimed the signal. |
-| `fallback_on_error` | `RAVEX_FALLBACK_ON_ERROR` | `true` | On an unexpected error, disable Ravex and let training continue. |
+| `fallback_on_error` | `RAVEX_FALLBACK_ON_ERROR` | `true` | On an unexpected error, log it and let training continue; the checkpoint is retried at the next one. Set `false` to raise instead. |
 | `log_file` | `RAVEX_LOG_FILE` | `null` | Log destination. Unset means stderr, WARNING and above only. |
 | `log_level` | `RAVEX_LOG_LEVEL` | `INFO` | |
 | `run_id` | `RAVEX_RUN_ID` | `null` | Recorded in checkpoint metadata; also used as the storage prefix when none is set. |
+| `frameworks.auto_detect` | — | `true` | Whether to identify the training framework in use. File only: there is no environment variable for it. |
 
 ### Sharded models
 
@@ -93,6 +96,46 @@ Two further consequences worth knowing:
   parameters as plain `Parameter`s and hands back a sharded state dict of
   `ShardedTensor`, which carries no mesh and no placements and so cannot be
   put back shard by shard.
+
+### The write path
+
+Two options change what a checkpoint costs, and both default to the fast side.
+The numbers below are from a 1B-parameter model with Adam on 8x RTX 5060 Ti —
+they will not transfer exactly, but the shape of the trade will.
+
+**`keep_base_in_memory`** holds the last full snapshot's bytes so Moonclip can
+compute the next delta against them. That is one extra copy of the saved state
+resident for the life of the run: about +11 GiB at that size. Turning it off
+does **not** make collection cheaper — `collect` measures identical — it moves
+the cost to `store`, which goes from 1.0 s to 20-23 s because the base is read
+back from storage for every delta. It is an option for a run with memory as the
+binding constraint, paid for in I/O. It is not an optimisation.
+
+**`async_save`** off makes the training loop wait for the checkpoint to be
+durable, which took the average total stall from ~10 s to ~27 s per checkpoint
+on that same configuration. It exists to make timings attributable while
+diagnosing something, not to make a run safer. The background write is already
+durable before the next one starts.
+
+### Reading the handoff log
+
+At `INFO` each checkpoint logs its phases:
+
+```
+Checkpoint at step 200 handed off in 13.6s (drain 11.1s, collect 1.4s, store 1.0s)
+```
+
+**`drain` is not a cost of checkpointing.** It is the wait for the accelerator
+queue to empty, and CUDA is asynchronous: at a wide `checkpoint_every` the
+training steps since the last checkpoint have been queueing work that comes due
+right there, because that is the first point anything asks for it. At
+`checkpoint_every=20` it was 11.1 s of a 13.6 s handoff — the largest entry, and
+none of it caused by the checkpoint. Reading it as checkpoint overhead leads to
+the wrong conclusion; that mistake is what
+[GPU-54](https://linear.app/gpuzero/issue/GPU-54) cost.
+
+The phases that *are* the handoff are `collect` (building the state dict, a
+collective on a sharded model) and `store` (handing it to the backend).
 
 ### Storage
 

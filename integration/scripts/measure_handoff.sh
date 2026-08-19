@@ -22,6 +22,10 @@ PARAMS=${PARAMS:-1.5e9}
 STEPS=${STEPS:-7}
 EVERY=${EVERY:-2}
 
+# Phases skipped for want of disk. Collected rather than fatal: a skip is not a
+# crash, and on a rented box the space can go away mid-sweep — see below.
+SKIPPED=()
+
 section() { printf '\n\033[1m── %s ─────────────────────────────────\033[0m\n' "$1"; }
 
 section "the box"
@@ -98,7 +102,13 @@ run() {
     if [ "$before" -lt "$NEED_GIB" ]; then
         echo "  SKIPPED $name: ${before} GiB free, needs $NEED_GIB." >&2
         echo "  Free space or lower --params; raising NEED_GIB only hides it." >&2
-        return 1
+        SKIPPED+=("$name")
+        # 0, not 1: `run` is called as a bare top-level command under `set -e`,
+        # so a non-zero return here does not skip one phase — it ends the
+        # script, and the phases after it never run. The sweep is reported as
+        # having crashed when it merely ran short of disk. The skip is already
+        # on stderr and it is counted; the exit status is settled at the end.
+        return 0
     fi
     echo "→ $name  ($*)   [${before} GiB free]"
     ( cd "$dir" && env "$@" torchrun --nproc_per_node="$N" --master_port=29566         "$SCRIPT" --params "$PARAMS" --api fsdp2 --steps "$STEPS"         >stdout.txt 2>stderr.txt ) || {
@@ -145,3 +155,11 @@ pip install --quiet pytest
 
 section "done"
 echo "logs under $RUNS/*/ravex.log"
+
+# Reported here, and reflected in the exit status, so a sweep with a hole in it
+# is not mistaken for a complete one — but only after every phase that *could*
+# run has run.
+if [ ${#SKIPPED[@]} -gt 0 ]; then
+    echo "incomplete: ${#SKIPPED[@]} phase(s) skipped for disk — ${SKIPPED[*]}" >&2
+    exit 1
+fi

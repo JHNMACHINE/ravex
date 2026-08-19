@@ -6,8 +6,11 @@ resume logic, and it is what the PyTorch patches call into.
 Two invariants shape everything here:
 
 *Never break the training run.* Every entry point is wrapped; on an unexpected
-error the runtime disables itself (``fallback_on_error``) and the user's code
-carries on as if Ravex were not installed.
+error the user's code carries on as if Ravex were not installed
+(``fallback_on_error``). A failed checkpoint costs that checkpoint and is tried
+again at the next one — it does not turn the runtime off, because the runtime
+is per process and one rank switching itself off is how the other seven end up
+waiting in a collective it will never enter.
 
 *Never write to stdout.* Training output belongs to the user. Logs go to the
 configured file, or to stderr at WARNING and above when no file is set —
@@ -27,7 +30,12 @@ from typing import Any, Optional
 
 from ravex._backends import get_backend
 from ravex._config import RavexConfig
-from ravex._distributed import get_rank, get_world_size, is_main_process
+from ravex._distributed import (
+    all_ranks_agree,
+    get_rank,
+    get_world_size,
+    is_main_process,
+)
 from ravex._patches import install_all_patches
 from ravex._registry import ObjectRegistry
 from ravex._resume import ResumeManager
@@ -165,8 +173,11 @@ class RavexRuntime:
             self._backend = get_backend(self.config, per_rank=self._per_rank_active())
             self._resume_manager = ResumeManager(self._backend, self.registry)
         except Exception as exc:
+            # Reported, not disabled. This runs inside `checkpoint`, between
+            # the collective collect and the verdict every rank agrees on, and
+            # turning *this* process off there is the asymmetry that strands
+            # the others. The caller folds the False into that verdict.
             logger.error("Could not open the checkpoint backend: %s", exc)
-            self._disable("backend unavailable")
             return False
         return True
 
@@ -346,6 +357,18 @@ class RavexRuntime:
         _drain_accelerator()
         collect_started = time.perf_counter()
         phases["drain"] = collect_started - started
+
+        # From here to the verdict below there is no early `return`, and that
+        # is the point. Every rank of a sharded run is about to enter a
+        # collective, so every rank has to come out of it the same way — a
+        # rank that leaves early is one the others wait for until NCCL times
+        # out. Failures set `ok` and are settled together at the bottom.
+        ok = True
+        wrote = False
+        # Kept because `except` unbinds its name on the way out, and the
+        # `fallback_on_error=False` path below wants the original, not a
+        # summary of it.
+        failure: Optional[BaseException] = None
         try:
             state = self.registry.collect_state(
                 track_rng=self.config.track_rng,
@@ -360,29 +383,71 @@ class RavexRuntime:
             # the model cannot be split that way, and then rank 0 is once again
             # the only one holding anything.
             if not self._collected_per_rank(state) and not is_main_process():
-                self._last_saved_step = step
-                return False
-            if not self._ensure_backend():
-                return False
-            backend = self._backend
-            if backend is None:  # pragma: no cover - _ensure_backend sets it
-                return False
-            metadata = {
-                "step": str(step),
-                "framework": self._framework,
-                "world_size": str(get_world_size()),
-            }
-            if self.config.run_id:
-                metadata["run_id"] = self.config.run_id
-            if final:
-                metadata["final"] = "true"
+                pass  # nothing of its own to write; still answers below
+            else:
+                backend = self._backend if self._ensure_backend() else None
+                if backend is None:
+                    ok = False
+                else:
+                    metadata = {
+                        "step": str(step),
+                        "framework": self._framework,
+                        "world_size": str(get_world_size()),
+                    }
+                    if self.config.run_id:
+                        metadata["run_id"] = self.config.run_id
+                    if final:
+                        metadata["final"] = "true"
 
-            phases.update(backend.save(step, state, metadata) or {})
-            self._last_saved_step = step
+                    phases.update(backend.save(step, state, metadata) or {})
+                    wrote = True
         except Exception as exc:
             logger.error("Checkpoint at step %d failed: %s", step, exc, exc_info=True)
-            if self.config.fallback_on_error:
-                self._disable("checkpoint failed")
+            ok = False
+            failure = exc
+
+        # One rank that cannot write is every rank's problem.
+        #
+        # This used to be `self._disable("checkpoint failed")`, and `_disable`
+        # is per process: a full disk on one node of eight turned that rank
+        # off while the other seven stayed on. At the next checkpoint the
+        # seven called `collect_state` — a collective — and the eighth
+        # returned at the first line and ran ahead into the next forward. The
+        # seven then wait for a participant that never comes: NCCL takes half
+        # an hour to say so, and all eight GPUs stay allocated and billing
+        # while it does. Not a fast error, an expensive hang.
+        #
+        # So the verdict is taken once, by everyone, and everyone acts on it.
+        if sharded and get_world_size() > 1:
+            ok = all_ranks_agree(ok)
+
+        if not ok:
+            if not self.config.fallback_on_error:
+                # The user asked to hear about it rather than be protected
+                # from it. Raised after the agreement, so every rank raises —
+                # a single rank unwinding out of here is the asymmetry above.
+                # A rank whose own save was fine has nothing to re-raise and
+                # says so; the rank that failed carries its own traceback.
+                if failure is not None:
+                    raise failure
+                raise RuntimeError(
+                    f"Ravex: checkpoint at step {step} failed on another rank"
+                )
+            # Nothing records the step, so the next checkpoint is a fresh
+            # attempt rather than a permanent surrender. `No space left on
+            # device` is often gone ten seconds later, and a long run that
+            # quietly drops its protection for the hours that remain is the
+            # worse outcome. A fault that really is permanent costs one logged
+            # attempt per checkpoint — noise, but noise that says the truth.
+            logger.warning(
+                "Checkpoint at step %d failed on at least one rank - skipped "
+                "on all of them; retrying at the next checkpoint",
+                step,
+            )
+            return False
+
+        self._last_saved_step = step
+        if not wrote:
             return False
 
         # The breakdown, not just the total: a handoff that costs seconds is

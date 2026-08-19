@@ -3,6 +3,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 import ravex
+from ravex import _runtime as runtime_module
 from ravex._backends import TorchSaveBackend
 from ravex._runtime import get_runtime
 
@@ -173,10 +174,21 @@ def test_deactivate_restores_pytorch(storage):
     assert not hasattr(torch.nn.Module, "_ravex_patched")
 
 
-def test_a_broken_backend_disables_ravex_instead_of_the_run(storage, monkeypatch):
+def test_a_broken_backend_costs_the_checkpoint_not_the_run(storage, monkeypatch):
+    """A failed write must not take the run down — and must not give up either.
+
+    It used to `_disable`, which is per process. On one rank of eight that is
+    the worst of both: the run keeps going without protection, and the next
+    checkpoint hangs the other seven in a collective this rank no longer
+    enters. So the failure now costs one checkpoint, and the next one is tried
+    on its own merits — a full disk is often not full a minute later.
+    """
     ravex.activate(backend="torch_save", checkpoint_every=1)
 
+    attempts = []
+
     def explode(*args, **kwargs):
+        attempts.append(1)
         raise RuntimeError("disk on fire")
 
     # Patched on the class: the backend instance does not exist yet, since it
@@ -186,4 +198,65 @@ def test_a_broken_backend_disables_ravex_instead_of_the_run(storage, monkeypatch
     model, optimizer, loader = make_loop()
     run_steps(model, optimizer, loader, 3)  # must not raise
 
-    assert not ravex.is_active()
+    assert ravex.is_active(), (
+        "the runtime turned itself off; on a sharded run that is the rank "
+        "the others wait for"
+    )
+    assert len(attempts) >= 2, (
+        f"it gave up after the first failure ({len(attempts)} attempt(s) in "
+        "3 steps at checkpoint_every=1)"
+    )
+
+
+def _as_one_rank_of_eight(monkeypatch, runtime, main: bool):
+    """Make this process look like a rank of a sharded eight-rank run."""
+    monkeypatch.setattr(runtime.registry, "has_sharded_models", lambda: True)
+    monkeypatch.setattr(runtime_module, "get_world_size", lambda: 8)
+    monkeypatch.setattr(runtime_module, "is_main_process", lambda: main)
+
+
+def test_a_rank_with_nothing_to_write_still_answers_the_verdict(storage, monkeypatch):
+    """The gather layout leaves the non-main ranks holding nothing.
+
+    They used to `return` as soon as they saw that, which is fine only because
+    nothing collective came after. Now the verdict does, and a collective that
+    seven ranks enter and one skips is exactly the hang this is all about.
+    """
+    ravex.activate(backend="torch_save", checkpoint_every=10_000)
+    model, optimizer, loader = make_loop()
+    run_steps(model, optimizer, loader, 1)
+
+    runtime = get_runtime()
+    _as_one_rank_of_eight(monkeypatch, runtime, main=False)
+
+    asked = []
+    monkeypatch.setattr(
+        runtime_module, "all_ranks_agree", lambda ok: (asked.append(ok), ok)[1]
+    )
+
+    runtime.checkpoint()
+    assert asked == [True], "a rank with nothing of its own to write skipped the agreement"
+
+
+def test_a_failure_on_another_rank_stops_this_one_too(storage, monkeypatch):
+    """This rank's own save was fine. Somebody else's was not.
+
+    It has to skip anyway, and — because the step goes unrecorded on every
+    rank — come back to it at the next checkpoint rather than treating it as
+    done.
+    """
+    ravex.activate(backend="torch_save", checkpoint_every=10_000)
+    model, optimizer, loader = make_loop()
+    run_steps(model, optimizer, loader, 1)
+
+    runtime = get_runtime()
+    _as_one_rank_of_eight(monkeypatch, runtime, main=True)
+    monkeypatch.setattr(runtime_module, "all_ranks_agree", lambda ok: False)
+
+    step = runtime.registry.step_count
+    assert runtime.checkpoint() is False
+    assert runtime._last_saved_step != step, (
+        "the step was recorded as saved while another rank had failed, so no "
+        "rank will come back to it"
+    )
+    assert ravex.is_active(), "one rank's failure turned the others off for good"
