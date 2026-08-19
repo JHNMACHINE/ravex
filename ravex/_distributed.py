@@ -337,6 +337,28 @@ def agree_on_step(local_step: int) -> int:
     return min(int(step) for step in steps)
 
 
+def gather_visible_stores(visible: "set[int]") -> "list[set[int]]":
+    """What every rank can reach on its own machine. **Collective.**
+
+    One entry per rank, in rank order. Ranks on the same machine report the
+    same set — that is not waste, it is how the picture stays readable without
+    anyone having to know which ranks are co-located.
+
+    Payload is a handful of integers per rank, so this costs what
+    :func:`agree_on_step` costs. It is deliberately *not* a way to move
+    checkpoint data: `all_gather_object` would leave every rank holding
+    `world_size` copies, which for real shards is tens of gigabytes per
+    process. Moving bytes is point-to-point work, and it is not this.
+    """
+    dist = _dist()
+    if dist is None or not dist.is_available() or not dist.is_initialized():
+        return [set(visible)]
+
+    seen: List[Any] = [None] * dist.get_world_size()
+    dist.all_gather_object(seen, set(visible))
+    return [set(entry or ()) for entry in seen]
+
+
 def all_ranks_agree(ok: bool) -> bool:
     """Whether *every* rank reports success. **Collective.**
 

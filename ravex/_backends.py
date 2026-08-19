@@ -457,6 +457,45 @@ def _per_rank_config(config, per_rank: bool):
     return replace(config, storage=storage)
 
 
+def visible_rank_stores(config) -> "set[int]":
+    """Which ranks' per-rank stores this machine can actually reach.
+
+    Reads the directory names only — ``rank_<n>`` as written by
+    ``_per_rank_config`` — and never opens a store. What is in them is each
+    rank's own business, and asking would mean constructing a backend per
+    foreign store just to answer a question about topology.
+
+    Empty for remote storage, and deliberately so: every node sees the same
+    bucket there, so "what I can reach" carries no information. It is only the
+    local case where two machines hold different halves of one checkpoint.
+    """
+    if config.storage.is_remote:
+        return set()
+
+    base = config.storage.path
+    try:
+        entries = os.listdir(base)
+    except OSError:
+        # No directory yet is the ordinary first-run case, not a failure.
+        return set()
+
+    found = set()
+    for name in entries:
+        if not name.startswith("rank_"):
+            continue
+        try:
+            rank = int(name[len("rank_") :])
+        except ValueError:
+            continue
+        path = os.path.join(base, name)
+        try:
+            if os.path.isdir(path) and os.listdir(path):
+                found.add(rank)
+        except OSError:
+            continue
+    return found
+
+
 def get_backend(config, per_rank: bool = False) -> CheckpointBackend:
     """Build the configured backend, falling back to ``torch_save``.
 

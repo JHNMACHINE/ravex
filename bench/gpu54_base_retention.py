@@ -23,6 +23,7 @@ allocator behaviour, and glibc's is not Windows'.
 
 import argparse
 import gc
+import shutil
 import tempfile
 import time
 from typing import Any, Dict, List, Tuple
@@ -88,29 +89,40 @@ def run(
     config.storage.path = tempfile.mkdtemp(prefix="gpu54-")
     config.keep_base_in_memory = keep_base
     config.async_save = async_save
+    # Retention is off on purpose: the question is what holding every base
+    # costs, so nothing may be pruned mid-run. It is also why the `finally`
+    # below is not optional — with `keep_last` this high the store only grows,
+    # and `--ranks 8` runs this in eight processes at once.
     config.keep_last = rounds + 1
     backend = MoonclipBackend(config)
 
-    live = make_state(mib)
-    timings: List[Tuple[float, float]] = []
-    for step in range(1, rounds + 1):
-        mutate(live)
-        started = time.perf_counter()
-        collected = collect(live)
-        collected_at = time.perf_counter()
-        backend.save(step * 2, collected, {"step": str(step * 2)})
-        # Both numbers, because they answer different questions. `collect` is
-        # what GPU-54 measured. The total is what the training loop actually
-        # waits for, and a writer that makes the first cheaper by making the
-        # second dearer has not helped anyone.
-        timings.append((collected_at - started, time.perf_counter() - started))
-        # Ravex drops its reference here too; the point is that Moonclip's
-        # copies outlive it.
-        del collected
+    try:
+        live = make_state(mib)
+        timings: List[Tuple[float, float]] = []
+        for step in range(1, rounds + 1):
+            mutate(live)
+            started = time.perf_counter()
+            collected = collect(live)
+            collected_at = time.perf_counter()
+            backend.save(step * 2, collected, {"step": str(step * 2)})
+            # Both numbers, because they answer different questions. `collect`
+            # is what GPU-54 measured. The total is what the training loop
+            # actually waits for, and a writer that makes the first cheaper by
+            # making the second dearer has not helped anyone.
+            timings.append((collected_at - started, time.perf_counter() - started))
+            # Ravex drops its reference here too; the point is that Moonclip's
+            # copies outlive it.
+            del collected
 
-    del live, backend
-    gc.collect()
-    return timings
+        del live, backend
+        gc.collect()
+        return timings
+    finally:
+        # After the backend is gone, so the background writer is not still
+        # draining into a directory being removed. `ignore_errors` because a
+        # bench that cannot tidy up should still report its numbers — the
+        # measurement is the point, and the caller sees the disk either way.
+        shutil.rmtree(config.storage.path, ignore_errors=True)
 
 
 def _rank_worker(mib, rounds, keep_base, async_save, out):

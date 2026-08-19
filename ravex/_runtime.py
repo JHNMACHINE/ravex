@@ -171,7 +171,9 @@ class RavexRuntime:
             return False
         try:
             self._backend = get_backend(self.config, per_rank=self._per_rank_active())
-            self._resume_manager = ResumeManager(self._backend, self.registry)
+            self._resume_manager = ResumeManager(
+                self._backend, self.registry, self.config
+            )
         except Exception as exc:
             # Reported, not disabled. This runs inside `checkpoint`, between
             # the collective collect and the verdict every rank agrees on, and
