@@ -83,6 +83,16 @@ class CheckpointBackend(ABC):
     def flush(self) -> None:
         """Block until every pending write has completed."""
 
+    def consolidate(self) -> None:
+        """Leave the store readable on its own, with nothing outside it.
+
+        Called before a store is copied to another machine: a copy that still
+        depends on something left behind is not a copy of anything. Backends
+        that never write a delta have nothing to do, which is why this is not
+        abstract.
+        """
+        self.flush()
+
     def close(self) -> None:
         self.flush()
 
@@ -271,6 +281,21 @@ class MoonclipBackend(CheckpointBackend):
 
     def flush(self) -> None:
         self._manager.flush()
+
+    def consolidate(self) -> None:
+        """Fold the delta chain into one full snapshot.
+
+        A delta names a base, and a base that stayed on the machine the copy
+        left is a base the copy cannot reach. ``merge_now`` collapses the chain
+        so what gets sent stands on its own.
+
+        It waits for the writer to drain and then forces a merge, which is the
+        path bounded to 300 s in moonclip's ``FORCED_MERGE_WAIT``. Before that
+        bound existed this could park here for twenty minutes on a stuck
+        reader.
+        """
+        self._manager.flush()
+        self._manager.merge_now()
 
     def close(self) -> None:
         self.flush()
@@ -493,6 +518,54 @@ def visible_rank_stores(config) -> "set[int]":
         entries = os.listdir(base)
     except OSError:
         # No directory yet is the ordinary first-run case, not a failure.
+        return set()
+
+    found = set()
+    for name in entries:
+        if not name.startswith("rank_"):
+            continue
+        try:
+            rank = int(name[len("rank_") :])
+        except ValueError:
+            continue
+        path = os.path.join(base, name)
+        try:
+            if os.path.isdir(path) and os.listdir(path):
+                found.add(rank)
+        except OSError:
+            continue
+    return found
+
+
+def replica_store_path(config, rank: int) -> str:
+    """Where a copy of another rank's store lands on this machine.
+
+    Under ``replica/`` rather than beside the real stores: everything that
+    scans for ``rank_<n>`` is asking "what does this machine own", and a copy
+    answering that question would be read as an original.
+    """
+    from ravex._replication import REPLICA_DIR
+
+    return os.path.join(config.storage.path, REPLICA_DIR, rank_suffix(rank))
+
+
+def visible_replica_stores(config) -> "set[int]":
+    """Which ranks this machine holds a *copy* of.
+
+    Separate from :func:`visible_rank_stores` because the two answer different
+    questions. "Rank 2's store is not here" and "rank 2's store is not here but
+    its copy is" lead to opposite conclusions — the first is a checkpoint that
+    cannot be reached, the second is one that can.
+    """
+    from ravex._replication import REPLICA_DIR
+
+    if config.storage.is_remote:
+        return set()
+
+    base = os.path.join(config.storage.path, REPLICA_DIR)
+    try:
+        entries = os.listdir(base)
+    except OSError:
         return set()
 
     found = set()

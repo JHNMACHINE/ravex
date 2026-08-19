@@ -94,6 +94,9 @@ class RavexRuntime:
         self._backend = None
         self._resume_manager: Optional[ResumeManager] = None
         self._storage_announced = False
+        #: Set by the probe: storage is local *and* each machine has its own.
+        self._storage_split = False
+        self._last_replicated_step: Optional[int] = None
         self._leader_optimizer_id: Optional[int] = None
         self._checkpoint_due = False
         self._resume_attempted = False
@@ -194,6 +197,9 @@ class RavexRuntime:
             return
 
         shared = storage_is_shared(self.config.storage.path)
+        # Kept: it is the difference between needing replication and not, and
+        # asking again per checkpoint would be a collective per checkpoint.
+        self._storage_split = not shared
 
         if not is_local_main_process():
             return
@@ -517,6 +523,7 @@ class RavexRuntime:
             return False
 
         self._last_saved_step = step
+        self._replicate_if_due(step)
         if not wrote:
             return False
 
@@ -531,6 +538,85 @@ class RavexRuntime:
             ", ".join("%s %.3fs" % item for item in phases.items()),
         )
         return True
+
+    def _replicate_if_due(self, step: int) -> None:
+        """Trade stores around the ring, so no machine is the only copy.
+
+        Reached by every rank or by none. Each condition below is the same on
+        all of them — the layout, the probe's verdict, the config, and a step
+        the ranks have already agreed on — which is what makes it safe to run
+        collectives in here.
+
+        A round is a recovery point only if **every** rank's copy landed. Three
+        out of four is not a checkpoint anyone can resume from, and recording
+        it as one would be worse than skipping: the next failure would find a
+        set that cannot be assembled and no sign that anything was wrong.
+        """
+        from ravex._backends import per_rank_store_path, replica_store_path
+        from ravex._distributed import all_ranks_agree, local_world_size
+        from ravex._replication import exchange_stores, replication_ring
+
+        if not self._replication_due(step):
+            return
+
+        ring = replication_ring(
+            get_rank(), get_world_size(), local_world_size()
+        )
+        if ring is None:
+            return
+        send_to, receive_from = ring
+
+        source = per_rank_store_path(self.config, get_rank())
+        destination = replica_store_path(self.config, receive_from)
+
+        ok = True
+        try:
+            # The copy has to stand on its own once it lands. See
+            # `CheckpointBackend.consolidate`.
+            if self._backend is not None:
+                self._backend.consolidate()
+            ok = exchange_stores(source, destination, send_to, receive_from)
+        except Exception as exc:
+            logger.warning("Replication at step %d failed here: %s", step, exc)
+            ok = False
+
+        # One rank short and nobody has a recovery point at this step.
+        if not all_ranks_agree(ok):
+            logger.warning(
+                "Replication at step %d did not complete on every rank - this "
+                "step is not a recovery point. Training continues; the "
+                "previous replicated step still stands.",
+                step,
+            )
+            return
+
+        self._last_replicated_step = step
+        logger.info(
+            "Replicated step %d to rank %d, and took rank %d's copy.",
+            step,
+            send_to,
+            receive_from,
+        )
+
+    def _replication_due(self, step: int) -> bool:
+        """Whether this checkpoint is one of the replicated ones.
+
+        Derived from the step and the configuration alone, so every rank gets
+        the same answer without asking each other. Off unless the storage was
+        actually found to be split: with a shared filesystem or a bucket, a
+        copy protects nothing and costs bandwidth.
+        """
+        from ravex._distributed import local_world_size
+
+        if self.config.replicate_every <= 0 or not self._storage_split:
+            return False
+        if not self._per_rank_active():
+            return False
+        if get_world_size() <= max(local_world_size(), 1):
+            return False
+
+        taken = step // max(self.config.checkpoint_every, 1)
+        return taken % self.config.replicate_every == 0
 
     @staticmethod
     def _collected_per_rank(state: dict) -> bool:

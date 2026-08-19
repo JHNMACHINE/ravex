@@ -149,6 +149,17 @@ class RavexConfig:
     compression_level: int = 3
     keep_last: int = 5
 
+    # How often each rank sends a copy of its store to a peer on another
+    # machine, counted in checkpoints. Only ever used when the storage turns
+    # out to be neither remote nor shared — with either of those a copy buys
+    # nothing and costs bandwidth. 0 turns it off.
+    #
+    # Wide on purpose. The average bandwidth is one store per rank divided by
+    # this number, so the interval is what keeps replication from becoming
+    # backpressure on the training loop. What it costs in exchange is bounded:
+    # losing a machine loses at most this many checkpoints of progress.
+    replicate_every: int = 10
+
     # Whether Moonclip keeps the last full snapshot's bytes resident so the
     # next delta can be computed without reading them back from storage.
     #
@@ -275,6 +286,8 @@ class RavexConfig:
             self.compression_level = _as_int(value, self.compression_level)
         if (value := get("KEEP_LAST")) is not None:
             self.keep_last = _as_int(value, self.keep_last)
+        if (value := get("REPLICATE_EVERY")) is not None:
+            self.replicate_every = _as_int(value, self.replicate_every)
         if (value := get("KEEP_BASE_IN_MEMORY")) is not None:
             self.keep_base_in_memory = _as_bool(value, self.keep_base_in_memory)
         if (value := get("ASYNC_SAVE")) is not None:
@@ -327,7 +340,12 @@ class RavexConfig:
         which the runtime logs once it has somewhere to log to.
         """
         defaults = RavexConfig()
-        numeric = ("checkpoint_every", "keep_last", "compression_level")
+        numeric = (
+            "checkpoint_every",
+            "keep_last",
+            "compression_level",
+            "replicate_every",
+        )
         boolean = (
             "enabled",
             "checkpoint_on_exit",
@@ -400,6 +418,8 @@ class RavexConfig:
             self.checkpoint_every = 1
         if self.keep_last < 1:
             self.keep_last = 1
+        if self.replicate_every < 0:
+            self.replicate_every = 0
         if str(self.compression).strip().lower() in ("none", "off", ""):
             self.compression_level = 0
 
