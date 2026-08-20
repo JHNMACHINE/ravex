@@ -184,6 +184,30 @@ steps is bounded; a hang is not. Set `checkpoint_every` accordingly.
 
 Numbers and the FSDP1 details: [docs/configuration.md](docs/configuration.md).
 
+### More than one machine
+
+Ranks, directories and collectives all cross machines unchanged. What does not
+is `per_rank` on local storage: each machine writes only its own ranks' shards
+to its own disk, so no machine holds a whole checkpoint. It resumes only if
+every machine is handed the same ranks again — no launcher promises that — and
+not at all if a machine is lost. Ravex probes the storage at activation and
+says which case you are in rather than letting you find out at the first resume.
+
+Two ways out, and they are not equivalent:
+
+- **A bucket** (`storage.type: s3`). Checkpoints leave the machines on their
+  own, and since 0.0.4 a rank that comes up with an empty disk pulls its store
+  back. Before that the remote was push-only — a backup you could not resume
+  from.
+- **`replicate_every`**, when there is no bucket and no shared filesystem. Each
+  rank copies its store to a peer on another machine every N checkpoints.
+  Survives losing any one machine, at a cost of at most N checkpoints of
+  progress.
+
+Keeping the data after the run ends is yours unless a remote is configured —
+and for a sharded model the newest checkpoint is the last periodic one, since
+there is none at exit.
+
 Known limits today:
 
 - **`IterableDataset`**: no index sampler exists, so the stream position cannot

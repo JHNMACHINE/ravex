@@ -302,6 +302,64 @@ GPUs would then fail to recognise itself on four. The parameter names are
 stored alongside so a changed architecture is reported rather than surfacing as
 a shape error from inside the loader.
 
+### More than one machine
+
+Most of what is above crosses machines untouched. `get_rank()` returns the
+global rank, so two nodes of eight are ranks 0-15 rather than 0-7 twice; the
+per-rank directories derived from it do not collide; and the collectives that
+agree on a step travel the network like any other.
+
+What does not carry over is the assumption that a checkpoint is in one place.
+
+With `per_rank` and local storage every machine writes only its own ranks'
+shards, to its own disk, and no machine holds the whole checkpoint. It resumes
+only if every machine is handed the same ranks again — which neither `torchrun`
+nor SLURM promises — and not at all if a machine is lost. On a six-node bench
+inverting the node order was enough: every rank found nothing and the run
+started over. The behaviour is safe, since nobody resumes from a checkpoint
+they hold half of, but it is total, and it used to be silent.
+
+So the topology is announced at activation rather than discovered at the first
+failed resume. Whether the storage is shared is **probed, not inferred from the
+path**: every rank drops a uniquely named marker and looks for everyone else's,
+because a local disk and an NFS mount are the same `type: local` pointing at a
+directory that exists. Three outcomes, and the log says which one you are in —
+shared storage, split storage with copies between machines, split storage
+without them.
+
+**A bucket is durability, not a way back.** Until 2026-08-19 the remote support
+was push-only: `sync_now()` sent local to remote and nothing read the other
+way, so the step to resume from was still read from the *local* manifest. On
+the bench a node whose disk had been replaced started from scratch with its own
+data sitting in the bucket, and took every other rank with it, because agreeing
+on a step takes the minimum. Moonclip can now pull a store back when the local
+one is empty, which makes a bucket the cheapest answer to both a lost machine
+and a reshuffle.
+
+**With neither a bucket nor a shared filesystem**, `replicate_every` is what
+stands between you and a lost machine. Each rank collapses its store into one
+self-contained full and sends it to a peer picked to land on a different
+machine — `(rank + local_world_size) % world_size`, which only holds when the
+ranks are spread evenly, so an uneven layout is reported as *not* replicating
+instead of being assumed to work. The exchange is point-to-point `isend` /
+`irecv`, never a collective: an all-gather would leave every rank holding
+`world_size` copies, tens of GiB per process to protect against one loss. It is
+all-or-nothing — three copies of four landing is not a restore point, and
+recording it as one would be worse than skipping the round. A replica lands
+under `replica/` rather than beside the real stores, so discovery cannot
+mistake it for a rank's own, and it counts only once a completion marker is
+written last.
+
+The guarantee is worth stating exactly: **the loss of any one machine is
+survivable, at a cost of at most one replication interval of progress.** Not
+"nothing is ever lost".
+
+**Keeping the checkpoints once the run ends is yours.** With no remote
+configured they go away with the machines. And for a sharded model there is no
+checkpoint at exit at all — see [Sharded models](#sharded-models) — so the most
+recent thing worth copying off is the last periodic checkpoint, not something
+written on the way out.
+
 ## Processes that never train
 
 The backend is not built at activation. It is built the first time something

@@ -1,5 +1,87 @@
 # Changelog
 
+## Unreleased
+
+Jobs spanning more than one machine. Everything below exists because of one
+question asked on 2026-08-18 — two boxes of eight GPUs, does this work? — and
+the answer turned out to be "partly, and it does not tell you which part".
+
+### Added
+
+- **The storage topology is announced at activation.** With
+  `sharded_checkpoints: per_rank` and local storage, each machine writes only
+  its own ranks' shards to its own disk, so no machine holds a whole
+  checkpoint. It then resumes only if every machine is handed the same ranks
+  again — which no launcher promises — and not at all if a machine is lost.
+  The behaviour was safe and silent: the run simply started over, with no
+  indication that a checkpoint existed and had not been used. Ravex now says
+  which of three situations you are in, at activation rather than at the first
+  failed resume.
+- **Shared storage is probed, not guessed.** A local disk and an NFS mount are
+  the same `type: local` pointing at a directory that exists, so the question
+  is asked instead: every rank drops a uniquely named marker and looks for
+  everyone else's, with `all_gather_object` as the synchronisation. A directory
+  that cannot be written to answers "not shared", which is the safe reading.
+- **`replicate_every`** — copies of each rank's store to a peer on another
+  machine, every N checkpoints, for jobs with neither a bucket nor a shared
+  filesystem. The peer is `(rank + local_world_size) % world_size`, which only
+  lands on a different machine when the ranks are spread evenly, so an uneven
+  layout is reported as *not* replicating rather than assumed to work. The
+  exchange is point-to-point `isend`/`irecv`, never a collective — an
+  all-gather would leave every rank holding `world_size` copies. All-or-nothing
+  with a collective verdict: three copies of four landing is not a restore
+  point and is not recorded as one. Replicas live under `replica/`, outside the
+  `rank_*` names discovery scans, and count only once a completion marker is
+  written last. Default 10; `0` turns it off. **The guarantee, stated exactly:
+  the loss of any one machine is survivable, at a cost of at most one
+  replication interval of progress.**
+- **A replaced machine gets its store back.** A rank that comes up with nothing
+  pulls its store from the peer that has been holding a copy, or — with a
+  bucket configured — from the remote. Without this the copies existed and
+  nobody read them, which protects the bytes and not the run.
+- **Run identity and owner records.** Each per-rank store carries a
+  `.ravex-owner` naming the run that wrote it and the machine it was written
+  on. Two training histories on one disk used to be indistinguishable: on
+  2026-08-19 a run restarted with a different placement wrote a second history
+  beside the first, and a later restart resumed the accidental one while the
+  original sat one directory away. It is also what turns "rank 2's store is not
+  here" into "rank 2's store was written on node0, which is not running rank 2
+  now".
+
+### Fixed
+
+- **A bucket was a backup you could not resume from, and the documentation
+  said otherwise.** Moonclip's remote support was push-only, so the step to
+  resume from was read from the *local* manifest. On a six-node bench a node
+  whose disk had been replaced started from scratch with its own data sitting
+  in the bucket, and took every other rank with it, since a resume is agreed at
+  the oldest step everyone holds. Fixed in Moonclip; Ravex now fills an empty
+  store from the remote before deciding where to resume. The runtime warning
+  that used to recommend S3 for a problem S3 did not solve was corrected in the
+  same pass.
+- **One rank disabling itself no longer hangs the other seven.** A failed
+  checkpoint called `_disable`, which is per process: a full disk on one node
+  of eight turned that rank off while the rest stayed on. At the next
+  checkpoint the seven entered `collect_state` — a collective — and the eighth
+  returned at the first line and ran ahead into the next forward. The seven
+  then waited for a participant that never came, and NCCL takes half an hour to
+  say so, with all eight GPUs allocated and billing throughout. Not a fast
+  error, an expensive hang. The verdict is now taken once, by everyone, and
+  everyone acts on it. A backend that is merely unavailable is reported rather
+  than latching the runtime off.
+
+### Documentation
+
+- **The multi-machine story is written down.** It had never been: `multi-node`,
+  `nnodes` and `NFS` appeared nowhere in `docs/`, the README or the sources,
+  and a runtime warning is not a substitute for a page you can read before
+  starting a job. See *More than one machine* in
+  [docs/how-it-works.md](docs/how-it-works.md) and
+  [docs/configuration.md](docs/configuration.md).
+- **Keeping the checkpoints after a run ends is the user's**, stated as such,
+  together with where to look: a sharded model has no checkpoint at exit, so
+  the newest thing worth copying off is the last periodic one.
+
 ## 0.0.3 — 2026-08-18
 
 **No changes to the library.** `git diff v0.0.2..v0.0.3 -- ravex/` is empty: the

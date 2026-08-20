@@ -33,6 +33,7 @@ ravex status
 | `compression_level` | `RAVEX_COMPRESSION_LEVEL` | `3` | zstd level. |
 | `keep_last` | `RAVEX_KEEP_LAST` | `5` | Checkpoints to retain. Older ones are deleted. |
 | `sharded_checkpoints` | `RAVEX_SHARDED_CHECKPOINTS` | `gather` | How FSDP state is written: `gather` or `per_rank`. See [Sharded models](#sharded-models). |
+| `replicate_every` | `RAVEX_REPLICATE_EVERY` | `10` | Checkpoints between copies of each rank's store to a peer on another machine. Only ever used when the storage turns out to be neither remote nor shared. `0` turns it off. See [More than one machine](#more-than-one-machine). |
 | `track_dataloaders` | `RAVEX_TRACK_DATALOADERS` | `true` | Track and restore the dataset position. |
 | `track_rng` | `RAVEX_TRACK_RNG` | `true` | Save and restore torch / CUDA / Python / NumPy RNG state. |
 | `handle_sigterm` | `RAVEX_HANDLE_SIGTERM` | `true` | Checkpoint on SIGTERM — the signal a preempted spot instance receives. Only installed if nothing else has claimed the signal. |
@@ -164,6 +165,39 @@ in order:
 
 1. `RAVEX_S3_ACCESS_KEY` / `RAVEX_S3_SECRET_KEY`
 2. `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`
+
+### More than one machine
+
+A job spanning several machines with `sharded_checkpoints: per_rank` and local
+storage splits one checkpoint across disks that cannot see each other. Ravex
+detects this at activation — by probing the storage, not by reading the path —
+and says so in the log.
+
+`replicate_every` is the answer when there is no bucket and no shared
+filesystem: every this many checkpoints, each rank sends a copy of its store to
+a peer on another machine.
+
+```yaml
+sharded_checkpoints: per_rank
+replicate_every: 10
+```
+
+The interval is what keeps the copy from becoming backpressure on the training
+loop — average bandwidth is one store per rank divided by it — and what it buys
+is bounded in the same breath: losing a machine costs at most that many
+checkpoints of progress.
+
+Left at its default it costs nothing on a job that does not need it. With a
+bucket or a shared filesystem the copies stay off, because there the checkpoint
+is already reachable from anywhere and the bandwidth would buy nothing. An
+uneven spread of ranks over machines also turns them off, and says so, since no
+peer can then be shown to be on a different machine.
+
+`storage.type: s3` covers the same ground more cheaply when you have a bucket:
+checkpoints leave the machines on their own, and a rank that comes up with an
+empty disk pulls its store back. See
+[More than one machine](how-it-works.md#more-than-one-machine) for what each
+one actually guarantees.
 
 ## Step budgets
 
