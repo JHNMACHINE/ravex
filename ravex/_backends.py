@@ -83,6 +83,15 @@ class CheckpointBackend(ABC):
     def flush(self) -> None:
         """Block until every pending write has completed."""
 
+    def restore_from_remote(self) -> bool:
+        """Pull this store back from remote storage. Did anything come?
+
+        For a machine that came up without the store it had. Backends with no
+        remote of their own have nothing to pull, which is why this is not
+        abstract — ``torch_save`` writes to a path and that is all.
+        """
+        return False
+
     def consolidate(self) -> None:
         """Leave the store readable on its own, with nothing outside it.
 
@@ -281,6 +290,14 @@ class MoonclipBackend(CheckpointBackend):
 
     def flush(self) -> None:
         self._manager.flush()
+
+    def restore_from_remote(self) -> bool:
+        try:
+            return bool(self._manager.restore_from_remote())
+        except AttributeError:
+            # An older Moonclip: the remote was push-only until 0.0.8, so there
+            # is no way back and saying so beats crashing the resume.
+            return False
 
     def consolidate(self) -> None:
         """Fold the delta chain into one full snapshot.

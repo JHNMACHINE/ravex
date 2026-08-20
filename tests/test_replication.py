@@ -421,3 +421,128 @@ class TestWhoSendsWhatBackToWhom:
     def test_nonsense_input_moves_nothing(self):
         assert recovery_roles(0, 1, 3, [], []) == (False, False)
         assert recovery_roles(0, 1, 3, [True, True], [True]) == (False, False)
+
+
+class TestFetchingBackFromTheBucket:
+    """The way back that did not exist until 2026-08-19.
+
+    With a remote configured, a rank whose disk was replaced used to come up
+    empty while its data sat in the bucket — and because a resume is agreed at
+    the oldest step every rank holds, it took the whole job back to zero.
+    Measured on a six-node bench, not reasoned about.
+    """
+
+    def runtime(self, monkeypatch, config, backend):
+        from ravex._runtime import RavexRuntime
+
+        runtime = RavexRuntime.__new__(RavexRuntime)
+        runtime.config = config
+        runtime._backend = backend
+        return runtime
+
+    def capture(self, runtime):
+        import logging
+
+        logger = logging.getLogger("ravex")
+        records = []
+        handler = logging.Handler()
+        handler.emit = lambda record: records.append(record.getMessage())
+        logger.addHandler(handler)
+        previous = logger.level
+        logger.setLevel(logging.INFO)
+        try:
+            runtime._restore_from_remote_if_empty()
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(previous)
+        return "\n".join(records)
+
+    def test_an_empty_local_store_is_refilled(self, tmp_path, monkeypatch):
+        class Backend:
+            def __init__(self):
+                self.asked = False
+
+            def has_checkpoint(self):
+                return False
+
+            def restore_from_remote(self):
+                self.asked = True
+                return True
+
+        config = local_config(tmp_path)
+        config.storage.type = "s3"
+        config.storage.bucket = "checkpoints"
+        backend = Backend()
+
+        text = self.capture(self.runtime(monkeypatch, config, backend))
+
+        assert backend.asked
+        assert "fetched one back from remote storage" in text
+
+    def test_a_store_that_is_there_is_left_alone(self, tmp_path, monkeypatch):
+        """A present store is the one this run is writing.
+
+        Overwriting it from the bucket would undo work rather than recover it.
+        """
+
+        class Backend:
+            def __init__(self):
+                self.asked = False
+
+            def has_checkpoint(self):
+                return True
+
+            def restore_from_remote(self):
+                self.asked = True
+                return True
+
+        config = local_config(tmp_path)
+        config.storage.type = "s3"
+        config.storage.bucket = "checkpoints"
+        backend = Backend()
+
+        self.capture(self.runtime(monkeypatch, config, backend))
+
+        assert not backend.asked, "it pulled over a store that was already here"
+
+    def test_local_storage_is_never_asked(self, tmp_path, monkeypatch):
+        """There is no bucket to ask, and the peer ring covers this case."""
+
+        class Backend:
+            def __init__(self):
+                self.asked = False
+
+            def has_checkpoint(self):
+                return False
+
+            def restore_from_remote(self):
+                self.asked = True
+                return True
+
+        backend = Backend()
+        self.capture(self.runtime(monkeypatch, local_config(tmp_path), backend))
+
+        assert not backend.asked
+
+    def test_a_backend_that_raises_does_not_take_the_run_down(
+        self, tmp_path, monkeypatch
+    ):
+        """Failing to fetch means starting from scratch, which is survivable.
+
+        Crashing at startup because a download failed is not.
+        """
+
+        class Backend:
+            def has_checkpoint(self):
+                return False
+
+            def restore_from_remote(self):
+                raise OSError("the bucket is having a day")
+
+        config = local_config(tmp_path)
+        config.storage.type = "s3"
+        config.storage.bucket = "checkpoints"
+
+        text = self.capture(self.runtime(monkeypatch, config, Backend()))
+
+        assert "Could not fetch" in text

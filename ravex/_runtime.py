@@ -421,7 +421,9 @@ class RavexRuntime:
         if not self._ensure_backend():
             return
         # Before anything asks what is on disk: a machine that was replaced has
-        # nothing of its own, and its copy is one rank away.
+        # nothing of its own. With a bucket the way back is a download; without
+        # one it is a peer that has been holding a copy.
+        self._restore_from_remote_if_empty()
         self._recover_missing_stores()
         # Bound locally: `_ensure_backend` sets it, but only a local name makes
         # that visible to a type checker, and the package ships `py.typed`.
@@ -575,6 +577,39 @@ class RavexRuntime:
             ", ".join("%s %.3fs" % item for item in phases.items()),
         )
         return True
+
+    def _restore_from_remote_if_empty(self) -> None:
+        """Fetch this rank's store back out of the bucket, if it has none.
+
+        Purely local — each rank pulls its own prefix and nothing waits on
+        anyone — so unlike the peer recovery below there is no pairing to get
+        right.
+
+        Only when the local store is empty. A store that is present is the one
+        this run has been writing, and a download that overwrote it would be
+        undoing work rather than recovering it; whether a *stale* local store
+        should also be refreshed is a separate question, and not this one.
+
+        Measured on a six-node bench on 2026-08-19: with the remote push-only,
+        a node whose disk had been replaced started from scratch while its data
+        sat in the bucket — and took every other rank with it, since a resume
+        is agreed at the oldest step everyone holds.
+        """
+        if not self.config.storage.is_remote or self._backend is None:
+            return
+        try:
+            if self._backend.has_checkpoint():
+                return
+            if not self._backend.restore_from_remote():
+                return
+        except Exception as exc:
+            logger.warning("Could not fetch this rank's store from the remote: %s", exc)
+            return
+
+        logger.info(
+            "This rank had no store of its own and fetched one back from remote "
+            "storage."
+        )
 
     def _recover_missing_stores(self) -> None:
         """Give a replaced machine back the store it never had.
