@@ -70,6 +70,20 @@ the answer turned out to be "partly, and it does not tell you which part".
   everyone acts on it. A backend that is merely unavailable is reported rather
   than latching the runtime off.
 
+### Testing
+
+- **A multi-machine bench**, `integration/multinode/`. One container per rank,
+  because the question is which ranks can see which directory and ranks on one
+  machine all see the same one — `torchrun --nproc_per_node=6` makes six
+  processes, not six machines. Four scenarios: shared storage, split storage,
+  a machine replaced with an empty disk, and the nodes coming back in a
+  different order. It prints what each disk holds before the resume, so a run
+  can tell "the data was gone" from "the data was there and nobody looked".
+
+  It is the first end-to-end exercise of both the shared-storage path and the
+  peer replication, and it found one defect on its first honest run: after a
+  reshuffle every replica is present and none is used.
+
 ### Documentation
 
 - **The multi-machine story is written down.** It had never been: `multi-node`,
