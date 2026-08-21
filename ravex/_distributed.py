@@ -21,8 +21,12 @@ Sharded models have two ways through here, and they trade against each other:
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any, Dict, List, Tuple
+
+
+logger = logging.getLogger("ravex")
 
 
 def _dist():
@@ -109,6 +113,60 @@ def barrier() -> None:
     dist = _dist()
     if dist is not None and dist.is_available() and dist.is_initialized():
         dist.barrier()
+
+
+def byte_transport_group():
+    """A group that can carry **CPU** tensors: ``(usable, group)``. Collective.
+
+    Replication moves a store as bytes, and bytes live on the host. NCCL is a
+    GPU collective library and refuses them outright — measured on 8x RTX 5060
+    Ti on 2026-08-21, where every replication round failed with
+    ``No backend type associated with device type cpu`` and not one copy was
+    ever made. The job carried on believing it was protected, because the
+    announcement at activation had promised it was.
+
+    Three answers, and the caller has to tell them apart:
+
+    * ``(True, None)`` — the default group already carries CPU tensors, which
+      is the case on a gloo job. Building a second group there would cost a
+      collective and buy nothing.
+    * ``(True, group)`` — a gloo subgroup, built once here and reused. Every
+      rank is a member; the ring only ever pairs ranks inside it.
+    * ``(False, None)`` — no transport for bytes on this job. The caller must
+      then say replication is **off**, at activation, rather than let every
+      round fail one warning at a time.
+
+    ``new_group`` is itself collective: every rank calls it, or the ones that
+    skipped hang the ones that did. Hence "collective" above, and hence being
+    called from a branch every rank takes together.
+    """
+    dist = _dist()
+    if dist is None or not dist.is_available() or not dist.is_initialized():
+        return False, None
+
+    try:
+        backend = str(dist.get_backend()).lower()
+    except Exception:  # pragma: no cover - a group in an odd state
+        return False, None
+
+    if "gloo" in backend:
+        return True, None
+
+    if not dist.is_gloo_available():
+        # Nothing to fall back to. Saying so beats failing per round.
+        return False, None
+
+    try:
+        group = dist.new_group(backend="gloo")
+    except Exception as exc:
+        logger.warning(
+            "Could not open a gloo group for moving checkpoint bytes between "
+            "machines: %s. Copies between machines are off for this run.",
+            exc,
+        )
+        return False, None
+
+    return True, group
 
 
 def is_sharded(model) -> bool:

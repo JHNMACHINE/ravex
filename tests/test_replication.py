@@ -762,6 +762,9 @@ class TestTheRuntimeRebuildsFromItsOwnDisk:
         runtime._backend = None
         runtime._resume_manager = None
         runtime._storage_split = True
+        # A gloo job, where the default group already carries host bytes.
+        runtime._byte_transport_ok = True
+        runtime._byte_group = None
         runtime._per_rank_active = lambda: True
         runtime._ensure_backend = lambda: True
         return runtime

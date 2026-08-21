@@ -85,6 +85,14 @@ def _drain_accelerator() -> None:
 class RavexRuntime:
     """Singleton runtime. Build it through :func:`get_runtime`."""
 
+    #: Defaults at class level as well as in `__init__`, because the tests —
+    #: and any future caller — build a runtime with `__new__` to exercise one
+    #: method without standing up the whole thing. False is the safe reading:
+    #: a job that has not established a transport has not got one.
+    _byte_transport_ok = False
+    _byte_group = None
+
+
     def __init__(self, config: Optional[RavexConfig] = None):
         self.config = config or RavexConfig.load()
         self.registry = ObjectRegistry()
@@ -96,6 +104,10 @@ class RavexRuntime:
         self._storage_announced = False
         #: Set by the probe: storage is local *and* each machine has its own.
         self._storage_split = False
+        #: Whether this job can move bytes between ranks at all, and the group
+        #: to do it on. Settled once at activation; see `byte_transport_group`.
+        self._byte_transport_ok = False
+        self._byte_group = None
         self._last_replicated_step: Optional[int] = None
         self._leader_optimizer_id: Optional[int] = None
         self._checkpoint_due = False
@@ -185,6 +197,7 @@ class RavexRuntime:
         speaker alone entered.
         """
         from ravex._distributed import (
+            byte_transport_group,
             is_local_main_process,
             local_world_size,
             spans_several_machines,
@@ -205,6 +218,13 @@ class RavexRuntime:
         # asking again per checkpoint would be a collective per checkpoint.
         self._storage_split = not shared
 
+        # Before the announcement, because what it is allowed to promise
+        # depends on the answer — and collective, so it happens on every rank
+        # rather than only on the one that logs. Reached by all of them: the
+        # branches above are taken together or not at all.
+        if self._storage_split:
+            self._byte_transport_ok, self._byte_group = byte_transport_group()
+
         if not is_local_main_process():
             return
 
@@ -222,7 +242,11 @@ class RavexRuntime:
         from ravex._replication import replication_ring
 
         ring = replication_ring(get_rank(), get_world_size(), local_world_size())
-        replicating = self.config.replicate_every > 0 and ring is not None
+        replicating = (
+            self.config.replicate_every > 0
+            and ring is not None
+            and self._byte_transport_ok
+        )
 
         if replicating:
             logger.info(
@@ -247,6 +271,12 @@ class RavexRuntime:
                 "copies between machines are switched on but cannot be placed "
                 "here: the ranks are not spread evenly over the machines, so "
                 "no peer can be shown to be on a different one"
+            )
+        elif not self._byte_transport_ok and self.config.replicate_every > 0:
+            reason = (
+                "copies between machines are switched on but there is no way "
+                "to move bytes between the ranks: this job's backend does not "
+                "carry host tensors and no gloo group could be opened"
             )
         else:
             reason = "copies between machines are off (replicate_every=0)"
@@ -735,6 +765,12 @@ class RavexRuntime:
         if not any(needs):
             return
 
+        # Promoting a copy off this machine's own disk needed no transport, and
+        # has already happened above. Fetching one from a peer does, and on a
+        # job with nowhere to put host bytes there is nothing further to try.
+        if not self._byte_transport_ok:
+            return
+
         do_send, do_receive = recovery_roles(rank, send_to, receive_from, needs, holds)
 
         try:
@@ -745,6 +781,7 @@ class RavexRuntime:
                 own if do_receive else None,
                 send_to=receive_from,
                 receive_from=send_to,
+                group=self._byte_group,
             )
         except Exception as exc:
             logger.warning("Recovering this rank's store from a copy failed: %s", exc)
@@ -800,7 +837,9 @@ class RavexRuntime:
             # `CheckpointBackend.consolidate`.
             if self._backend is not None:
                 self._backend.consolidate()
-            ok = exchange_stores(source, destination, send_to, receive_from)
+            ok = exchange_stores(
+                source, destination, send_to, receive_from, group=self._byte_group
+            )
         except Exception as exc:
             logger.warning("Replication at step %d failed here: %s", step, exc)
             ok = False
@@ -834,6 +873,9 @@ class RavexRuntime:
         from ravex._distributed import local_world_size
 
         if self.config.replicate_every <= 0 or not self._storage_split:
+            return False
+        if not self._byte_transport_ok:
+            # Said once at activation rather than once per checkpoint.
             return False
         if not self._per_rank_active():
             return False

@@ -319,7 +319,16 @@ class TestWhatItSaysBeforeTheFirstCheckpoint:
     cluster with an NFS mount.
     """
 
-    def announce(self, monkeypatch, config, world, local, local_rank=0, shared=False):
+    def announce(
+        self,
+        monkeypatch,
+        config,
+        world,
+        local,
+        local_rank=0,
+        shared=False,
+        transport=(True, None),
+    ):
         monkeypatch.setenv("WORLD_SIZE", str(world))
         monkeypatch.setenv("LOCAL_WORLD_SIZE", str(local))
         monkeypatch.setenv("LOCAL_RANK", str(local_rank))
@@ -332,6 +341,12 @@ class TestWhatItSaysBeforeTheFirstCheckpoint:
             return shared
 
         monkeypatch.setattr("ravex._distributed.storage_is_shared", probe)
+        # These tests have no process group at all, so the real probe would
+        # answer "no transport" and the announcement would be about that
+        # instead of about the topology, which is what they are here for.
+        monkeypatch.setattr(
+            "ravex._distributed.byte_transport_group", lambda: transport
+        )
 
         runtime = RavexRuntime.__new__(RavexRuntime)
         runtime.config = config
@@ -378,6 +393,33 @@ class TestWhatItSaysBeforeTheFirstCheckpoint:
 
         assert "not at all if one machine is lost" in text
         assert "replicate_every=0" in text
+
+    def test_a_backend_that_cannot_carry_bytes_is_said_out_loud(
+        self, tmp_path, monkeypatch
+    ):
+        """GPU-82, and the reason it went unnoticed for two days.
+
+        Replication moves a store as bytes, and bytes live on the host. NCCL is
+        a GPU collective library and refuses them: measured on 8x RTX 5060 Ti
+        on 2026-08-21, every round failed with ``No backend type associated
+        with device type cpu`` and **not one copy was made** — while this
+        announcement went on promising that losing a machine cost an interval.
+
+        A gloo subgroup fixes it, and where one cannot be opened the honest
+        answer is to say replication is off **here**, once, rather than let
+        every round fail a warning at a time into a log nobody reads.
+        """
+        config = local_config(tmp_path)
+        config.replicate_every = 10
+        text, _ = self.announce(
+            monkeypatch, config, world=32, local=8, transport=(False, None)
+        )
+
+        assert "no way to move bytes between the ranks" in text
+        assert "not at all if one machine is lost" in text
+        assert "at most that much progress" not in text, (
+            "it promised protection it does not have"
+        )
 
     def test_copies_asked_for_but_impossible_says_which(self, tmp_path, monkeypatch):
         """Wanting copies and not being able to place them is the silent case.
