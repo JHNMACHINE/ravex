@@ -230,9 +230,27 @@ def test_the_startup_path_does_not_import_typing(tmp_path):
     A regression here is invisible: putting `from typing import ...` back into
     `ravex/__init__.py` breaks no other test and slows every Python process in
     the environment. Hence this one.
+
+    Asked as "did importing Ravex bring `typing` in", not as "is `typing` in
+    `sys.modules`" — the second is a question about the environment and Ravex
+    cannot answer it. On Python 3.9 it failed for a reason that does not exist
+    outside CI: `pip install -e .` leaves a `__editable___ravex_0_0_3_finder`
+    behind, `site` imports it before any test runs, and on 3.9 that reaches
+    `typing` through `importlib` — 6 ms, none of it ours. A user installs a
+    wheel, which has no such finder.
+
+    So the probe drops `typing` and every Ravex module from `sys.modules` and
+    imports again: whatever comes back is what the startup path costs, in any
+    environment. `-S` would also silence the finder, but it silences the `.pth`
+    that puts an editable install on `sys.path` too, and then there is no Ravex
+    left to import.
     """
     answer = _in_a_fresh_interpreter(
-        "import ravex._bootstrap, sys; print('typing' in sys.modules)",
+        "import sys;"
+        " [sys.modules.pop(m) for m in list(sys.modules)"
+        "  if m == 'typing' or m == 'ravex' or m.startswith('ravex.')];"
+        " import ravex._bootstrap;"
+        " print('typing' in sys.modules)",
         cwd=str(tmp_path),
     )
     assert answer == "False", "typing is back on the startup path"
