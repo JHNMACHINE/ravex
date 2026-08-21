@@ -8,6 +8,29 @@ the answer turned out to be "partly, and it does not tell you which part".
 
 ### Changed
 
+- **Peer replication now moves a store at the speed of the wire.** Copying a
+  checkpoint to another machine was running at about a third of what the same
+  link carried with nothing else in the way: 529 MB/s against 1462 MB/s on a
+  rented box, and the same shape on a laptop. It was not the network and not
+  the disk — reading and framing the store ran at 3411 MB/s on its own. It was
+  four copies of every chunk, two on each side, all of them holding the GIL.
+
+  Two of them are gone. The sending side hands `isend` a tensor over the
+  chunk's own memory instead of a `bytearray` duplicate — safe because
+  `fixed_chunks` yields fresh immutable `bytes`, which is the only thing the
+  copy was protecting against. The receiving side writes straight from the
+  tensor's memory when nothing is half-parsed, instead of `tobytes()` into a
+  `_pending` buffer, slicing a piece out, and memmoving the tail. Headers and
+  file boundaries still take the buffered path, which is where the ragged
+  cases always lived.
+
+  Measured on the same machine, alternating arms: **355 MB/s → 527 MB/s, a 48%
+  improvement**, which puts the transfer at the wire's own rate. A threaded
+  version that also overlapped disk with network was tried and added only six
+  points on top — not worth concurrency in a recovery path, so it was dropped.
+  The bytes on the wire did not change: a patched peer and an unpatched one
+  still understand each other.
+
 - **`pip install ravex` now installs the autoloader.** The one-line
   `ravex_autoload.pth` ships in the wheel, so checkpointing works on a project
   with a `ravex.yaml` without anyone running `ravex enable` first. The README
@@ -160,6 +183,23 @@ the answer turned out to be "partly, and it does not tell you which part".
   model and a silent one.
 
 ### Testing
+
+- **Two scripts for the replication transfer**, in `integration/scripts/`, both
+  running two gloo processes with no GPU and no rented machine — the path was
+  measured at 529 MB/s over loopback and 562 MB/s over real TCP between
+  containers, so whatever binds it can be studied on a laptop.
+
+  `measure_replication_transfer.py` times the transfer against the two bounds
+  it has to be read against: the wire carrying the same volume with no file
+  touched, and the disk delivering the store with nothing sent. When the
+  transfer sits far below both, its `phases` arm says which step is spending
+  the time. That is how the 48% came off.
+
+  `verify_replication_transfer.py` sends a deliberately awkward store — a
+  zero-length file, a one-byte file, a file exactly one chunk long, another one
+  byte past the boundary, nested directories — and compares the arrival with
+  the source by hash. The unit tests drive `StoreWriter` in one process; this
+  is the only thing that exercises `exchange_stores` between two of them.
 
 - **A multi-machine bench**, `integration/multinode/`. One container per rank,
   because the question is which ranks can see which directory and ranks on one

@@ -215,6 +215,29 @@ class TestMovingAStore:
         assert (tmp_path / "dst" / "empty").read_bytes() == b""
         assert (tmp_path / "dst" / "after.bin").read_bytes() == b"z" * 40
 
+    def test_it_takes_any_buffer_and_not_only_bytes(self, tmp_path):
+        """The wire hands over borrowed memory, and copying it was the cost.
+
+        `exchange_stores` passes the received tensor's own memory straight in,
+        so `feed` has to accept anything with a buffer. It used to be handed
+        `bytes` only, which meant a `tobytes()` copy of every chunk — most of
+        what the receiving side spent its time on. Pinned here because the
+        signature invites a well-meant narrowing back to `bytes`, and the
+        breakage would only show up on a real transfer.
+        """
+        files = {"big.bin": bytes(range(256)) * 40, "small.bin": b"q" * 3}
+        source = build_store(tmp_path / "src", files)
+
+        writer = StoreWriter(str(tmp_path / "dst"))
+        for index, block in enumerate(encode_store(str(source), chunk=64)):
+            # Alternating, so neither kind is only ever seen mid-file.
+            writer.feed(memoryview(block) if index % 2 else bytearray(block))
+        writer.close()
+
+        assert writer.complete
+        for relative, content in files.items():
+            assert (tmp_path / "dst" / relative).read_bytes() == content
+
     def test_an_empty_store_completes_without_sending_a_body(self, tmp_path):
         source = (tmp_path / "src")
         source.mkdir()
