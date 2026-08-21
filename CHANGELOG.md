@@ -67,6 +67,17 @@ the answer turned out to be "partly, and it does not tell you which part".
   `dict[str, object | None]` rather than `Dict[str, Optional[Any]]`, and
   `object` is stricter than `Any` for a consumer.
 
+- **The Moonclip floor is `>=0.0.8`.** Ravex calls `restore_from_remote()`,
+  which the engine grew in 0.0.8, and the backend catches the `AttributeError`
+  an older one raises. That is the right thing for a method that may not be
+  there, and it is also why the pin has to move: on 0.0.7 the call does not
+  fail, it answers "nothing to restore" — so a rank whose disk was replaced
+  starts from scratch with its own data sitting in the bucket, and takes every
+  other rank with it. The code path cannot tell an empty remote from an engine
+  that has no way to read one; the version requirement can. The same release
+  is also the first that can put an object over 5 GiB into S3 at all, which
+  `sharded_checkpoints: gather` reaches on its own.
+
 ### Added
 
 - **The storage topology is announced at activation.** With

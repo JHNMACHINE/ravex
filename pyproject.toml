@@ -27,7 +27,7 @@ classifiers = [
 dependencies = ["PyYAML>=5.1"]
 
 [project.optional-dependencies]
-# 0.0.7, and the floor has moved twice for the same reason: each time, the
+# 0.0.8, and the floor has moved three times for the same reason: each time, the
 # version below it loses or wedges something Ravex's own defaults walk straight
 # into.
 #
@@ -41,7 +41,17 @@ dependencies = ["PyYAML>=5.1"]
 #            that makes both likely: `sharded_checkpoints: per_rank` has every
 #            rank on the node saving at once, and the merger runs against
 #            stores that a resume may be reading.
-moonclip = ["moonclip>=0.0.7"]
+#   >=0.0.8  the remote stopped being one-way. `restore_from_remote` exists
+#            from 0.0.8, and `_backends.py` catches the `AttributeError` an
+#            older engine raises — so on 0.0.7 a rank with an empty disk does
+#            not crash, it silently starts from scratch and takes every other
+#            rank back with it. That is the failure this floor exists to
+#            prevent, and a version pin is the only place it can be caught,
+#            since the code path cannot tell "no remote copy" from "no such
+#            method". The same release also made a write over 5 GiB reach S3
+#            at all, which `sharded_checkpoints: gather` produces on its own
+#            for a model of any size.
+moonclip = ["moonclip>=0.0.8"]
 dev = ["pytest>=7", "numpy"]
 
 [project.urls]

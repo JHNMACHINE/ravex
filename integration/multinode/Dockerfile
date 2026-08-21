@@ -11,7 +11,8 @@
 # the honest default — it is what a user gets — and it means the image needs no
 # Rust toolchain. To try an unreleased Moonclip, build a wheel with maturin and
 # add it here; the difference matters for anything touching remote storage,
-# where 0.0.7 is push-only.
+# which reached the released engine in 0.0.8 — before that the remote was
+# push-only and there was nothing to pull back.
 FROM python:3.12-slim
 
 RUN pip install --no-cache-dir \
