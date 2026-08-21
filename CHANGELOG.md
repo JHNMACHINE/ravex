@@ -70,6 +70,20 @@ the answer turned out to be "partly, and it does not tell you which part".
   everyone acts on it. A backend that is merely unavailable is reported rather
   than latching the runtime off.
 
+- **After a reshuffle every copy was present and none was used.** The ring
+  addresses a peer **by rank**, but a copy travels **with the disk** it was
+  written to. Move the nodes round by one position and each rank comes up
+  sitting on the copy of its own store — complete, and unreachable, because
+  the peer that used to hold it is now elsewhere holding somebody else's. Six
+  intact copies bought nothing, and the run started from scratch with the
+  bytes under its feet. A rank without a store now looks for a copy of itself
+  on its own disk first: a local file copy, no pairing and nothing on the
+  wire. It is promoted only when the history it belongs to is unambiguous —
+  named by the stores that survived, or, when none did, agreed among the
+  copies themselves. A copy from an older run is refused, because resuming
+  half the shards from one training history and half from another is a wrong
+  model and a silent one.
+
 ### Testing
 
 - **A multi-machine bench**, `integration/multinode/`. One container per rank,
@@ -81,8 +95,15 @@ the answer turned out to be "partly, and it does not tell you which part".
   can tell "the data was gone" from "the data was there and nobody looked".
 
   It is the first end-to-end exercise of both the shared-storage path and the
-  peer replication, and it found one defect on its first honest run: after a
-  reshuffle every replica is present and none is used.
+  peer replication, and it earned its keep on its first honest run by finding
+  the reshuffle defect fixed above — which no unit test could have found,
+  because every piece involved was correct on its own.
+
+  Worth knowing if you extend it: `--init` is load-bearing. A round ends with
+  the training script sending itself SIGKILL, and the kernel discards a
+  SIGKILL aimed at PID 1 from inside its own namespace when PID 1 has no
+  handler. Without an init process the script runs to completion and the bench
+  reports six happy nodes having proved nothing.
 
 ### Documentation
 

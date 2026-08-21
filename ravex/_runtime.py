@@ -611,19 +611,39 @@ class RavexRuntime:
             "storage."
         )
 
+    def _reread_store(self) -> None:
+        """Build the backend again over a store that appeared under it.
+
+        The backend read the directory when it was empty and its answer is now
+        wrong. Cheap to drop: nothing has trained yet at this point.
+        """
+        self._backend = None
+        self._resume_manager = None
+        self._ensure_backend()
+
     def _recover_missing_stores(self) -> None:
-        """Give a replaced machine back the store it never had.
+        """Give a rank back a store it came up without.
 
-        The ring run backwards. A rank that comes up with nothing — its machine
-        was preempted and a fresh one took its place — pulls its store from the
-        peer that has been holding a copy of it all along. Without this the
-        copies exist and nobody reads them, which protects the bytes and not
-        the run.
+        Two ways, and the cheap one goes first.
 
-        Every rank takes part, and the pairs are worked out from lists all of
-        them have: who is missing a store, and who holds a whole copy of whose.
-        A send posted without a receive waiting would hang here at startup,
-        before anyone is watching.
+        **A copy already on this disk.** The ring addresses a peer by rank, but
+        a copy travels with the disk it was written to, so a reshuffle of the
+        nodes leaves every rank sitting on the copy of its own store — present,
+        complete, and unreachable by asking anyone. Promoting it is a local
+        file copy: no pairing, no transfer, nothing on the wire.
+
+        **A copy on the peer that has been holding it.** The ring run
+        backwards, for the machine that was replaced and arrived with an empty
+        disk. Without this the copies exist and nobody reads them, which
+        protects the bytes and not the run.
+
+        Every rank takes part, and both decisions come out of one gathered
+        picture: who is missing a store, who holds a copy of whose, and which
+        history each of those copies belongs to. A send posted without a
+        receive waiting would hang here at startup, before anyone is watching —
+        so the pairing is computed from the picture *after* the local
+        promotions, which every rank works out identically rather than
+        announcing.
 
         Best-effort. Failing to recover means starting from scratch, which is
         what would have happened anyway; failing loudly at startup would not.
@@ -634,8 +654,11 @@ class RavexRuntime:
             visible_rank_stores,
         )
         from ravex._distributed import gather_objects, local_world_size
+        from ravex._identity import run_id_at
         from ravex._replication import (
             exchange_stores,
+            local_recoveries,
+            promote_copy,
             recovery_roles,
             replica_is_complete,
             replication_ring,
@@ -652,19 +675,57 @@ class RavexRuntime:
 
         own = per_rank_store_path(self.config, rank)
         held = replica_store_path(self.config, receive_from)
+        mine_here = replica_store_path(self.config, rank)
 
         try:
             needs_mine = rank not in visible_rank_stores(self.config)
             holds_whole = replica_is_complete(held)
+            own_copy = replica_is_complete(mine_here)
+            copy_run = run_id_at(mine_here)
+            store_run = None if needs_mine else run_id_at(own)
         except Exception:  # pragma: no cover - never worth the run
-            needs_mine, holds_whole = False, False
+            needs_mine, holds_whole, own_copy = False, False, False
+            copy_run, store_run = None, None
 
         # Unconditional, and before any of the decisions below: the pairing is
-        # only exact if every rank contributes to the same picture.
-        state = gather_objects((bool(needs_mine), bool(holds_whole)))
+        # only exact if every rank contributes to the same picture. It carries
+        # the identities too, because a copy can only be promoted once the
+        # history it belongs to is known, and that is not a local fact.
+        state = gather_objects(
+            (bool(needs_mine), bool(holds_whole), bool(own_copy), copy_run, store_run)
+        )
         needs = [bool(entry[0]) for entry in state]
         holds = [bool(entry[1]) for entry in state]
+        own_copies = [bool(entry[2]) for entry in state]
+        copy_runs = [entry[3] for entry in state]
+        store_runs = [entry[4] for entry in state]
 
+        if not any(needs):
+            return
+
+        promotions = local_recoveries(needs, own_copies, copy_runs, store_runs)
+
+        if promotions[rank]:
+            if promote_copy(mine_here, own):
+                logger.info(
+                    "This rank had no store of its own and rebuilt one from the "
+                    "copy that came back on this machine's disk - nothing had to "
+                    "be fetched."
+                )
+                self._reread_store()
+            else:
+                logger.warning(
+                    "This rank has no store and the copy on its own disk could "
+                    "not be promoted - starting from scratch."
+                )
+
+        # Recomputed, not re-gathered. A promotion is a local act with a local
+        # outcome, and asking again would cost a second collective to learn
+        # something every rank can already derive. A promotion that failed
+        # leaves this rank without a store and nobody sending it one, which is
+        # the same place it would have been anyway — and not a hang, which is
+        # what an inexact pairing would cost.
+        needs = [need and not taken for need, taken in zip(needs, promotions)]
         if not any(needs):
             return
 
@@ -689,10 +750,7 @@ class RavexRuntime:
                 "%d, where a copy had been kept.",
                 send_to,
             )
-            # Rebuilt because the backend read the store when it was empty.
-            self._backend = None
-            self._resume_manager = None
-            self._ensure_backend()
+            self._reread_store()
         elif do_receive:
             logger.warning(
                 "This rank has no store and the copy on rank %d could not be "

@@ -88,6 +88,7 @@ def machine_of(rank: int, local_size: int) -> Optional[int]:
 # ─── moving a store, without moving it twice ────────────────────────
 
 import os
+import shutil
 import struct
 
 #: Bytes per chunk on the wire. Bounded on purpose: a real shard is over a
@@ -354,6 +355,106 @@ def recovery_roles(rank, send_to, receive_from, needs, holds):
     should_receive = bool(needs[rank]) and bool(holds[send_to])
     should_send = bool(needs[receive_from]) and bool(holds[rank])
     return should_send, should_receive
+
+
+def local_recoveries(needs, has_own_copy, copy_runs, store_runs):
+    """Which ranks can rebuild themselves from a copy already on their disk.
+
+    The ring addresses a peer **by rank**, but a copy travels **with the disk**
+    it was written to. Shift the nodes by one position and every rank comes up
+    sitting on the copy of its own store: all of them present, complete, and
+    none reachable by asking a peer — because the peer that used to hold your
+    copy is now elsewhere holding somebody else's. Seen on the bench on
+    2026-08-20, six intact copies buying nothing.
+
+    A copy under your own feet costs nothing to use: no pairing, no transfer,
+    no collective. What it does need is proof that it belongs to the history
+    this job is continuing. Promoting a copy left by an older run would leave
+    the job resuming half its shards from one training history and half from
+    another, which is a wrong model — worse than starting from scratch, and
+    silent.
+
+    So the history has to be **unambiguous**, and there are two ways to know it:
+
+    * some ranks still have their own store, and those stores name it;
+    * none does — the full reshuffle — and then the copies are all there is,
+      so they have to agree among themselves.
+
+    Anything less settled promotes nobody. Two histories on one disk is exactly
+    the case that must not be guessed at, and it is not hypothetical: it
+    happened on 2026-08-19.
+
+    Every rank computes this from the same gathered lists and so reaches the
+    same answer, which is what keeps the network pairing that follows exact
+    even though no one announces whether their own promotion worked.
+    """
+    size = len(needs)
+    if any(len(other) != size for other in (has_own_copy, copy_runs, store_runs)):
+        return [False] * size
+
+    # A copy with no owner record cannot be attributed to anything, and an
+    # unattributable copy is the one case this function exists to refuse.
+    candidates = {
+        rank
+        for rank in range(size)
+        if needs[rank] and has_own_copy[rank] and copy_runs[rank]
+    }
+    if not candidates:
+        return [False] * size
+
+    history = {
+        store_runs[rank]
+        for rank in range(size)
+        if not needs[rank] and store_runs[rank]
+    }
+    if not history:
+        history = {copy_runs[rank] for rank in candidates}
+
+    if len(history) != 1:
+        return [False] * size
+
+    wanted = next(iter(history))
+    return [rank in candidates and copy_runs[rank] == wanted for rank in range(size)]
+
+
+def promote_copy(copy_path: str, store_path: str) -> bool:
+    """Turn a copy already on this disk into this rank's own store.
+
+    A plain local copy: the bytes are here, and nothing has to be asked of
+    anyone. Built in a hidden sibling and renamed into place, so a process that
+    dies half way leaves something the store scans skip rather than a directory
+    that looks like a store and is not — ``rank_<n>`` is what everything
+    scans for, and a leading dot is not.
+
+    The completeness marker stays behind. It says something true about a copy,
+    and what is being built here is not one. The owner record does come across:
+    it is what lets the resume recognise which history it is continuing, and
+    dropping it would undo the check that allowed this promotion.
+    """
+    if not replica_is_complete(copy_path):
+        return False
+
+    parent = os.path.dirname(store_path) or "."
+    staging = os.path.join(parent, "." + os.path.basename(store_path) + ".incoming")
+
+    try:
+        shutil.rmtree(staging, ignore_errors=True)
+        os.makedirs(parent, exist_ok=True)
+        shutil.copytree(copy_path, staging)
+
+        marker = os.path.join(staging, COMPLETE_MARKER)
+        if os.path.exists(marker):
+            os.remove(marker)
+
+        # The caller only gets here when this rank has no usable store, so what
+        # is being removed is a missing or empty directory — and `rename` onto
+        # a non-empty one fails on POSIX and on Windows alike.
+        shutil.rmtree(store_path, ignore_errors=True)
+        os.rename(staging, store_path)
+        return True
+    except OSError:
+        shutil.rmtree(staging, ignore_errors=True)
+        return False
 
 
 def exchange_stores(

@@ -124,6 +124,19 @@ def read_owner(store_path: str) -> Optional[Dict[str, Any]]:
     return record if isinstance(record, dict) else None
 
 
+def run_id_at(store_path: str) -> Optional[str]:
+    """Which run a store — or a copy of one — belongs to, or None.
+
+    The narrow question, separated from :func:`read_owner` because one caller
+    asks nothing else and asks it about directories that may not exist. A copy
+    with no readable record cannot be attributed to any history, and a copy
+    that cannot be attributed is one nothing should be resumed from.
+    """
+    record = read_owner(store_path) or {}
+    value = record.get("run_id")
+    return str(value) if value else None
+
+
 def write_owner(store_path: str, run_id: str, rank: int, world_size: int) -> None:
     """Record who this store belongs to. Never raises.
 

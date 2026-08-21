@@ -144,7 +144,7 @@ summarise() {
             | sort -u | sed "s/^/  /" || echo "  (nothing)"
         echo
         echo "=== where each rank resumed ==="
-        grep -h -E "Resumed at|No checkpoint|fetched one back|from a peer|from scratch" \
+        grep -h -E "Resumed at|No checkpoint|took one back|rebuilt one from|fetched one back|from scratch" \
             /out/ravex.resume.rank*.log 2>/dev/null \
             | sed -E "s/^[0-9-]+ [0-9:,]+ \[ravex\] [A-Z]+ //" \
             | sort | uniq -c | sed "s/^/ /" || echo "  (nothing)"

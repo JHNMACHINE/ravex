@@ -46,20 +46,22 @@ where a copy had been kept.
 Resumed at step 20
 ```
 
-`reshuffle` — a checkpoint that exists and cannot be reached, said in those
-words rather than as a silent restart:
+`reshuffle` — every rank rebuilds itself from the copy that came back on its
+own disk, without asking anyone:
 
 ```
-A checkpoint exists but this topology cannot reach it - starting from scratch.
-The stores for rank(s) 0, 1, 2, 3, 4, 5 are on machines other than the ones
-now running them (written on ...), which is what happens when the nodes come
-back in a different order. Nothing was lost: rerun with the previous
-rank-to-node placement, or use remote storage.
+6 This rank had no store of its own and rebuilt one from the copy that came
+  back on this machine's disk - nothing had to be fetched.
+6 Resumed at step 20
 ```
 
-**But look at the layout the bench prints just before that resume.** Every
-rank is sitting on the disk holding its own replica, and not one of them is
-used. Tracked separately; the bench is what found it.
+**This is the scenario that earned the bench its keep.** On its first honest
+run it printed something else — *"A checkpoint exists but this topology cannot
+reach it - starting from scratch"* — while the layout dump above it showed
+every rank sitting on the disk holding its own copy. Six intact copies, none
+used, because the recovery addressed peers by rank while the copies had
+travelled with the disks. That was GPU-79, fixed on 2026-08-21; this scenario
+is what would catch it coming back.
 
 ## Why it is built the way it is
 

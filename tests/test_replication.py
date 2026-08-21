@@ -10,6 +10,8 @@ The failure being defended against was demonstrated on 2026-08-19: four nodes,
 one SIGKILLed mid-run, 2260 steps unrecoverable on three intact disks.
 """
 
+import os
+
 from ravex._backends import replica_store_path, visible_replica_stores
 from ravex._config import RavexConfig
 from ravex._replication import (
@@ -17,8 +19,10 @@ from ravex._replication import (
     REPLICA_DIR,
     StoreWriter,
     encode_store,
+    local_recoveries,
     machine_count,
     machine_of,
+    promote_copy,
     recovery_roles,
     replica_is_complete,
     replication_ring,
@@ -546,3 +550,290 @@ class TestFetchingBackFromTheBucket:
         text = self.capture(self.runtime(monkeypatch, config, Backend()))
 
         assert "Could not fetch" in text
+
+
+# --- a copy that came back on this machine's own disk ---------------
+
+
+def a_complete_copy(base, rank, run_id, step=20):
+    """A replica directory the way a finished transfer leaves one."""
+    import json
+
+    path = replica_store_path(local_config(base), rank)
+    os.makedirs(os.path.join(path, "snapshots"), exist_ok=True)
+    with open(os.path.join(path, "manifest.json"), "w", encoding="utf-8") as handle:
+        json.dump({"step": step}, handle)
+    with open(os.path.join(path, "snapshots", "pack"), "wb") as handle:
+        handle.write(b"shard bytes")
+    with open(os.path.join(path, ".ravex-owner"), "w", encoding="utf-8") as handle:
+        json.dump({"run_id": run_id, "rank": rank, "world_size": 6}, handle)
+    with open(os.path.join(path, COMPLETE_MARKER), "w", encoding="utf-8") as handle:
+        handle.write("ok")
+    return path
+
+
+def a_store(base, rank, run_id):
+    """A rank's own store, with the record that says whose history it is."""
+    import json
+
+    path = os.path.join(str(base), "rank_%d" % rank)
+    os.makedirs(path, exist_ok=True)
+    with open(os.path.join(path, "manifest.json"), "w", encoding="utf-8") as handle:
+        json.dump({"step": 20}, handle)
+    with open(os.path.join(path, ".ravex-owner"), "w", encoding="utf-8") as handle:
+        json.dump({"run_id": run_id, "rank": rank, "world_size": 6}, handle)
+    return path
+
+
+class TestDecidingWhoCanPromoteACopy:
+    """GPU-79: after a reshuffle every copy is present and none is reachable.
+
+    The ring addresses a peer by rank; a copy travels with the disk. Move the
+    nodes round by one and each rank is sitting on the copy of its own store,
+    while the peer that used to hold it is elsewhere holding somebody else's.
+    """
+
+    def test_a_full_reshuffle_lets_everyone_rebuild_locally(self):
+        """Nobody has a store, every copy is here, and they agree whose."""
+        assert local_recoveries(
+            needs=[True] * 6,
+            has_own_copy=[True] * 6,
+            copy_runs=["run-a"] * 6,
+            store_runs=[None] * 6,
+        ) == [True] * 6
+
+    def test_the_surviving_stores_name_the_history(self):
+        """One rank lost its disk; the others still hold theirs."""
+        assert local_recoveries(
+            needs=[False, False, True],
+            has_own_copy=[False, False, True],
+            copy_runs=[None, None, "run-a"],
+            store_runs=["run-a", "run-a", None],
+        ) == [False, False, True]
+
+    def test_a_copy_from_another_run_is_refused(self):
+        """The case this check exists for.
+
+        Promoting it would resume half the shards from one training history
+        and half from another - a wrong model, and a silent one. Starting from
+        scratch is the better of the two.
+        """
+        assert local_recoveries(
+            needs=[False, False, True],
+            has_own_copy=[False, False, True],
+            copy_runs=[None, None, "run-from-last-week"],
+            store_runs=["run-a", "run-a", None],
+        ) == [False, False, False]
+
+    def test_two_histories_among_the_stores_promote_nobody(self):
+        """Not hypothetical: two runs left their stores side by side on
+        2026-08-19. Which one is being continued is not a thing to guess."""
+        assert local_recoveries(
+            needs=[False, False, True],
+            has_own_copy=[False, False, True],
+            copy_runs=[None, None, "run-a"],
+            store_runs=["run-a", "run-b", None],
+        ) == [False, False, False]
+
+    def test_reshuffled_copies_that_disagree_promote_nobody(self):
+        """No store left to arbitrate, and the copies do not agree either."""
+        assert local_recoveries(
+            needs=[True] * 3,
+            has_own_copy=[True] * 3,
+            copy_runs=["run-a", "run-a", "run-b"],
+            store_runs=[None] * 3,
+        ) == [False] * 3
+
+    def test_a_copy_with_no_owner_record_is_not_promoted(self):
+        """Unattributable, so it cannot be shown to belong to this history."""
+        assert local_recoveries(
+            needs=[False, True],
+            has_own_copy=[False, True],
+            copy_runs=[None, None],
+            store_runs=["run-a", None],
+        ) == [False, False]
+
+    def test_a_torn_copy_is_not_promoted(self):
+        assert local_recoveries(
+            needs=[False, True],
+            has_own_copy=[False, False],
+            copy_runs=[None, "run-a"],
+            store_runs=["run-a", None],
+        ) == [False, False]
+
+    def test_a_rank_that_has_its_store_promotes_nothing(self):
+        """A present store is the one this run is writing over."""
+        assert local_recoveries(
+            needs=[False, False],
+            has_own_copy=[True, True],
+            copy_runs=["run-a", "run-a"],
+            store_runs=["run-a", "run-a"],
+        ) == [False, False]
+
+    def test_nonsense_input_promotes_nothing(self):
+        assert local_recoveries([], [], [], []) == []
+        assert local_recoveries([True, True], [True], ["a", "a"], [None, None]) == [
+            False,
+            False,
+        ]
+
+
+class TestPromotingACopy:
+    def test_a_copy_becomes_a_store(self, tmp_path):
+        copy = a_complete_copy(tmp_path, 0, "run-a")
+        store = os.path.join(str(tmp_path), "rank_0")
+
+        assert promote_copy(copy, store)
+        assert os.path.exists(os.path.join(store, "manifest.json"))
+        assert os.path.exists(os.path.join(store, "snapshots", "pack"))
+
+    def test_the_owner_record_comes_across(self, tmp_path):
+        """It is what lets the resume know which history it is continuing -
+        and dropping it would undo the check that allowed the promotion."""
+        from ravex._identity import run_id_at
+
+        copy = a_complete_copy(tmp_path, 0, "run-a")
+        store = os.path.join(str(tmp_path), "rank_0")
+
+        promote_copy(copy, store)
+
+        assert run_id_at(store) == "run-a"
+
+    def test_the_completeness_marker_stays_behind(self, tmp_path):
+        """It says something true about a copy, and this is not one."""
+        copy = a_complete_copy(tmp_path, 0, "run-a")
+        store = os.path.join(str(tmp_path), "rank_0")
+
+        promote_copy(copy, store)
+
+        assert not os.path.exists(os.path.join(store, COMPLETE_MARKER))
+
+    def test_the_copy_is_left_where_it_was(self, tmp_path):
+        """Promotion is a copy, not a move: this machine still holds a copy of
+        this rank, and the next replication interval expects to find it."""
+        copy = a_complete_copy(tmp_path, 0, "run-a")
+        store = os.path.join(str(tmp_path), "rank_0")
+
+        promote_copy(copy, store)
+
+        assert replica_is_complete(copy)
+
+    def test_a_torn_copy_is_refused(self, tmp_path):
+        copy = a_complete_copy(tmp_path, 0, "run-a")
+        os.remove(os.path.join(copy, COMPLETE_MARKER))
+        store = os.path.join(str(tmp_path), "rank_0")
+
+        assert not promote_copy(copy, store)
+        assert not os.path.exists(store)
+
+    def test_nothing_is_staged_when_it_is_over(self, tmp_path):
+        """A leftover staging directory is neither one thing nor the other. It
+        is hidden so the scans skip it, but it should not be there at all once
+        the promotion has finished."""
+        copy = a_complete_copy(tmp_path, 0, "run-a")
+        promote_copy(copy, os.path.join(str(tmp_path), "rank_0"))
+
+        leftovers = [n for n in os.listdir(str(tmp_path)) if n.endswith(".incoming")]
+        assert leftovers == []
+
+    def test_an_empty_directory_in_the_way_is_replaced(self, tmp_path):
+        """`visible_rank_stores` calls an empty directory "no store", so this
+        is a rank that needs promoting with a husk where its store goes."""
+        copy = a_complete_copy(tmp_path, 0, "run-a")
+        store = os.path.join(str(tmp_path), "rank_0")
+        os.makedirs(store, exist_ok=True)
+
+        assert promote_copy(copy, store)
+        assert os.path.exists(os.path.join(store, "manifest.json"))
+
+
+class TestTheRuntimeRebuildsFromItsOwnDisk:
+    """The wiring, which is where GPU-79 actually lived.
+
+    Every piece above was correct on its own. What was missing was the runtime
+    ever looking at a copy named after itself.
+    """
+
+    def runtime(self, config):
+        from ravex._runtime import RavexRuntime
+
+        runtime = RavexRuntime.__new__(RavexRuntime)
+        runtime.config = config
+        runtime._backend = None
+        runtime._resume_manager = None
+        runtime._storage_split = True
+        runtime._per_rank_active = lambda: True
+        runtime._ensure_backend = lambda: True
+        return runtime
+
+    def run(self, monkeypatch, runtime, rank=0, world=6, gather=None):
+        import logging
+
+        import ravex._distributed as distributed
+        import ravex._replication as replication
+        import ravex._runtime as runtime_module
+
+        monkeypatch.setattr(runtime_module, "get_rank", lambda: rank)
+        monkeypatch.setattr(runtime_module, "get_world_size", lambda: world)
+        monkeypatch.setattr(distributed, "local_world_size", lambda: 1)
+        # Every rank in the same position, which is what a reshuffle is.
+        monkeypatch.setattr(
+            distributed, "gather_objects", gather or (lambda value: [value] * world)
+        )
+
+        def refuse(*args, **kwargs):
+            raise AssertionError("it went to the network for bytes already here")
+
+        monkeypatch.setattr(replication, "exchange_stores", refuse)
+
+        logger = logging.getLogger("ravex")
+        records = []
+        handler = logging.Handler()
+        handler.emit = lambda record: records.append(record.getMessage())
+        logger.addHandler(handler)
+        previous = logger.level
+        logger.setLevel(logging.INFO)
+        try:
+            runtime._recover_missing_stores()
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(previous)
+        return chr(10).join(records)
+
+    def test_the_copy_under_this_rank_is_used(self, tmp_path, monkeypatch):
+        """Six intact copies used to buy nothing. This is that, fixed."""
+        a_complete_copy(tmp_path, 0, "run-a")
+        # A reshuffle leaves another rank's store on this disk as well.
+        a_store(tmp_path, 1, "run-a")
+
+        text = self.run(monkeypatch, self.runtime(local_config(tmp_path)))
+
+        assert "nothing had to be fetched" in text
+        assert os.path.exists(os.path.join(str(tmp_path), "rank_0", "manifest.json"))
+
+    def test_a_copy_from_another_run_is_left_alone(self, tmp_path, monkeypatch):
+        """One rank still holds its own store, so that store names the
+        history - and this copy is not from it."""
+        a_complete_copy(tmp_path, 0, "run-from-last-week")
+
+        def uneven(value):
+            others = (False, False, False, None, "run-a")
+            return [tuple(value)] + [others] * 5
+
+        text = self.run(
+            monkeypatch, self.runtime(local_config(tmp_path)), gather=uneven
+        )
+
+        store = os.path.join(str(tmp_path), "rank_0", "manifest.json")
+        assert not os.path.exists(store)
+        assert "nothing had to be fetched" not in text
+
+    def test_a_rank_that_has_its_store_is_left_alone(self, tmp_path, monkeypatch):
+        a_complete_copy(tmp_path, 0, "run-a")
+        store = a_store(tmp_path, 0, "run-a")
+        manifest = os.path.join(store, "manifest.json")
+        before = open(manifest, encoding="utf-8").read()
+
+        self.run(monkeypatch, self.runtime(local_config(tmp_path)))
+
+        assert open(manifest, encoding="utf-8").read() == before
