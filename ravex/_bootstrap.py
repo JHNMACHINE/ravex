@@ -218,4 +218,18 @@ def install():
     return True
 
 
-install()
+# Bare `install()` was the last unguarded path here, and the only one whose
+# failure everybody sees. `site.addpackage` does wrap the `.pth` line — it
+# prints `Error processing line N`, the traceback, `Remainder of file
+# ignored`, and carries on, so a raise here does not take the interpreter
+# down. What it does do is put a traceback on stderr at the start of every
+# Python process in the environment, which is its own kind of broken.
+#
+# Silent on purpose, and only here: everything past this point reports itself
+# (see `_activate`). This catches the cases where reporting is not possible —
+# an unreadable working directory, an environment being torn down — and in
+# those the honest outcome is that Ravex does not start.
+try:
+    install()
+except Exception:  # pragma: no cover - defensive, by construction untestable
+    pass

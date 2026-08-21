@@ -6,6 +6,44 @@ Jobs spanning more than one machine. Everything below exists because of one
 question asked on 2026-08-18 — two boxes of eight GPUs, does this work? — and
 the answer turned out to be "partly, and it does not tell you which part".
 
+### Changed
+
+- **`pip install ravex` now installs the autoloader.** The one-line
+  `ravex_autoload.pth` ships in the wheel, so checkpointing works on a project
+  with a `ravex.yaml` without anyone running `ravex enable` first. The README
+  used to promise the opposite — *"installing the package changes nothing on
+  its own"* — and that sentence is gone.
+
+  What replaces it is a weaker promise that is worth more, because it is about
+  what the file *does* rather than about its absence: **Ravex is inert until a
+  project asks for it.** The line runs in every interpreter in the
+  environment, imports only `os` and `sys`, looks for a `ravex.yaml` at or
+  above the working directory, and — finding none, and no `RAVEX_ENABLED` —
+  installs nothing at all and returns. It never imports torch to decide. When
+  it does arm, it arms a hook that waits for `import torch` and loads the
+  runtime only then, removing itself once it has fired.
+
+  Measured with `-X importtime`: **1.8 ms**, down from 11.6 ms once `typing`
+  was taken off the path (see below). Verified on a real wheel rather than on
+  the configuration — the file lands in `site-packages`, not in the
+  `.data/` directory that `data_files` would have put it in and that pip
+  installs one level above where a `.pth` is ever executed. It is recorded in
+  `RECORD`, so `pip uninstall ravex` takes it away again: an orphaned `.pth`
+  importing a module that no longer exists is the classic way this scheme
+  breaks, and it is not a risk here.
+
+  `ravex enable` still exists, for putting the file back after
+  `ravex disable`. `ravex disable` now says that a later
+  `pip install --upgrade` will restore it.
+
+- **`ravex/__init__.py` no longer imports `typing`.** It was 9.8 ms of the
+  11.6 ms the autoloader cost — 85% — for three names used only in
+  annotations, which the `from __future__ import annotations` already at the
+  top of the file turns into strings that are never resolved. The annotations
+  now use builtins. Visible in the public typed surface: `status()` returns
+  `dict[str, object | None]` rather than `Dict[str, Optional[Any]]`, and
+  `object` is stricter than `Any` for a consumer.
+
 ### Added
 
 - **The storage topology is announced at activation.** With

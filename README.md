@@ -5,7 +5,6 @@ does not change — not one line, not one import.
 
 ```bash
 pip install ravex
-ravex enable
 ```
 
 Ravex itself is pure Python and installs anywhere. Its default checkpoint engine,
@@ -46,9 +45,16 @@ that was never interrupted, and the same final weights.
 
 ## Two ways to use it
 
-**Zero code changes.** `ravex enable` installs a one-line `.pth` file in
+**Zero code changes.** `pip install ravex` puts a one-line `.pth` file in
 site-packages, which Python executes at interpreter startup. From then on Ravex
 attaches itself to any training process that has a `ravex.yaml`.
+
+That line costs about a millisecond and does almost nothing: it reads `os` and
+`sys`, looks for a `ravex.yaml` above the working directory, and stops there
+unless it finds one. When it does, it arms a hook that waits for `import
+torch` and only then loads the runtime — so a process that never touches
+PyTorch never pays for anything else, and the hook removes itself once it has
+fired.
 
 **One line**, when you would rather be explicit:
 
@@ -58,7 +64,9 @@ ravex.activate()
 ```
 
 Both do the same thing. The `.pth` route exists so that a platform can enable
-checkpointing for code it does not own.
+checkpointing for code it does not own — and `ravex disable` removes it for
+people who would rather it were not there. A later `pip install --upgrade`
+puts it back.
 
 ## Configuration
 
@@ -126,9 +134,13 @@ not:
 - if a checkpoint fails, Ravex disables itself and logs it — training continues
 - nothing is ever written to stdout; logs go to `log_file`, or to stderr at
   WARNING and above
-- installing the package changes nothing on its own. Without `ravex enable`
-  there is no `.pth`; with it, Ravex still only wakes up for projects that have
-  a `ravex.yaml` or set `RAVEX_ENABLED=1`
+- installing the package starts no checkpointing anywhere. The `.pth` runs in
+  every interpreter, and in one without a `ravex.yaml` above the working
+  directory — or `RAVEX_ENABLED=1` — it installs nothing and returns. Ravex is
+  **inert until a project asks for it**, which is a weaker promise than "it
+  writes no file" and the one that actually matters
+- it never imports torch to find that out. The runtime loads only once your
+  code has imported PyTorch itself
 - `ravex disable` removes the autoloader; `RAVEX_ENABLED=0` turns it off for a
   single run
 

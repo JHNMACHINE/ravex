@@ -3,3 +3,8 @@
 # the thing a distribution packager or an auditor reads — was the one place the
 # release notes were missing.
 include CHANGELOG.md
+
+# The autoloader, so an install from the source archive gets it too. It is put
+# into the wheel by setup.py; the sdist needs it listed here or the file simply
+# is not in the archive to be built from.
+include ravex_autoload.pth

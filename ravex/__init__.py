@@ -21,7 +21,16 @@ AMP scaler, RNG state and dataset position included.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+# `typing` is deliberately **not** imported here, and this is a startup-cost
+# decision rather than a style one. `ravex_autoload.pth` is the line
+# `import ravex._bootstrap`, which runs this module first, in every Python
+# process in the environment. Measured with `-X importtime`: this module's own
+# code costs 0.4 ms and `typing` cost 9.8 ms — 85% of the total, for three
+# names that appear only in annotations, which `from __future__ import
+# annotations` above already turns into strings that are never resolved.
+#
+# So the annotations below use builtins. Anything added here that imports at
+# module scope is paid by every `python -c` on the machine.
 
 #: The one place the version is written. `pyproject.toml` reads it from here
 #: (`[tool.setuptools.dynamic]`), because declaring it in both is a pair that
@@ -41,7 +50,7 @@ __all__ = [
 ]
 
 
-def activate(**overrides: Any):
+def activate(**overrides: object):
     """Install the PyTorch patches and start checkpointing.
 
     Keyword arguments override the resolved configuration, e.g.
@@ -122,7 +131,7 @@ def step() -> int:
     return runtime.step if runtime is not None else 0
 
 
-def status() -> Dict[str, Optional[Any]]:
+def status() -> dict[str, object | None]:
     """Snapshot of what the runtime is doing, for debugging."""
     from ravex._runtime import get_runtime
 

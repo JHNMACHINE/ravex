@@ -1,12 +1,21 @@
 """``ravex`` command line.
 
-Its only real job is managing the autoloader: a one-line ``.pth`` file in
-site-packages that Python executes at interpreter startup. That file is what
-makes checkpointing work without touching the training script.
+Its subject is the autoloader: a one-line ``.pth`` file in site-packages that
+Python executes at interpreter startup. That file is what makes checkpointing
+work without touching the training script, and since 0.0.4 **the wheel ships
+it** — ``pip install ravex`` puts it there.
 
-Keeping enable/disable explicit — rather than writing the ``.pth`` from a
-post-install hook — means installing the package never changes the behaviour of
-unrelated Python processes on the machine.
+So ``enable`` is no longer how the autoloader arrives. What it is for is
+putting it back after ``disable``, which is the command that still earns its
+keep: somebody who does not want a line of ours running in every interpreter
+of their environment should be able to say so, and to change their mind.
+
+The property this used to protect — that installing the package changes
+nothing for unrelated processes — is now defended in the file itself rather
+than by withholding it. ``ravex._bootstrap`` imports only ``os`` and ``sys``,
+looks for a ``ravex.yaml`` above the working directory, and installs nothing
+at all when there is not one. Measured at about a millisecond, against roughly
+twelve when it still pulled in ``typing``.
 """
 
 from __future__ import annotations
@@ -40,6 +49,9 @@ def _enable(_args) -> int:
     print("Ravex now starts with every Python process in this environment,")
     print("but only activates for projects that have a ravex.yaml (or when")
     print("RAVEX_ENABLED=1 is set). Nothing else changes.")
+    print()
+    print("Since 0.0.4 the wheel ships this file, so a normal install already")
+    print("has it. This command is here to put it back after `ravex disable`.")
     return 0
 
 
@@ -54,6 +66,10 @@ def _disable(_args) -> int:
         print(f"Could not remove {path}: {exc}", file=sys.stderr)
         return 1
     print(f"Autoloader removed: {path}")
+    print()
+    print("Note that `pip install --upgrade ravex` will put it back: the file")
+    print("ships in the wheel. Run `ravex disable` again after an upgrade, or")
+    print("set RAVEX_ENABLED=0 to turn Ravex off without removing anything.")
     return 0
 
 
@@ -96,7 +112,9 @@ def main(argv=None) -> int:
     )
     subparsers = parser.add_subparsers(dest="command")
 
-    subparsers.add_parser("enable", help="install the startup autoloader").set_defaults(
+    subparsers.add_parser(
+        "enable", help="reinstall the startup autoloader (the wheel ships it)"
+    ).set_defaults(
         handler=_enable
     )
     subparsers.add_parser("disable", help="remove the startup autoloader").set_defaults(

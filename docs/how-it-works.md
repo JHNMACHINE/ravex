@@ -9,7 +9,7 @@ third one being much harder than it looks.
 
 ## Startup
 
-`ravex enable` writes one line into site-packages:
+Installing the package puts one line into site-packages:
 
 ```
 import ravex._bootstrap
