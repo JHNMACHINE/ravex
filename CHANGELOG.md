@@ -8,6 +8,42 @@ the answer turned out to be "partly, and it does not tell you which part".
 
 ### Changed
 
+- **The handoff breakdown names the replication, and the cadence observation
+  counts it.** `Checkpoint at step N handed off in 186.362s (drain 34.898s,
+  collect 0.228s, flatten 0.001s, store 0.030s)` — a line that declares 186
+  seconds and explains 35. The missing 151 were the copy going to the other
+  machine: timed inside the handoff, named by nothing, and therefore invisible
+  to the observation that exists to say *"checkpointing is eating your wall
+  time"*. That observation sums the phases this line names, so it computed
+  0.26s against a 291s interval, called it 0.09%, and stayed silent while the
+  run spent 64% of its wall time stopped.
+
+  Over loopback the copy costs milliseconds, which is why a missing phase hid
+  a number that was always zero. It took two machines with 100 Mbps between
+  them — measured at 7 MB/s each way — for it to become the whole handoff.
+  Now there is a `replicate` entry, the phases add up to the total, and the
+  same situation reports **42% of wall time** and says so. `drain` is still
+  excluded, and for the reason it always was: it is the training loop's own
+  queued work coming due, not a cost of checkpointing. Replication is not that
+  — without it the time would not exist at all.
+
+- **A copy caught mid-transfer is now named rather than called absent.** Losing
+  a machine while a replica is in flight left the survivor saying *"No store
+  anywhere for rank(s) 1 - starting from scratch. Either the run that wrote
+  these had fewer ranks, or the machines holding the last ones are gone"*.
+  Neither was true: the machine printing it was powered on with 680 MB of that
+  rank's store on its own disk, disqualified because `StoreWriter` removes the
+  completeness marker before the first byte lands and the transfer never
+  finished. The refusal is correct — a torn copy is not a checkpoint — but the
+  explanation sent the reader looking for hardware that was fine.
+
+  The machine holding the copy now says so. It is the only one that can tell
+  the two apart, and the others go on reporting what they see. Not a rare
+  corner on a slow link: measured at 0.5s resolution on the same pair, a
+  ~670 MB store takes 102s to copy against a 244s cycle, so the copy is
+  unusable **42% of the time** and losing a machine during a transfer is close
+  to a coin toss.
+
 - **Peer replication now moves a store at the speed of the wire.** Copying a
   checkpoint to another machine was running at about a third of what the same
   link carried with nothing else in the way: 529 MB/s against 1462 MB/s on a

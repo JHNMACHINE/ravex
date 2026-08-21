@@ -596,7 +596,18 @@ class RavexRuntime:
             return False
 
         self._last_saved_step = step
+        replicate_started = time.perf_counter()
         self._replicate_if_due(step)
+        # Named, because on a slow link this *is* the handoff. Measured on two
+        # machines with a 100 Mbps link between them: 151s of a 186s handoff,
+        # absent from this breakdown and therefore absent from the cadence
+        # observation below, which sums what this dict names. It stayed silent
+        # while the run spent 64% of its wall time stopped here.
+        #
+        # On one machine the copy goes over loopback and this reads 0.000s.
+        # Worth printing anyway: a phase that costs nothing is the fastest way
+        # to rule it out.
+        phases["replicate"] = time.perf_counter() - replicate_started
         if not wrote:
             return False
 
@@ -907,6 +918,11 @@ class RavexRuntime:
         ``drain`` is excluded on purpose. That phase is the training loop's own
         queued GPU work coming due, not a cost of checkpointing, and counting it
         would make every cadence look expensive on a fast writer.
+
+        ``replicate`` does count, and for the mirror reason: it exists only
+        because a copy is being pushed to another machine, and the loop is
+        stopped for the whole of it. Over loopback it is milliseconds and says
+        nothing; over a 100 Mbps link it was 81% of the handoff.
         """
         previous = self._last_checkpoint_end
         self._last_checkpoint_end = finished

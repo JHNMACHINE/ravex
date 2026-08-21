@@ -55,6 +55,33 @@ def test_an_expensive_cadence_is_reported_once():
     assert "43%" in message
 
 
+def test_replication_counts_against_the_cadence():
+    """The mirror of the rule below, in the units it was measured in.
+
+    Two machines on a 100 Mbps link: 186s of handoff in a 291s interval, of
+    which 151s was the peer copy. While that phase had no name, `cost` summed
+    0.26s and this observation stayed quiet through a run that was stopped for
+    most of its wall time.
+
+    Unlike `drain`, this is not the loop's own work coming due: without
+    replication it would not exist at all.
+    """
+    runtime, warnings = _runtime(every=4)
+    phases = {
+        "drain": 35.1,
+        "collect": 0.2,
+        "flatten": 0.0,
+        "store": 0.0,
+        "replicate": 151.2,
+    }
+    _handoff(runtime, 16, 0.0, 186.4, phases)
+    # 151.4s of cost in the 290.9s until the next one: 52%.
+    _handoff(runtime, 20, 186.4, 477.3, phases)
+
+    assert len(warnings) == 1, "the replication is the cadence cost here"
+    assert "52%" in warnings[0].getMessage()
+
+
 def test_drain_does_not_count_against_the_cadence():
     """`drain` is the training loop's own queued work, not a checkpoint cost.
 
