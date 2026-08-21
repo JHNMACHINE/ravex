@@ -94,3 +94,46 @@ def test_the_shared_store_path_is_untouched():
 
     assert ResumeManager(backend, registry).try_resume() is True
     assert registry.step_count == 8
+
+
+def _config_at(path):
+    from ravex._config import RavexConfig
+
+    config = RavexConfig()
+    config.storage.type = "local"
+    config.storage.path = str(path)
+    return config
+
+
+def test_a_copy_cut_off_part_way_is_named_rather_than_called_absent(tmp_path):
+    """The third possibility, which the two in the message used to swallow.
+
+    A transfer interrupted leaves the directory here and disqualified: bytes on
+    disk, no completeness marker. Saying "no store anywhere" then accuses a
+    machine that is powered on and holding the data. Found on 2026-08-21 by
+    killing both ranks mid-copy on a 100 Mbps link, where that window is 42% of
+    the cycle rather than a millisecond.
+    """
+    from ravex._replication import COMPLETE_MARKER, REPLICA_DIR
+    from ravex._resume import _torn_copy_here
+
+    config = _config_at(tmp_path)
+    copy = tmp_path / REPLICA_DIR / "rank_1"
+    copy.mkdir(parents=True)
+    (copy / "manifest.json").write_text("{}", encoding="utf-8")
+
+    said = _torn_copy_here(config, [1])
+    assert "rank(s) 1" in said
+    assert "interrupted" in said
+
+    (copy / COMPLETE_MARKER).write_text("ok", encoding="utf-8")
+    assert _torn_copy_here(config, [1]) == "", "a whole copy is not this case"
+
+
+def test_a_rank_with_no_copy_here_adds_nothing(tmp_path):
+    """Silence when this machine has nothing to add: the other ranks say what
+    they see, and a machine inventing a third case it cannot see would be the
+    same failure in the other direction."""
+    from ravex._resume import _torn_copy_here
+
+    assert _torn_copy_here(_config_at(tmp_path), [1]) == ""

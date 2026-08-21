@@ -27,6 +27,48 @@ def _records(seen):
                     yield record
 
 
+def _torn_copy_here(config, missing) -> str:
+    """The third possibility, for the machine that can see it.
+
+    A copy caught mid-transfer is neither a store nor an absence: the directory
+    is here and full of bytes, and it is disqualified because ``StoreWriter``
+    removes the completeness marker before the first one lands. Saying "no
+    store anywhere" then blames a machine that is powered on and holding the
+    data, and sends whoever reads it looking for a hardware fault.
+
+    Not a rare corner on a slow link. Measured on two machines with 100 Mbps
+    between them: a ~670 MB store takes 102s to copy against a 244s cycle, so
+    the copy is unusable 42% of the time. Losing a machine during a transfer is
+    close to a coin toss there.
+
+    Only the machine holding the copy adds this: it is the one that can tell
+    the two apart, and the others say what they see.
+    """
+    if config is None:
+        return ""
+    try:
+        from ravex._backends import replica_store_path, visible_replica_stores
+        from ravex._replication import replica_is_complete
+
+        here = visible_replica_stores(config)
+        torn = sorted(
+            rank
+            for rank in missing
+            if rank in here
+            and not replica_is_complete(replica_store_path(config, rank))
+        )
+    except Exception:  # pragma: no cover - diagnosis must not cost the run
+        return ""
+
+    if not torn:
+        return ""
+    return (
+        " This machine does hold a copy of rank(s) %s, but it was interrupted "
+        "part-way through and cannot be trusted - the bytes are here and are "
+        "not a checkpoint." % ", ".join(str(rank) for rank in torn)
+    )
+
+
 def _where_written(seen, ranks) -> str:
     """" (written on node0, node1)", or nothing if the stores never said.
 
@@ -301,8 +343,9 @@ class ResumeManager:
                 "No store anywhere for rank(s) %s - starting from scratch. "
                 "Either the run that wrote these had fewer ranks, or the "
                 "machines holding the last ones are gone; from here the two "
-                "look the same.%s%s",
+                "look the same.%s%s%s",
                 ", ".join(str(rank) for rank in missing),
+                _torn_copy_here(self.config, missing),
                 (
                     " The stores that do exist go up to rank %d, past this "
                     "run's %d." % (max(beyond), world - 1)
