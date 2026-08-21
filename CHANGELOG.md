@@ -99,6 +99,32 @@ the answer turned out to be "partly, and it does not tell you which part".
 
 ### Fixed
 
+- **Replication never worked on a GPU job, and said it did.** Moving a store
+  between machines means moving bytes, and bytes live on the host — but the
+  transfer went out on the **default** process group, which on a multi-GPU job
+  is NCCL. NCCL is a GPU collective library and refuses host tensors outright.
+
+  Measured on 8x RTX 5060 Ti on 2026-08-21: every replication round failed
+  with `No backend type associated with device type cpu`, **not one copy was
+  ever made**, and the announcement at activation went on promising that
+  losing a machine would cost at most one interval. The failure was reported —
+  a warning per round — but the promise was louder and came first.
+
+  Bytes now travel on a **gloo** subgroup, opened once at activation and
+  reused. On a job that is already gloo the default group carries host tensors
+  perfectly well and no second group is made. Where neither is possible,
+  replication is declared **off at activation**, in the same message that
+  would otherwise have promised it — because a run that is not protected
+  should be told once, at the start, rather than a warning at a time into a
+  log nobody is reading.
+
+  Verified on the same hardware after the change: six rounds out of six, and
+  both disks holding the peer's copy where before they held nothing.
+
+  Nothing on CPU was affected, which is exactly why nothing caught it: the
+  four-scenario container bench runs on gloo, where the same code is correct.
+  The backend was the one variable it could not vary.
+
 - **A bucket was a backup you could not resume from, and the documentation
   said otherwise.** Moonclip's remote support was push-only, so the step to
   resume from was read from the *local* manifest. On a six-node bench a node
