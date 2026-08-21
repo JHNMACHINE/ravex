@@ -1,10 +1,18 @@
 # Changelog
 
-## Unreleased
+## 0.0.4 — 2026-08-21
 
 Jobs spanning more than one machine. Everything below exists because of one
 question asked on 2026-08-18 — two boxes of eight GPUs, does this work? — and
 the answer turned out to be "partly, and it does not tell you which part".
+
+On 2026-08-21 the question was finally put to two machines that were actually
+two machines, on a network that could actually fail. The replication holds:
+a box that arrived with an empty disk took its store back from its peer and
+resumed where the run had stopped, and a copy caught half way was refused
+rather than trusted. What that day changed in this release is the last two
+entries below — both are things a single machine could not have shown, because
+on loopback the number they hide is zero.
 
 ### Changed
 

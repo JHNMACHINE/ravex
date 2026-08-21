@@ -36,7 +36,7 @@ from __future__ import annotations
 #: (`[tool.setuptools.dynamic]`), because declaring it in both is a pair that
 #: drifts at the first bump — and `ravex status` reports this one, so the drift
 #: shows up as the CLI stating a version nobody installed.
-__version__ = "0.0.3"
+__version__ = "0.0.4"
 
 __all__ = [
     "activate",
