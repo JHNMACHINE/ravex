@@ -48,6 +48,17 @@ the answer turned out to be "partly, and it does not tell you which part".
   here" into "rank 2's store was written on node0, which is not running rank 2
   now".
 
+- **A run is told when its cadence is expensive.** Once, and as a statement of
+  what happened rather than a prediction: what fraction of wall time went into
+  checkpoint handoff between the last two checkpoints. Measured on 8x RTX 5060
+  Ti with a 1.5B model, `checkpoint_every=2` spends a third of wall time on
+  handoff and nothing breaks — the writer keeps up, the run is simply slower
+  than its author probably meant. So it does not claim the cadence is
+  unsustainable and it does not quietly raise it; both would be guesses about
+  a machine the process cannot see, while the ratio is a fact it can. The
+  `drain` phase is left out, being the training loop's own queued GPU work
+  coming due rather than a cost of checkpointing.
+
 ### Fixed
 
 - **A bucket was a backup you could not resume from, and the documentation
