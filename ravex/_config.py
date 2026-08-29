@@ -201,6 +201,23 @@ class RavexConfig:
     # number of GPUs is not something to acquire by upgrading.
     sharded_checkpoints: str = "gather"
 
+    # Resume a ``per_rank`` checkpoint onto a different number of ranks,
+    # stitching each new shard out of the old ones.
+    #
+    # Off by default, and the reason is not caution about the arithmetic. A
+    # resume that reshards silently is a resume that silently succeeds when the
+    # launcher was misconfigured and started 3 ranks where the job wants 4 —
+    # the run continues, the loss looks plausible, and nothing says the world
+    # shrank. The mismatch is therefore always detected and always logged; only
+    # acting on it is opt-in.
+    #
+    # Preconditions, checked at resume and refused loudly when unmet: a 1-D
+    # mesh (FSDP, ``Shard`` and ``Replicate`` only), and every old rank's store
+    # readable from here — as itself or as a complete peer copy. See
+    # ``docs/how-it-works.md`` for what a resharded resume does *not* promise,
+    # which is the data order and the per-rank RNG.
+    reshard_on_resume: bool = False
+
     # Interception toggles — each patch can be disabled independently, which
     # makes bisecting an incompatibility trivial.
     track_dataloaders: bool = True
@@ -294,6 +311,8 @@ class RavexConfig:
             self.async_save = _as_bool(value, self.async_save)
         if (value := get("SHARDED_CHECKPOINTS")) is not None:
             self.sharded_checkpoints = value
+        if (value := get("RESHARD_ON_RESUME")) is not None:
+            self.reshard_on_resume = _as_bool(value, self.reshard_on_resume)
         if (value := get("TRACK_DATALOADERS")) is not None:
             self.track_dataloaders = _as_bool(value, self.track_dataloaders)
         if (value := get("TRACK_RNG")) is not None:
@@ -353,6 +372,7 @@ class RavexConfig:
             "delta",
             "keep_base_in_memory",
             "async_save",
+            "reshard_on_resume",
             "track_dataloaders",
             "track_rng",
             "handle_sigterm",

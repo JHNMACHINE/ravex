@@ -293,6 +293,71 @@ optimizer is by definition not training.
 This one only shows up on a GPU: FSDP1 refuses to initialise without an
 accelerator, and the CPU-only FSDP2 path happened not to hit it.
 
+### Resuming onto a different number of ranks
+
+Per-rank shards are cut for the topology that wrote them. Resume eight shards
+onto four ranks and the first tensor raises *saved shard is (384, 4096), this
+rank holds (512, 4096)*. With `reshard_on_resume` each rank rebuilds its own
+shard out of the old ones instead.
+
+The mechanism turns on one decision: **offsets are measured, not derived.** The
+obvious approach is to reproduce torch's chunking rule and work out where each
+shard begins — and it is the wrong one, because that rule has an uneven-tail
+case and a second implementation of it would drift from the first in silence.
+Both sides can be observed instead. The old offsets are the running sum of the
+shard *shapes that were saved*; the new ones are the running sum of the local
+shapes the live model is holding, which every rank reads off its own tensors
+and shares in one `all_gather_object` of a few integers. Nothing has to know
+how torch decided; it only has to add up what torch did.
+
+What follows from that is not a rearrangement of whole shards. Going from four
+ranks to three over twelve rows, no new shard equals any old one: each is
+stitched from two, and one old shard feeds two new ones. Boundaries coincide
+only on an exact halving or doubling — which is why an 8 → 4 test would pass
+with the general mechanism unwritten, and why the planner's tests are
+exhaustive over every N → M pair in a range rather than illustrative.
+
+Reading is two passes over the old stores. The first measures and keeps
+nothing; the second cuts out only the intervals the plan asked for. Reading
+twice is what buys the memory bound: knowing where a shard starts needs every
+length before it, so a single pass would mean holding every old snapshot at
+once — the whole checkpoint, per rank. As it is, the peak is one old snapshot
+plus this rank's new shards, and the global tensor is never materialised
+anywhere. That was the entire point of per-rank checkpointing and it survives
+the feature intact.
+
+**The hard half is reachability, not arithmetic.** New rank *r* has to be able
+to *read* the old shards, and on local storage it usually cannot: each rank
+wrote to its own disk on its own machine. Resharding 8 → 4 asks four surviving
+machines to produce eight stores. Where the old machines are still up this is
+bytes that have to move point to point — not yet implemented, so a reshard that
+would need it is refused. Where a machine is gone, the shard it wrote survives
+only as the copy a neighbour holds under `replicate_every`, and a *complete*
+copy is accepted in the original's place. A copy caught mid-transfer is not:
+it is bytes, and it is not a checkpoint.
+
+If some old shard is reachable as neither, the resume stops and names the rank.
+The tempting alternative — carry on with the shards that *are* there — produces
+a tensor with a band of uninitialised rows: every individual shard valid, the
+model wrong, and nothing downstream able to notice. That is the failure
+[the split-checkpoint](#more-than-one-machine) and replica-lookup fixes were
+both about, and it does not get reintroduced through this door.
+
+Step agreement moves with it. Normally the ranks agree on the newest step every
+one of them holds, over the live process group; here that group answers the
+wrong question, because after a shrink rank 5's store is not held by anybody —
+it is read from a copy, by whichever rank got there. The agreement therefore
+runs over the set of *old stores* before any tensor is read, and since every
+rank reads the same set it reaches the same number without a collective.
+
+Two things do not reshard, and the docs say so rather than a bug report. The
+sampler partitions the epoch by world size, so a resumed run continues the
+model and not the run — the position is rescaled to preserve the total data
+consumed, every sample is still seen once per epoch, and the order is not the
+one the original run would have taken. And there were N per-rank generator
+states where there are now M ranks: there is no correct mapping, so they are
+not restored and a log line says so.
+
 ### Keys
 
 Keys for sharded models are positional (`sharded_0`), not structural

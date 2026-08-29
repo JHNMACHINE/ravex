@@ -2,7 +2,58 @@
 
 ## 0.0.5 — unreleased
 
+### Added
+
+- **`reshard_on_resume`: a `per_rank` checkpoint can be resumed at a different
+  world size.** Each rank rebuilds its own shard out of the old ones — eight
+  ranks' shards onto four, or four onto three, where no new shard equals any
+  old one and each is stitched from two.
+
+  The offsets are *measured*, never recomputed. The old lengths are the shapes
+  of the tensors that were saved; the new ones are the shapes the live model is
+  holding, shared in one `all_gather_object` of a few integers. Reproducing
+  torch's chunking rule to derive them would have been a second implementation
+  of a rule with an uneven-tail case, and it would have drifted from the first
+  in silence.
+
+  **Off by default**, and not out of caution about the arithmetic: a resume
+  that reshards silently is a resume that silently succeeds when the launcher
+  started three ranks where the job wants four. The mismatch is detected and
+  logged always; acting on it is the opt-in.
+
+  Refused, loudly and by name, when a precondition does not hold: a 2-D mesh
+  (FSDP crossed with tensor parallel) is a cartesian problem rather than an
+  interval one and is not attempted, and a reshard whose old shards are not all
+  reachable — as stores or as *complete* peer copies — stops rather than
+  assemble tensors with a band of uninitialised rows in them. Local storage
+  only so far; on remote the mismatch is reported and the run starts clean.
+
+  Two things do not reshard, and are documented rather than left to be found.
+  The sampler partitions the epoch by world size, so a resumed run continues
+  the model and not the run: the position is rescaled to preserve the total
+  data consumed, every sample is still seen once per epoch, and the order is
+  not the one the original run would have taken. And there were N per-rank RNG
+  states where there are now M ranks, with no correct mapping between them, so
+  they are not restored and the log says so.
+
+  Peak memory is one old snapshot plus this rank's new shards. The old stores
+  are read twice — once to measure, once to cut out the slices the plan asked
+  for — because a single pass would mean holding every old snapshot at once,
+  which is the whole checkpoint per rank. The global tensor is never
+  materialised anywhere.
+
 ### Changed
+
+- **Shard placements are stored as data, not as `str(placement)`.** What went
+  into a checkpoint was torch's own short repr — `S(0)`, `R`, `P(sum)` — and
+  the only way back from it is a parser for a string nobody promised to keep.
+  Resharding has to ask which dimension a tensor was split along, so the answer
+  is now written down as an answer. The mesh shape is recorded alongside.
+
+  Checkpoints written before this are still read: both the short form and the
+  long `Shard(dim=0)` one are parsed back. Nothing about resuming an existing
+  checkpoint at the same world size changes.
+
 
 - **The Moonclip backend now builds `MoonclipManager` rather than
   `CheckpointManager`.** Ravex owns the topology and hands Moonclip a value;

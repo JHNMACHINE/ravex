@@ -33,6 +33,7 @@ ravex status
 | `compression_level` | `RAVEX_COMPRESSION_LEVEL` | `3` | zstd level. |
 | `keep_last` | `RAVEX_KEEP_LAST` | `5` | Checkpoints to retain. Older ones are deleted. |
 | `sharded_checkpoints` | `RAVEX_SHARDED_CHECKPOINTS` | `gather` | How FSDP state is written: `gather` or `per_rank`. See [Sharded models](#sharded-models). |
+| `reshard_on_resume` | `RAVEX_RESHARD_ON_RESUME` | `false` | Resume a `per_rank` checkpoint at a different world size, rebuilding each shard from the old ones. See [Resuming onto a different number of ranks](#resuming-onto-a-different-number-of-ranks). |
 | `replicate_every` | `RAVEX_REPLICATE_EVERY` | `10` | Checkpoints between copies of each rank's store to a peer on another machine. Only ever used when the storage turns out to be neither remote nor shared. `0` turns it off. See [More than one machine](#more-than-one-machine). |
 | `track_dataloaders` | `RAVEX_TRACK_DATALOADERS` | `true` | Track and restore the dataset position. |
 | `track_rng` | `RAVEX_TRACK_RNG` | `true` | Save and restore torch / CUDA / Python / NumPy RNG state. |
@@ -80,11 +81,13 @@ pinned staging instead (9.4× on the transfer, measured separately).
 Ravex uses the middle row today: shards are taken with `cpu_offload=True`. The
 bottom row is what the plumbing allows, not what it does.
 
-What you give up is the resharding. Per-rank shards are cut for one topology
-and compose into nothing on another, so the checkpoint only resumes at the same
-world size with the same sharding. Resuming at a different one starts the run
-clean — on *every* rank, deliberately: a resume that half the ranks complete
-leaves the others in collectives nobody joins.
+What you give up is the resharding — unless you ask for it back. Per-rank
+shards are cut for one topology and compose into nothing on another, so by
+default the checkpoint only resumes at the same world size with the same
+sharding, and resuming at a different one starts the run clean on *every* rank
+(a resume half the ranks complete leaves the others in collectives nobody
+joins). `reshard_on_resume` rebuilds the shards instead; see
+[Resuming onto a different number of ranks](#resuming-onto-a-different-number-of-ranks).
 
 Two further consequences worth knowing:
 
@@ -97,6 +100,53 @@ Two further consequences worth knowing:
   parameters as plain `Parameter`s and hands back a sharded state dict of
   `ShardedTensor`, which carries no mesh and no placements and so cannot be
   put back shard by shard.
+
+### Resuming onto a different number of ranks
+
+`reshard_on_resume: true` lets a `per_rank` checkpoint be resumed at a world
+size it was not written at. Each rank rebuilds its own shard out of the old
+ones: the shards are measured rather than recomputed, so the arithmetic never
+depends on reproducing how torch chunks a tensor, and no rank ever holds the
+whole tensor.
+
+```yaml
+sharded_checkpoints: per_rank
+reshard_on_resume: true
+```
+
+**Off by default, and not out of caution about the arithmetic.** A resume that
+reshards silently is a resume that silently succeeds when the launcher started
+three ranks where the job wants four — the run continues, the loss looks
+plausible, and nothing says the world shrank. So the mismatch is *always*
+detected and logged; only acting on it is opt-in.
+
+Two preconditions, both refused loudly rather than worked around:
+
+- **A 1-D mesh** — FSDP, `Shard` and `Replicate`. A 2-D mesh (FSDP crossed with
+  tensor parallel) makes the plan a cartesian problem rather than an interval
+  one and is not attempted.
+- **Every old rank's store readable from here**, as itself or as a complete
+  peer copy (see [`replicate_every`](#more-than-one-machine)). Every old shard
+  is needed, including the ones this rank reads nothing from: where a shard
+  starts is the running sum of all the lengths before it, so one missing store
+  is an unknown alignment for everybody. Carrying on without it would produce
+  tensors with a band of uninitialised rows — every shard valid, the model
+  wrong, and nothing downstream able to notice.
+
+Local storage only, so far. On remote storage the mismatch is reported and the
+run starts from scratch.
+
+**What a resharded resume does not promise.** It continues the *model*, not the
+run, and the two differences are worth knowing before you rely on it:
+
+- **The data order.** The sampler partitions the epoch by world size, so at a
+  different world size each rank walks different samples in a different order.
+  The position is rescaled to preserve the total amount of data consumed, and
+  every sample is still seen once per epoch — but it is not bit-identical
+  continuation and it cannot be.
+- **Per-rank RNG.** There were N generator states and there are now M ranks;
+  there is no correct mapping. The saved states are not restored, and random
+  draws continue from whatever seeding your script did. A log line says so.
 
 ### The write path
 

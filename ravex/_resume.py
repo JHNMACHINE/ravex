@@ -110,6 +110,117 @@ def _several_runs(seen) -> str:
     )
 
 
+def _per_rank_groups(snapshot: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """``{group: {"model": tree, "optimizer": tree}}`` for the per-rank groups.
+
+    Groups written with ``sharded_checkpoints=gather`` are skipped: their state
+    is already topology-independent, so there is nothing in them to reshape and
+    reshaping it would be an error.
+    """
+    groups: Dict[str, Dict[str, Any]] = {}
+    for key, saved in (snapshot.get("sharded") or {}).items():
+        if not isinstance(saved, dict) or saved.get("layout") != "per_rank":
+            continue
+        groups[key] = {
+            "model": saved.get("model"),
+            "optimizer": saved.get("optimizer"),
+        }
+    return groups
+
+
+def _paths_of(live_groups, new_extents, rank) -> Dict[Any, Dict[Any, list]]:
+    """Every sharded tensor, with the length each new rank holds of it.
+
+    Keyed by ``(group, half)`` then by path, and the value is one length per
+    new rank in rank order — which is precisely what :func:`plan_reshard` takes
+    as its second argument.
+
+    A tensor that some rank does not report is refused rather than planned
+    around. It means the ranks are not running the same model, and a plan built
+    from a partial list would put the boundaries in the wrong places for
+    everybody, not only for the rank that was quiet.
+    """
+    world = len(new_extents)
+    out: Dict[Any, Dict[Any, list]] = {}
+    for group in (new_extents[rank] or {}):
+        key, half = group
+        if key not in live_groups:  # pragma: no cover - built from live_groups
+            continue
+        for path in new_extents[rank][group]:
+            lengths = []
+            for r in range(world):
+                extents = (new_extents[r] or {}).get(group) or {}
+                if path not in extents:
+                    raise ValueError(
+                        "rank %d has no shard for %s in group %s: the ranks are "
+                        "not running the same model" % (r, path, key)
+                    )
+                lengths.append(int(extents[path]))
+            out.setdefault(group, {})[path] = lengths
+    return out
+
+
+def _extent(extents, group, path, q) -> int:
+    """One old rank's shard length, or a message naming what is missing."""
+    found = (extents or {}).get(group)
+    if found is None or path not in found:
+        key, half = group
+        raise ValueError(
+            "rank %d's store has no %s shard for %s in group %s, so where the "
+            "other shards start cannot be worked out" % (q, half, path, key)
+        )
+    return int(found[path])
+
+
+def _drop_per_rank_randomness(state: Dict[str, Any], old_world: int, world: int) -> None:
+    """Take out the two things that do not survive a change of world size.
+
+    **The RNG.** There were ``old_world`` generator states and there are now
+    ``world`` ranks. There is no correct mapping — restoring rank 0's onto
+    every rank would have them all draw the same numbers, which is worse than
+    starting from the seeding the script already did. Dropping it lets
+    ``restore_state`` leave the live generators alone, and the log line says so
+    rather than leaving it to be discovered.
+
+    **The data position.** The sampler partitions the epoch by world size, so
+    ``position`` counts this rank's batches and means a different amount of
+    data at a different world size. It is rescaled to preserve the *total*
+    consumed, which is the honest half of the promise: the resumed run
+    continues the model, not the run. Every sample is still seen once per
+    epoch; the order is not the order the original run would have taken, and
+    it cannot be.
+    """
+    if state.pop("rng", None) is not None:
+        logger.info(
+            "Resharded resume: the saved RNG states belong to a %d-rank run "
+            "and are not restored. Random draws continue from this run's own "
+            "seeding.",
+            old_world,
+        )
+
+    loaders = state.get("dataloaders") or {}
+    for key, saved in loaders.items():
+        if not isinstance(saved, dict) or "position" not in saved:
+            continue
+        try:
+            position = int(saved["position"])
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            continue
+        rescaled = (position * old_world) // max(world, 1)
+        saved["position"] = rescaled
+        logger.info(
+            "Resharded resume: dataloader %s resumes %d batch(es) in rather "
+            "than %d, so the run has consumed the same amount of data at %d "
+            "ranks as it had at %d. The order within the epoch differs from "
+            "the original run and cannot be made to match.",
+            key,
+            rescaled,
+            position,
+            world,
+            old_world,
+        )
+
+
 class ResumeManager:
     def __init__(self, backend, registry, config=None):
         self.backend = backend
@@ -121,6 +232,8 @@ class ResumeManager:
         self.config = config
         self.attempted = False
         self.restored_step: Optional[int] = None
+        #: World size that wrote the stores, once `_reshard_wanted` has looked.
+        self._old_world: Optional[int] = None
         #: Set once the ranks have agreed; see :meth:`_settle_run_identity`.
         self.run_id: Optional[str] = None
 
@@ -164,6 +277,14 @@ class ResumeManager:
         """
         from ravex._distributed import agree_on_step, all_ranks_agree
 
+        # Before anything else, because at a different world size "this rank's
+        # own store" is not this rank's own history: after a shrink `rank_5`
+        # may not exist, and after a growth it belongs to a rank that no longer
+        # runs here. The mismatch is detected always and acted on only when
+        # asked — see `reshard_on_resume`.
+        if self._reshard_wanted():
+            return self._resume_resharded(defer_rng)
+
         local = self.backend.latest_step()
         step = agree_on_step(local if local is not None else -1)
 
@@ -199,6 +320,431 @@ class ResumeManager:
             # Every rank arrives here, and with the same `resumed`: each return
             # above is taken by all of them together or by none.
             self._settle_run_identity(resumed)
+
+    # ─── resuming onto a different number of ranks ──────────────────
+
+    def _old_world_size(self) -> Optional[int]:
+        """How many ranks wrote the stores on this machine, if they agree.
+
+        Read from the owner records rather than from the number of ``rank_<n>``
+        directories: the directories on *this* machine are only the ones it
+        happens to hold, and after a shrink that is a fraction of the run.
+        ``write_owner`` records the world size beside every store, which is the
+        whole world's answer written down N times.
+
+        ``None`` when nothing says, and equally when the records disagree —
+        two runs' leftovers sharing a directory is a real case (see
+        :func:`_several_runs`), and guessing which of them is being resumed is
+        not a decision to make silently.
+        """
+        if self.config is None or self.config.storage.is_remote:
+            return None
+
+        try:
+            from ravex._backends import visible_store_owners
+
+            records = visible_store_owners(self.config)
+        except Exception:  # pragma: no cover - never worth the run
+            return None
+
+        sizes = {
+            int(record["world_size"])
+            for record in records.values()
+            if isinstance(record, dict) and record.get("world_size")
+        }
+        if len(sizes) != 1:
+            if len(sizes) > 1:
+                logger.warning(
+                    "The stores here were written by runs of %s ranks. Which "
+                    "one this job continues is not something to guess at, so "
+                    "no resharding is attempted.",
+                    " and ".join(str(size) for size in sorted(sizes)),
+                )
+            return None
+        return sizes.pop()
+
+    def _reshard_wanted(self) -> bool:
+        """Whether this resume has to reshape shards, and may. **Collective.**
+
+        Detection is unconditional and acting on it is not. A resume that
+        reshards silently is a resume that silently succeeds when the launcher
+        was misconfigured and started three ranks where the job wants four: the
+        run continues, the loss curve looks plausible, and nothing anywhere
+        says the world shrank. So the mismatch is always said out loud, and
+        turning it into an action is ``reshard_on_resume``.
+
+        The agreement at the end is what keeps this from stranding a
+        collective. Ranks decide from what their own machine holds, and on a
+        job spread over several machines they can reach different verdicts;
+        ``all_ranks_agree`` turns any disagreement into "everybody takes the
+        ordinary path", which is the branch that is safe to take alone.
+        """
+        from ravex._distributed import all_ranks_agree, get_world_size
+
+        world = get_world_size()
+        old = self._old_world_size()
+        enabled = bool(getattr(self.config, "reshard_on_resume", False))
+        remote = self.config is not None and self.config.storage.is_remote
+
+        wanted = False
+        if old is not None and old != world:
+            if not enabled:
+                logger.warning(
+                    "This checkpoint was written per-rank by a %d-rank run and "
+                    "this one has %d. Resuming it means rebuilding every shard "
+                    "out of the old ones, which Ravex will do on request: set "
+                    "reshard_on_resume=true (RAVEX_RESHARD_ON_RESUME=1). It is "
+                    "off by default so that a launcher that started the wrong "
+                    "number of ranks fails visibly instead of training on.",
+                    old,
+                    world,
+                )
+            elif remote:  # pragma: no cover - needs a bucket
+                logger.warning(
+                    "reshard_on_resume is set and the world changed from %d to "
+                    "%d, but this store is remote and resharding is only "
+                    "implemented for local storage so far. Starting from "
+                    "scratch rather than half-resuming.",
+                    old,
+                    world,
+                )
+            else:
+                wanted = True
+
+        # Unconditional, on every rank, exactly once: the branch below has
+        # collectives in it and the branch beside it has different ones.
+        agreed = all_ranks_agree(wanted)
+        if wanted and not agreed:  # pragma: no cover - needs several machines
+            logger.warning(
+                "Only some ranks can see a topology change from here, so no "
+                "resharding is attempted. This is what a per-rank checkpoint "
+                "split across machines looks like from one of them; remote or "
+                "shared storage is what makes the picture whole."
+            )
+        self._old_world = old if agreed else None
+        return agreed
+
+    def _resume_resharded(self, defer_rng: bool) -> bool:
+        """Rebuild this rank's shards out of a differently-shaped checkpoint.
+
+        The shape of it, in order: agree on a step every *old* store holds,
+        measure both topologies, plan, read each old store once more taking
+        only the slices this rank needs, and hand the result to the ordinary
+        apply path as though it had been written at this world size.
+
+        Step agreement moves to the old stores and off the live process group,
+        and it has to: the live group answers "what does rank r hold", and
+        after a shrink rank 5's store is not held by anybody — it is read from
+        a copy, by whichever rank got there. Every rank reads the same set of
+        stores here, so every rank reaches the same number without a
+        collective, and the ``all_ranks_agree`` below is a check rather than
+        the decision.
+
+        **Memory.** Each rank reads the old stores one at a time and keeps only
+        the slices it needs, so the peak is one old snapshot plus this rank's
+        new shards — not the whole checkpoint. The global tensor is never
+        materialised anywhere, which is the entire point of per-rank
+        checkpointing and survives this feature intact.
+        """
+        from ravex._distributed import all_ranks_agree
+
+        resumed = False
+        try:
+            state = self._resharded_state()
+            if not all_ranks_agree(state is not None):
+                logger.warning(
+                    "The reshard could not be completed on every rank - "
+                    "starting from scratch on all of them, because a partial "
+                    "resume would be worse than none."
+                )
+                return False
+            assert state is not None  # all_ranks_agree said so
+            resumed = self._apply(state, defer_rng)
+            return resumed
+        finally:
+            self._settle_run_identity(resumed)
+
+    def _resharded_state(self) -> Optional[Dict[str, Any]]:
+        """The state this rank should restore, or None with the reason logged.
+
+        Split out from :meth:`_resume_resharded` so that every way of failing
+        is a ``return None`` in one place and the caller can turn any of them
+        into the same all-or-nothing verdict.
+
+        **Every early exit here is taken by all the ranks or by none.** The
+        checks before the first collective are answered from what each machine
+        holds, and on a job spread over several machines the ranks can answer
+        them differently — one machine reaching every old store through its
+        copies while another reaches half. A rank that returned early there
+        would leave the rest inside ``local_sharded_state`` waiting for a
+        participant that has gone home. So the local verdicts are pooled first,
+        in one gather, and they have to *match* rather than merely all be
+        favourable: two ranks resuming from two different steps is worse than
+        two ranks not resuming.
+        """
+        from ravex._backends import reachable_rank_stores
+        from ravex._distributed import (
+            gather_objects,
+            get_rank,
+            get_world_size,
+            local_sharded_state,
+            shard_extents,
+        )
+        from ravex._reshard import ReshardUnsupported
+
+        old_world = self._old_world
+        if old_world is None:  # pragma: no cover - guarded by `_reshard_wanted`
+            return None
+        world, rank = get_world_size(), get_rank()
+
+        # Every old shard is needed, including the ones this rank will not read
+        # a single row from: the offsets of the shards it *does* read are the
+        # running sum of all the lengths before them. A missing store is not a
+        # slice missing from one rank's tensor, it is an unknown alignment for
+        # everybody.
+        wanted = set(range(old_world))
+        reachable = reachable_rank_stores(self.config, wanted)
+        missing = sorted(wanted - reachable)
+        if missing:
+            logger.warning(
+                "Cannot reshard %d ranks onto %d: no store and no complete "
+                "copy here for rank(s) %s. Rebuilding the others without them "
+                "would produce tensors with a band of uninitialised rows - "
+                "every shard valid, the model wrong, and nothing downstream "
+                "able to notice - so this starts from scratch instead.%s",
+                old_world,
+                world,
+                ", ".join(str(q) for q in missing),
+                _torn_copy_here(self.config, missing),
+            )
+
+        step = None if missing else self._agree_on_old_step(sorted(wanted))
+
+        # The pooling described above, and the only collective before the live
+        # layout is read. What travels is a couple of integers per rank.
+        view = (step, sorted(reachable)) if step is not None else None
+        views = gather_objects(view)
+        if any(other != views[0] for other in views):
+            logger.warning(
+                "The ranks do not see the same old stores from where they are, "
+                "so no reshard is attempted: resuming half of them from one "
+                "step and half from another would be worse than starting from "
+                "scratch. This is what a per-rank checkpoint split across "
+                "machines looks like; moving the old shards between machines "
+                "is not implemented yet. Remote or shared storage makes the "
+                "picture whole today."
+            )
+            return None
+        if views[0] is None:
+            # Every rank agreed there is nothing to do; the reason is already
+            # in the log, once per rank, from the branch that decided it.
+            return None
+        assert step is not None  # `views[0]` being set says so
+
+        # The live layout, read for its shapes only. Collective, and every rank
+        # reaches it: the returns above are taken by all of them together.
+        live_groups = {}
+        for key, model, optimizers in self.registry.sharded_groups():
+            model_live, optimizer_live = local_sharded_state(model, optimizers)
+            live_groups[key] = {"model": model_live, "optimizer": optimizer_live}
+
+        mine: Optional[Dict[Any, Any]]
+        try:
+            mine = {
+                (key, half): shard_extents(tree)
+                for key, halves in live_groups.items()
+                for half, tree in halves.items()
+            }
+        except (ValueError, ReshardUnsupported) as exc:
+            logger.warning("Cannot reshard this checkpoint: %s", exc)
+            # Not a `return`: the gather below is the next collective and the
+            # other ranks are already on their way into it. Refusing is said
+            # *through* it, as a None among the extents.
+            mine = None
+
+        # One dict of integers per rank. This is the only collective that
+        # carries anything about the tensors, and it carries their lengths.
+        new_extents = gather_objects(mine)
+        if any(extents is None for extents in new_extents):
+            return None
+
+        try:
+            return self._stitch(
+                step, old_world, rank, world, live_groups, new_extents
+            )
+        except (ValueError, ReshardUnsupported) as exc:
+            logger.warning(
+                "Reshard from %d ranks to %d failed: %s. Starting from scratch.",
+                old_world,
+                world,
+                exc,
+            )
+            return None
+        except Exception as exc:  # pragma: no cover - a resume never kills a run
+            logger.warning(
+                "Reshard from %d ranks to %d hit an unexpected error (%s). "
+                "Starting from scratch.",
+                old_world,
+                world,
+                exc,
+            )
+            return None
+
+    def _agree_on_old_step(self, old_ranks) -> Optional[int]:
+        """The newest step every old store holds, or None having said why.
+
+        Opening each store to ask is the cost of the question; ``latest_step``
+        reads a manifest and no tensors, so it is a cost paid in file reads
+        rather than in gigabytes.
+        """
+        from ravex._backends import open_rank_store
+
+        steps = []
+        for q in old_ranks:
+            store = open_rank_store(self.config, q)
+            if store is None:  # pragma: no cover - reachability already checked
+                logger.warning("Rank %d's store went away mid-resume", q)
+                return None
+            try:
+                steps.append(store.latest_step())
+            finally:
+                store.close()
+
+        if any(step is None for step in steps):
+            blank = [q for q, step in zip(old_ranks, steps) if step is None]
+            logger.warning(
+                "Nothing to reshard: the store(s) for rank(s) %s hold no "
+                "checkpoint. Starting from scratch.",
+                ", ".join(str(q) for q in blank),
+            )
+            return None
+
+        step = min(int(s) for s in steps)
+        if len(set(steps)) > 1:
+            logger.info(
+                "Resharding from step %s, the newest every old store holds "
+                "(they range from %s to %s)",
+                step,
+                min(int(s) for s in steps),
+                max(int(s) for s in steps),
+            )
+        return step
+
+    def _stitch(
+        self, step, old_world, rank, world, live_groups, new_extents
+    ) -> Dict[str, Any]:
+        """Read the old stores and assemble this rank's state. Two passes.
+
+        The first pass measures — how long is each old shard — and keeps
+        nothing. The second cuts out the intervals the plan asked for. Reading
+        twice buys the memory bound: knowing where a shard starts needs every
+        length before it, so a single pass would mean holding every old
+        snapshot at once, which is the whole checkpoint per rank.
+        """
+        from ravex._distributed import (
+            build_resharded_tree,
+            shard_extents,
+            take_shard_slices,
+        )
+        from ravex._reshard import check_covered, plan_reshard
+
+        old_ranks = list(range(old_world))
+        base = old_ranks[0]
+
+        # ── pass one: lengths ───────────────────────────────────────
+        old_extents: Dict[int, Any] = {}
+        for q in old_ranks:
+            snapshot = self._load_old(q, step)
+            old_extents[q] = {
+                (key, half): shard_extents(tree)
+                for key, halves in _per_rank_groups(snapshot).items()
+                for half, tree in halves.items()
+            }
+            del snapshot
+
+        # ── the plan, one tensor at a time ──────────────────────────
+        wanted: Dict[int, Dict[Any, Any]] = {q: {} for q in old_ranks}
+        for group, paths in _paths_of(live_groups, new_extents, rank).items():
+            if group not in old_extents[base]:
+                # A group the live model shards and the checkpoint holds under
+                # `gather`. Its state is already topology-independent, so there
+                # is nothing to reshape — and a checkpoint mixing the two
+                # layouts should not lose the half that was fine.
+                continue
+            for path, new_lengths in paths.items():
+                old_lengths = [
+                    _extent(old_extents[q], group, path, q) for q in old_ranks
+                ]
+                pieces = plan_reshard(old_lengths, new_lengths)[rank]
+                check_covered(pieces, new_lengths[rank], "%s %s" % (group, path))
+                for q, (start, stop), _ in pieces:
+                    wanted[q].setdefault(group, {}).setdefault(path, []).append(
+                        (start, stop)
+                    )
+
+        # ── pass two: the slices, and the base snapshot ─────────────
+        slices: Dict[Any, Dict[Any, list]] = {}
+        state: Optional[Dict[str, Any]] = None
+        for q in old_ranks:
+            snapshot = self._load_old(q, step)
+            groups = _per_rank_groups(snapshot)
+            for group, paths in wanted[q].items():
+                key, half = group
+                tree = groups.get(key, {}).get(half)
+                if tree is None:
+                    raise ValueError(
+                        "rank %d's store has no %s state for group %s" % (q, half, key)
+                    )
+                for path, parts in take_shard_slices(tree, paths).items():
+                    slices.setdefault(group, {}).setdefault(path, []).extend(parts)
+            if q == base:
+                state = snapshot
+            else:
+                del snapshot
+
+        if state is None:  # pragma: no cover - `base` is always in `old_ranks`
+            raise ValueError("the base store produced nothing to build on")
+
+        # ── assembly ────────────────────────────────────────────────
+        for key, saved in state.get("sharded", {}).items():
+            if saved.get("layout") != "per_rank":
+                continue
+            live = live_groups.get(key)
+            if live is None:
+                # A group in the checkpoint that this run does not have. The
+                # registry already reports these; leaving it alone keeps that
+                # one report rather than raising a second, different one here.
+                continue
+            for half in ("model", "optimizer"):
+                saved[half] = build_resharded_tree(
+                    saved[half],
+                    live[half],
+                    slices.get((key, half), {}),
+                )
+            # Written by a run of `old_world`, and now shaped for this one.
+            # Said in the checkpoint so the apply path takes the ordinary
+            # branch instead of the "cannot be reshaped" one.
+            saved["world_size"] = world
+            saved["rank"] = rank
+            saved["resharded_from"] = old_world
+
+        _drop_per_rank_randomness(state, old_world, world)
+        return state
+
+    def _load_old(self, q: int, step: int) -> Dict[str, Any]:
+        """One old store's snapshot at ``step``, opened and closed around it."""
+        from ravex._backends import open_rank_store
+
+        store = open_rank_store(self.config, q)
+        if store is None:  # pragma: no cover - reachability already checked
+            raise ValueError("rank %d's store is no longer readable" % q)
+        try:
+            snapshot = store.load_step(step)
+        finally:
+            store.close()
+        if not snapshot:
+            raise ValueError("rank %d's store holds nothing at step %s" % (q, step))
+        return snapshot
 
     def _settle_run_identity(self, resumed: bool) -> None:
         """Agree on which run this is, and record it beside this rank's store.

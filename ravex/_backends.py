@@ -35,7 +35,7 @@ import re
 import time
 from abc import ABC, abstractmethod
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, Optional
 
 logger = logging.getLogger("ravex")
 
@@ -452,17 +452,32 @@ def _per_rank_config(config, per_rank: bool):
     The cost is N manifests, and a resume that has to agree on a step (see
     ``agree_on_step``).
     """
-    from dataclasses import replace
-
     from ravex._distributed import get_rank
 
     if not per_rank:
         return config
 
-    suffix = rank_suffix(get_rank())
+    return store_config_at(config, rank_suffix(get_rank()))
+
+
+def store_config_at(config, *parts: str):
+    """The same config, re-rooted at ``<path>/<parts...>``.
+
+    Both the local path and the remote prefix move together, because a store
+    is one place addressed two ways and letting them drift would put a rank's
+    bytes on disk under one name and in the bucket under another.
+
+    Public because :func:`open_rank_store` needs to point a backend at a
+    directory this process did not write, which is the whole of what reading a
+    foreign store amounts to: the store is single-rank like every other, and
+    only the path is different.
+    """
+    from dataclasses import replace
+
+    suffix = "/".join(parts)
     storage = replace(
         config.storage,
-        path=os.path.join(config.storage.path, suffix),
+        path=os.path.join(config.storage.path, *parts),
         prefix=(
             "%s/%s" % (config.storage.prefix.rstrip("/"), suffix)
             if config.storage.prefix
@@ -590,6 +605,74 @@ def visible_store_owners(config) -> "dict[int, dict]":
         rank: (read_owner(per_rank_store_path(config, rank)) or {})
         for rank in visible_rank_stores(config)
     }
+
+
+def open_rank_store(config, rank: int) -> Optional[CheckpointBackend]:
+    """A handle on some *other* rank's per-rank store, or None if unreachable.
+
+    The seam :func:`visible_rank_stores` declined to open. It answers "does
+    ``rank_<q>`` exist on this machine" by reading directory names, on the
+    grounds that opening a store to answer a question about topology is a lot
+    of machinery for a small fact. Resharding needs the bytes, so this is where
+    the store gets opened — and it needs nothing new underneath: every per-rank
+    store is an ordinary single-rank store (``world_size=1, rank=0``, see
+    :class:`MoonclipBackend`) and the only thing that differs is the path.
+
+    Falls back to a *complete* copy under ``replica/`` when the original is not
+    here, which is what makes a shrink survivable at all: after losing a
+    machine, the shard it wrote exists only as the copy a neighbour holds. A
+    copy caught mid-transfer is not offered — it is bytes, and it is not a
+    checkpoint.
+
+    Read-only by intent, not by enforcement: the backend it returns can write,
+    and nothing here should. The caller closes it.
+    """
+    if config.storage.is_remote:
+        # Every node already sees every store, so there is no foreign store to
+        # open — `get_backend` on the ordinary per-rank path reaches it.
+        return None
+
+    from ravex._replication import REPLICA_DIR, replica_is_complete
+
+    direct = per_rank_store_path(config, rank)
+    if os.path.isdir(direct) and os.listdir(direct):
+        return get_backend(store_config_at(config, rank_suffix(rank)))
+
+    copy = replica_store_path(config, rank)
+    if os.path.isdir(copy) and os.listdir(copy) and replica_is_complete(copy):
+        return get_backend(store_config_at(config, REPLICA_DIR, rank_suffix(rank)))
+
+    return None
+
+
+def reachable_rank_stores(config, ranks: Iterable[int]) -> "set[int]":
+    """Which of ``ranks`` this machine could open, original or complete copy.
+
+    Cheaper than opening them and the same verdict, so the reshard can decide
+    whether it is possible before it starts reading tensors. Deciding late is
+    the expensive kind of failure here: half the shards are in memory by then.
+    """
+    from ravex._replication import replica_is_complete
+
+    if config.storage.is_remote:
+        return set(ranks)
+
+    found = set()
+    for rank in ranks:
+        direct = per_rank_store_path(config, rank)
+        try:
+            if os.path.isdir(direct) and os.listdir(direct):
+                found.add(rank)
+                continue
+        except OSError:  # pragma: no cover - a directory that vanished
+            pass
+        copy = replica_store_path(config, rank)
+        try:
+            if os.path.isdir(copy) and os.listdir(copy) and replica_is_complete(copy):
+                found.add(rank)
+        except OSError:  # pragma: no cover - a directory that vanished
+            continue
+    return found
 
 
 def get_backend(config, per_rank: bool = False) -> CheckpointBackend:

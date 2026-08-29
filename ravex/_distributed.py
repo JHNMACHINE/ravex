@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 
 logger = logging.getLogger("ravex")
@@ -267,15 +267,28 @@ def _encode_shards(value: Any) -> Any:
     What comes back is plain tensors and plain data, which is all the storage
     backends can take. The global shape and the placements ride along so a
     resume onto a different layout can *say so* instead of failing with a shape
-    error from inside ``set_state_dict``.
+    error from inside ``set_state_dict`` — and, since :mod:`ravex._reshard`,
+    so it can do something about it.
+
+    The placements are stored as data rather than as ``str(placement)``. The
+    old form is still read (see :func:`ravex._reshard.decode_placements`); it
+    is not still written, because the reshard planner has to ask which
+    dimension a tensor was split along and parsing torch's ``repr`` for the
+    answer is a dependency on a string nobody promised to keep.
     """
     DTensor = _dtensor_class()
     if DTensor is not None and isinstance(value, DTensor):
+        from ravex._reshard import encode_placement
+
         return {
             _SHARD_TAG: 1,
             "local": value.to_local().detach(),
             "global_shape": list(value.shape),
-            "placements": [str(p) for p in value.placements],
+            "placements": [encode_placement(p) for p in value.placements],
+            # The mesh the placements index into. Recorded so a reshard can
+            # refuse a 2-D mesh by looking at the checkpoint instead of
+            # inferring it from how many placements happen to be shards.
+            "mesh_shape": _mesh_shape(value),
         }
     if _is_sharded_tensor(value):
         # FSDP1, whatever `use_orig_params` is set to. Measured on torch
@@ -294,6 +307,23 @@ def _encode_shards(value: Any) -> Any:
     if isinstance(value, tuple):
         return tuple(_encode_shards(v) for v in value)
     return value
+
+
+def _mesh_shape(value: Any) -> Optional[List[int]]:
+    """The device mesh's shape as plain integers, or None if it will not say.
+
+    Best-effort by design: the mesh is recorded to make a refusal specific, and
+    a checkpoint that cannot describe its mesh should still be written. The
+    reshard planner already refuses on the placements alone.
+    """
+    mesh = getattr(value, "device_mesh", None)
+    if mesh is None:
+        return None
+    shape = getattr(mesh, "shape", None)
+    try:
+        return [int(n) for n in shape] if shape is not None else None
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        return None
 
 
 def _rebuild_dtensor(saved: Dict[str, Any], live: Any) -> Any:
@@ -404,6 +434,173 @@ def _decode_shards(saved: Any, live: Any) -> Any:
         ]
         return type(saved)(decoded) if isinstance(saved, tuple) else decoded
     return saved
+
+
+#: Where one shard sits in an encoded state tree: dict keys and list indices,
+#: from the root down. Used as a dictionary key and sent through
+#: ``all_gather_object``, so it is a tuple of plain strings and integers.
+ShardPath = Tuple[Any, ...]
+
+
+def walk_shards(tree: Any, path: ShardPath = ()):
+    """Yield ``(path, node)`` for every shard in an encoded state tree.
+
+    A shard node is a leaf as far as this is concerned: it is a dict, but the
+    walk stops there rather than descending into ``local`` and ``placements``.
+    """
+    if isinstance(tree, dict):
+        if tree.get(_SHARD_TAG):
+            yield path, tree
+            return
+        for key, value in tree.items():
+            yield from walk_shards(value, path + (key,))
+    elif isinstance(tree, (list, tuple)):
+        for index, value in enumerate(tree):
+            yield from walk_shards(value, path + (index,))
+
+
+def node_at(tree: Any, path: ShardPath) -> Any:
+    """The node ``path`` names, or None if this tree does not have one there."""
+    node = tree
+    for step in path:
+        try:
+            node = node[step]
+        except (KeyError, IndexError, TypeError):
+            return None
+    return node
+
+
+def path_name(path: ShardPath) -> str:
+    """A path as something a log line can print."""
+    return ".".join(str(step) for step in path) or "<root>"
+
+
+def shard_extents(tree: Any) -> Dict[ShardPath, int]:
+    """How long each shard in this tree is, along the dimension it is split on.
+
+    Replicated tensors are left out: they have no extent to add up, and every
+    rank holds the same bytes, so resharding one is a copy rather than a
+    stitch. Excluding them here is what keeps them out of the plan entirely.
+
+    Works on a saved tree and on a live one, which is the point — the reshard
+    compares an old measurement against a new one, and neither side is allowed
+    to be a guess about how torch chunks tensors.
+    """
+    from ravex._reshard import decode_placements, shard_dim
+
+    extents: Dict[ShardPath, int] = {}
+    for path, node in walk_shards(tree):
+        placements = decode_placements(node.get("placements"))
+        dim = shard_dim(placements, path_name(path))
+        if dim is None:
+            continue
+        local = node.get("local")
+        shape = getattr(local, "shape", None)
+        if shape is None or dim >= len(shape):
+            raise ValueError(
+                "%s: placements say dimension %d, the stored shard has %d"
+                % (path_name(path), dim, len(shape) if shape is not None else 0)
+            )
+        extents[path] = int(shape[dim])
+    return extents
+
+
+def take_shard_slices(
+    tree: Any, wanted: Dict[ShardPath, List[Tuple[int, int]]]
+) -> Dict[ShardPath, List[Any]]:
+    """Cut the requested intervals out of one old rank's tree and keep only those.
+
+    Called once per old store, with the store's whole snapshot in hand and the
+    intention of not keeping it. ``narrow`` is a view, so the pieces are cloned
+    — a view would pin the entire tensor it was taken from, and pinning the
+    whole old checkpoint is the thing this function exists to avoid.
+    """
+    from ravex._reshard import decode_placements, shard_dim
+
+    taken: Dict[ShardPath, List[Any]] = {}
+    for path, intervals in wanted.items():
+        node = node_at(tree, path)
+        if not isinstance(node, dict) or not node.get(_SHARD_TAG):
+            raise ValueError(
+                "%s: this store has no shard where the others do" % path_name(path)
+            )
+        dim = shard_dim(decode_placements(node.get("placements")), path_name(path))
+        if dim is None:  # pragma: no cover - `wanted` only holds sharded paths
+            continue
+        local = node["local"]
+        taken[path] = [
+            local.narrow(dim, start, stop - start).clone()
+            for start, stop in intervals
+        ]
+    return taken
+
+
+def build_resharded_tree(
+    base: Any,
+    live: Any,
+    pieces: Dict[ShardPath, List[Any]],
+) -> Any:
+    """One old tree's structure, with every shard replaced by this rank's own.
+
+    ``base`` supplies the shape of the result and every non-shard leaf —
+    optimizer hyperparameters, step counters, the keys themselves — which are
+    the same on every rank and are taken from one of them rather than merged.
+    ``live`` supplies the layout each new shard has to match. ``pieces`` holds
+    the slices already cut from the old stores, in the order they concatenate.
+
+    Non-shard leaves are passed through by reference, not copied: they are
+    about to be handed straight to ``set_state_dict`` and nothing here mutates
+    them.
+    """
+    import torch
+
+    from ravex._reshard import decode_placements, shard_dim
+
+    def rebuild(node: Any, path: ShardPath) -> Any:
+        if isinstance(node, dict) and node.get(_SHARD_TAG):
+            return rebuild_shard(node, path)
+        if isinstance(node, dict):
+            return {key: rebuild(value, path + (key,)) for key, value in node.items()}
+        if isinstance(node, list):
+            return [rebuild(value, path + (i,)) for i, value in enumerate(node)]
+        if isinstance(node, tuple):
+            return tuple(rebuild(value, path + (i,)) for i, value in enumerate(node))
+        return node
+
+    def rebuild_shard(node: Dict[str, Any], path: ShardPath) -> Dict[str, Any]:
+        live_node = node_at(live, path)
+        if not isinstance(live_node, dict) or not live_node.get(_SHARD_TAG):
+            raise ValueError(
+                "%s is a shard in the checkpoint and not in this run's model"
+                % path_name(path)
+            )
+
+        placements = live_node.get("placements")
+        dim = shard_dim(decode_placements(placements), path_name(path))
+
+        if dim is None:
+            # Replicated: every old rank wrote the same bytes, so this rank's
+            # new shard is any one of them. `base` is one of them.
+            local = node["local"]
+        else:
+            parts = pieces.get(path)
+            if not parts:
+                raise ValueError(
+                    "%s: nothing was read for this tensor" % path_name(path)
+                )
+            local = parts[0] if len(parts) == 1 else torch.cat(parts, dim=dim)
+
+        return {
+            _SHARD_TAG: 1,
+            "local": local,
+            # From the live model, not from the checkpoint: this shard is being
+            # rebuilt to fit the topology running now.
+            "global_shape": list(live_node.get("global_shape", [])),
+            "placements": placements,
+            "mesh_shape": live_node.get("mesh_shape"),
+        }
+
+    return rebuild(base, ())
 
 
 def local_sharded_state(
