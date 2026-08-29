@@ -33,6 +33,28 @@
   point and wanted only the first half. Until 0.0.9 the first half had no
   public name, so taking it meant taking the second as well.
 
+### Fixed
+
+- **A shard rebuilt on an older torch could come back with a global shape
+  nobody asked for.** `DTensor.from_local` is given `shape=`/`stride=` so
+  uneven shards survive; a torch whose signature predates those arguments
+  raises `TypeError`, and Ravex fell back to calling it without them. That
+  fallback infers the global shape as local × mesh size — correct when the
+  tensor divides evenly across the mesh, and wrong by exactly the remainder
+  when it does not. A 10-row tensor over 4 ranks came back claiming 12.
+
+  Nothing failed at the point of the mistake. Every shard was individually
+  valid, `set_state_dict` accepted them, and the first symptom would have been
+  somewhere else entirely — which is the same shape as GPU-59 and GPU-79, and
+  the reason this is worth a release note rather than a line in a diff.
+
+  The fallback is now taken only after checking that the shape it would infer
+  is the shape that is actually there, and refuses with both numbers when it
+  is not. Even splits are unaffected, which is most of them. Every rank
+  reaches the same verdict — with an uneven split the ranks holding a full
+  chunk infer too much and the short one too little, so none of them agrees —
+  so no rank is left inside a collective while another raises.
+
 ### Removed
 
 - **Four compatibility guards against Moonclip builds the floor already
@@ -62,10 +84,11 @@
   that only runs against a build the packaging forbids cannot be exercised
   without installing one.
 
-  Deliberately kept: the `except TypeError` around
-  `DTensor.from_local(shape=, stride=)` in `_distributed.py`. Torch is not a
-  declared dependency — Ravex attaches to whatever build is already installed
-  — so there is no floor to date it against and it is not dead.
+  One guard of that shape survives, because it is not dead: the
+  `except TypeError` around `DTensor.from_local(shape=, stride=)`. Torch is
+  not a declared dependency — Ravex attaches to whatever build is already
+  installed — so there is no floor to date it against. What it *did* do
+  silently is fixed below.
 
 ## 0.0.4 — 2026-08-21
 

@@ -320,7 +320,10 @@ def _rebuild_dtensor(saved: Dict[str, Any], live: Any) -> Any:
 
     # `shape`/`stride` are passed so uneven shards survive: without them
     # `from_local` infers the global shape as local × mesh size, which is wrong
-    # for the last rank of a dimension that does not divide evenly.
+    # for the last rank of a dimension that does not divide evenly. Torch is
+    # not a declared dependency — Ravex attaches to whatever build is already
+    # installed — so a build without them is reachable, and the `except` below
+    # is what happens then.
     try:
         return DTensor.from_local(
             local,
@@ -330,8 +333,51 @@ def _rebuild_dtensor(saved: Dict[str, Any], live: Any) -> Any:
             shape=live.shape,
             stride=live.stride(),
         )
-    except TypeError:  # older signature
+    except TypeError:
+        # An older signature, with no way to state the global shape. What it
+        # infers instead is local x mesh size, which is right whenever the
+        # tensor divides evenly across the mesh and wrong otherwise — so the
+        # fallback is usable, but only after checking that this is one of the
+        # cases where it agrees.
+        #
+        # Checked rather than assumed because the disagreement is silent: the
+        # rebuilt DTensor would carry a global shape nobody asked for, every
+        # shard individually valid, and the first symptom somewhere far away.
+        # Every rank reaches the same verdict — with an uneven split the ranks
+        # holding a full chunk infer too much and the short one too little, so
+        # none of them agrees with `live.shape` — which is what keeps this from
+        # stranding some ranks inside a collective while others raise.
+        inferred = _inferred_global_shape(local.shape, live.placements, live.device_mesh)
+        if tuple(inferred) != tuple(live.shape):
+            raise ValueError(
+                "this torch's DTensor.from_local does not take shape=/stride=, "
+                "so it would rebuild this shard as %s instead of %s. The tensor "
+                "does not divide evenly across the mesh, and the difference is "
+                "exactly what those arguments exist to carry. Upgrade to a "
+                "torch whose from_local accepts them, or run at a world size "
+                "that divides this tensor evenly."
+                % (tuple(inferred), tuple(live.shape))
+            )
         return DTensor.from_local(local, live.device_mesh, live.placements)
+
+
+def _inferred_global_shape(local_shape, placements, mesh) -> tuple:
+    """The global shape `from_local` works out when it is not given one.
+
+    It multiplies each sharded dimension by the size of the mesh dimension it
+    is sharded over, which is the even-split assumption. Kept as a function of
+    plain values so the arithmetic can be tested without a process group —
+    the path that needs it only runs on a torch this dev box does not have.
+
+    A placement is a shard exactly when it carries a `dim`; `Replicate` and
+    `Partial` do not, and neither multiplies anything.
+    """
+    inferred = list(local_shape)
+    for mesh_dim, placement in enumerate(placements):
+        dim = getattr(placement, "dim", None)
+        if dim is not None:
+            inferred[dim] *= mesh.size(mesh_dim)
+    return tuple(inferred)
 
 
 def _decode_shards(saved: Any, live: Any) -> Any:

@@ -525,3 +525,158 @@ def _no_process_group(monkeypatch):
     real one cannot be reached and block.
     """
     monkeypatch.setattr("ravex._distributed._dist", lambda: None)
+
+
+# ─── the old-torch from_local fallback ──────────────────────────────
+
+
+class _Mesh:
+    """Just the `.size(mesh_dim)` that the shape arithmetic asks for."""
+
+    def __init__(self, *sizes):
+        self._sizes = sizes
+
+    def size(self, mesh_dim):
+        return self._sizes[mesh_dim]
+
+
+class _Shard:
+    def __init__(self, dim):
+        self.dim = dim
+
+
+class _Replicate:
+    """No `dim`, because a replicated placement multiplies nothing."""
+
+
+class TestInferredGlobalShape:
+    """What `DTensor.from_local` works out when it is not told the shape.
+
+    Torch is not a declared dependency, so a build whose `from_local` predates
+    `shape=`/`stride=` is reachable and Ravex falls back to it. That fallback
+    assumes an even split. These tests are the arithmetic that decides whether
+    the assumption holds here — the check that turns a silently wrong global
+    shape into a refusal.
+    """
+
+    def test_an_even_split_infers_the_real_shape(self):
+        from ravex._distributed import _inferred_global_shape
+
+        # 12 rows over 4 ranks: every rank holds 3, and 3 x 4 is the truth.
+        assert _inferred_global_shape(
+            (3, 512), [_Shard(0)], _Mesh(4)
+        ) == (12, 512)
+
+    def test_an_uneven_split_is_caught_from_every_rank(self):
+        from ravex._distributed import _inferred_global_shape
+
+        # 10 rows over 4 ranks: torch gives 3, 3, 3, 1. No rank infers 10, and
+        # that is what keeps some ranks from raising while others proceed —
+        # a split verdict inside a collective is worse than either answer.
+        for local_rows in (3, 3, 3, 1):
+            inferred = _inferred_global_shape((local_rows, 512), [_Shard(0)], _Mesh(4))
+            assert inferred != (10, 512), (
+                "rank holding %d rows inferred %s, which agrees with a global "
+                "shape it should not" % (local_rows, inferred)
+            )
+
+    def test_replicated_placements_multiply_nothing(self):
+        from ravex._distributed import _inferred_global_shape
+
+        assert _inferred_global_shape(
+            (12, 512), [_Replicate()], _Mesh(4)
+        ) == (12, 512)
+
+    def test_a_two_dimensional_mesh_multiplies_each_axis_once(self):
+        from ravex._distributed import _inferred_global_shape
+
+        # Sharded on dim 0 over a mesh axis of 2, and on dim 1 over one of 3.
+        assert _inferred_global_shape(
+            (4, 5), [_Shard(0), _Shard(1)], _Mesh(2, 3)
+        ) == (8, 15)
+
+    def test_the_same_dimension_sharded_twice_compounds(self):
+        from ravex._distributed import _inferred_global_shape
+
+        # Both mesh axes cut dim 0, so the local rows stand for 2 x 3 of them.
+        assert _inferred_global_shape(
+            (4, 5), [_Shard(0), _Shard(0)], _Mesh(2, 3)
+        ) == (24, 5)
+
+
+class TestTheOldSignatureFallback:
+    """`_rebuild_dtensor` against a torch whose `from_local` takes no shape.
+
+    Driven with stand-ins rather than a real mesh: the branch only runs on a
+    torch older than the one installed anywhere we can test, and the thing
+    worth testing is the decision, not torch. `_inferred_global_shape` above
+    covers the arithmetic; this covers whether anything consults it.
+    """
+
+    @staticmethod
+    def _live(local_rows, global_rows, mesh_size):
+        import torch
+
+        class Mesh:
+            def size(self, mesh_dim):
+                return mesh_size
+
+        class Shard:
+            dim = 0
+
+        class Live:
+            device_mesh = Mesh()
+            placements = [Shard()]
+            shape = (global_rows, 4)
+
+            def to_local(self):
+                return torch.zeros(local_rows, 4)
+
+            def stride(self):
+                return (4, 1)
+
+        return Live()
+
+    @staticmethod
+    def _old_torch(monkeypatch):
+        """A DTensor whose `from_local` rejects shape=/stride=, as older ones do."""
+
+        class OldDTensor:
+            @staticmethod
+            def from_local(local, mesh, placements, run_check=None, **kwargs):
+                if kwargs:
+                    raise TypeError("from_local() got an unexpected keyword argument")
+                return ("rebuilt", tuple(local.shape))
+
+        import ravex._distributed as distributed
+
+        monkeypatch.setattr(distributed, "_dtensor_class", lambda: OldDTensor)
+
+    def test_an_even_split_still_rebuilds(self, monkeypatch):
+        """12 rows over 4 ranks: the inferred shape is the real one, so the
+        older signature loses nothing and the fallback is taken."""
+        import torch
+
+        from ravex._distributed import _rebuild_dtensor
+
+        self._old_torch(monkeypatch)
+        rebuilt = _rebuild_dtensor(
+            {"local": torch.zeros(3, 4)}, self._live(3, 12, 4)
+        )
+        assert rebuilt == ("rebuilt", (3, 4))
+
+    def test_an_uneven_split_is_refused_rather_than_rebuilt_wrong(self, monkeypatch):
+        """10 rows over 4 ranks. Without shape= the rebuild would claim 12,
+        and every shard would look fine on its own."""
+        import torch
+
+        from ravex._distributed import _rebuild_dtensor
+
+        self._old_torch(monkeypatch)
+        with pytest.raises(ValueError) as caught:
+            _rebuild_dtensor({"local": torch.zeros(3, 4)}, self._live(3, 10, 4))
+
+        message = str(caught.value)
+        assert "(12, 4)" in message, "the wrong shape it would have produced"
+        assert "(10, 4)" in message, "and the right one"
+        assert "shape=" in message, "and why this torch cannot say so"
