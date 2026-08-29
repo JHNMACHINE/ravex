@@ -1,5 +1,72 @@
 # Changelog
 
+## 0.0.5 — unreleased
+
+### Changed
+
+- **The Moonclip backend now builds `MoonclipManager` rather than
+  `CheckpointManager`.** Ravex owns the topology and hands Moonclip a value;
+  it no longer relies on a convenience layer that worked one out.
+
+  `CheckpointManager` read `RANK`/`WORLD_SIZE` from the environment whenever
+  it was not told. Under `torchrun` it would then believe it was one rank of
+  eight and reject the single-rank save API outright — and this backend caught
+  that in the `except` around its own construction and fell back to
+  `torch.save`, with one log line to say so. A distributed run lost Moonclip
+  checkpointing and kept training. The pinning that avoided it has been in
+  place since the failure was found, and a test has guarded it since; what
+  changes now is that there is nothing left to pin against.
+
+  `MoonclipManager` is the explicit layer underneath, it never guessed, and it
+  already accepts every option this backend passes. Nothing changes about
+  where checkpoints land or what is in them.
+
+  Requires Moonclip **0.0.9**, and the floor moves accordingly — not for the
+  manager, which has always been there, but for `unflatten_state_dict` below.
+  A version requirement stated in `pyproject.toml`, rather than a method call
+  wrapped in a guard that answers "nothing here" when the method is missing.
+
+- Loading goes through Moonclip's `unflatten_state_dict`, new in 0.0.9 and the
+  public inverse of the `flatten_state_dict` this backend already used to
+  write. `CheckpointManager.load` rebuilt the state tree *and* called
+  `load_state_dict` on live objects; this backend has no live objects at that
+  point and wanted only the first half. Until 0.0.9 the first half had no
+  public name, so taking it meant taking the second as well.
+
+### Removed
+
+- **Four compatibility guards against Moonclip builds the floor already
+  excludes.** GPU-88 asks for this sweep before every tag, and names the shape
+  to look for: *every guard around a backend call is a version requirement in
+  disguise*. Each one below was dated against the release that introduced what
+  it guarded, and every one of them was unreachable.
+
+  - `restore_from_remote` was wrapped in `except AttributeError` returning
+    `False`. This is the exact case GPU-88 was written about. The method has
+    existed since Moonclip 0.0.8 and the floor has said `>=0.0.8` since — the
+    guard simply outlived it. It never crashed; it answered *"nothing to
+    restore"*, which is indistinguishable from an empty bucket. A rank whose
+    disk had been replaced would have started from scratch with its own data
+    sitting in the remote, and taken every other rank back with it, because a
+    resume is agreed at the oldest step everyone holds.
+  - `flatten_state_dict(as_tensors=)` was feature-detected, with the byte path
+    as a fallback and a log line saying checkpoints would block the training
+    loop about five times longer. The parameter shipped in 0.0.4.
+  - `keep_base_in_memory` was feature-detected, warning that the base would be
+    retained anyway when a run had explicitly asked otherwise. It shipped in
+    0.0.4 too.
+  - `_accepts`, the introspection helper the last two used, with nothing left
+    to ask.
+
+  None of the removed branches had a test. That is not a coincidence: a branch
+  that only runs against a build the packaging forbids cannot be exercised
+  without installing one.
+
+  Deliberately kept: the `except TypeError` around
+  `DTensor.from_local(shape=, stride=)` in `_distributed.py`. Torch is not a
+  declared dependency — Ravex attaches to whatever build is already installed
+  — so there is no floor to date it against and it is not dead.
+
 ## 0.0.4 — 2026-08-21
 
 Jobs spanning more than one machine. Everything below exists because of one

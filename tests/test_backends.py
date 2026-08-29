@@ -61,15 +61,21 @@ def test_moonclip_backend_writes_under_a_torchrun_environment(
 ):
     """Moonclip must be told this is a single-rank save, whatever the env says.
 
-    MoonclipManager infers world_size from RANK/WORLD_SIZE when it is not given
-    one. Under torchrun it would therefore reject the single-rank save API -
+    Every Ravex store is single-rank: where ranks write separately they get a
+    directory each, so there is one writer and one manifest whatever the job
+    looks like. Moonclip has to be told that, because a manager that believes
+    it is one of eight rejects the single-rank save API outright -
     "Multi-rank save requires explicit create_snapshot/save_rank/finalize
-    flow" - and Ravex, doing what it promises, would disable itself and let
-    training continue with no checkpoints at all.
+    flow" - and Ravex, doing what it promises, catches that, disables itself
+    and lets training continue with no checkpoints at all.
 
-    Ravex never needs that flow: sharded state is gathered before it reaches a
-    backend, and exactly one rank writes. Without this test the failure only
-    shows up on a real multi-GPU run, as a single line in a log file.
+    Two things used to have to go right for that not to happen, and now only
+    one does. `CheckpointManager` read RANK/WORLD_SIZE from the environment
+    when it was not told, so this backend had to pin the pair defensively;
+    since Moonclip 0.0.9 it refuses to guess instead, and this backend builds
+    `MoonclipManager`, which never guessed. The test stays because the failure
+    it guards is silent: without it, a wrong answer here shows up only on a
+    real multi-GPU run, as one line in a log file.
     """
     if distributed_env:
         monkeypatch.setenv("RANK", "0")

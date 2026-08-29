@@ -29,7 +29,6 @@ enough to always be on.
 from __future__ import annotations
 
 import glob
-import inspect
 import logging
 import os
 import re
@@ -114,25 +113,6 @@ class CheckpointBackend(ABC):
 _PREFIX = "ravex"
 
 
-def _accepts(obj, name: str) -> bool:
-    """Whether ``obj`` takes a keyword argument called ``name``.
-
-    Moonclip's surface has grown parameters since its first release, and this
-    backend runs against whatever build happens to be installed. Handing an
-    unknown keyword to a PyO3 constructor is a TypeError raised in the middle
-    of a training run, so every optional parameter gets asked about once, here,
-    rather than guessed at later.
-
-    Introspection does work on PyO3 callables, but nothing promises it always
-    will; failing to introspect is therefore read as "does not take it", which
-    is the answer that keeps the run alive.
-    """
-    try:
-        return name in inspect.signature(obj).parameters
-    except (TypeError, ValueError):  # pragma: no cover - defensive
-        return False
-
-
 class MoonclipBackend(CheckpointBackend):
     """Default backend, built on the Moonclip checkpoint engine."""
 
@@ -147,29 +127,22 @@ class MoonclipBackend(CheckpointBackend):
             "compression_level": config.compression_level,
             "max_total_snapshots": config.keep_last,
             "async_save": config.async_save,
-            # Always single-rank, stated explicitly. Moonclip otherwise infers
-            # world_size from RANK/WORLD_SIZE in the environment, and under
-            # torchrun it then rejects the single-rank save API outright:
-            # "Multi-rank save requires explicit create_snapshot/save_rank/
-            # finalize flow". Ravex does not need that flow — sharded state is
-            # gathered before it gets here and exactly one rank writes — but
-            # the mismatch is silent apart from a log line, so every
-            # distributed run would lose checkpointing altogether.
+            # Ravex owns the topology; Moonclip is handed a value and never
+            # asked to work one out.
+            #
+            # Every store here is single-rank by construction. Where ranks
+            # write separately they get a *directory* each — see
+            # `_per_rank_config` — rather than sharing one store with a rank
+            # id, so from Moonclip's side there is exactly one writer and one
+            # manifest whatever the job looks like. That is the whole reason
+            # this pair is stated rather than left to a default.
             "world_size": 1,
             "rank": 0,
         }
 
-        # Passed only when it differs from Moonclip's own default, so a build
-        # that predates the parameter behaves exactly as it did before and only
-        # a run that explicitly asked to turn retention off is told it cannot.
+        # Passed only when it differs from Moonclip's own default.
         if not config.keep_base_in_memory:
-            if _accepts(moonclip.CheckpointManager, "keep_base_in_memory"):
-                kwargs["keep_base_in_memory"] = False
-            else:
-                logger.warning(
-                    "keep_base_in_memory=false was requested but this Moonclip "
-                    "build does not take the option; the base will be retained"
-                )
+            kwargs["keep_base_in_memory"] = False
 
         if not config.async_save:
             logger.warning(
@@ -199,16 +172,15 @@ class MoonclipBackend(CheckpointBackend):
                 s3_path_style=storage.path_style,
             )
 
-        self._manager = moonclip.CheckpointManager(**kwargs)
-
-        # `as_tensors` arrived after the first released Moonclip, so it gets the
-        # same treatment.
-        self._as_tensors = _accepts(moonclip.flatten_state_dict, "as_tensors")
-        if not self._as_tensors:
-            logger.info(
-                "Moonclip predates flatten_state_dict(as_tensors=); checkpoints "
-                "will block the training loop for roughly 5x longer per save"
-            )
+        # `MoonclipManager`, not `CheckpointManager`. The latter is Moonclip's
+        # convenience layer: it reads RANK/WORLD_SIZE from the environment when
+        # it is not told, and under torchrun that made it refuse the
+        # single-rank save API outright — a refusal this backend caught and
+        # answered by falling back to `torch.save` with one log line, so a
+        # distributed run lost Moonclip checkpointing and said almost nothing.
+        # `MoonclipManager` is the explicit layer underneath and infers
+        # nothing; every keyword above is one it already takes.
+        self._manager = moonclip.MoonclipManager(**kwargs)
 
     def save(
         self, step: int, state: Dict[str, Any], metadata: Dict[str, str]
@@ -224,14 +196,9 @@ class MoonclipBackend(CheckpointBackend):
         # `save_raw`. That matters because for a model already on CPU the dict
         # below aliases live parameter memory rather than owning a copy of it.
         started = time.perf_counter()
-        if self._as_tensors:
-            tensors, _ = self._moonclip.flatten_state_dict(
-                state, _PREFIX, as_tensors=True
-            )
-        else:
-            tensors, _ = self._moonclip.flatten_state_dict(state, _PREFIX)
+        tensors, _ = self._moonclip.flatten_state_dict(state, _PREFIX, as_tensors=True)
         flattened = time.perf_counter()
-        self._manager.save_raw(step=step, tensors=tensors, metadata=metadata)
+        self._manager.save_tensors(step=step, tensors=tensors, metadata=metadata)
         # `store` is not the write: that runs in the background. It is the
         # shadow copy, plus however long the previous checkpoint's writer still
         # needed — Moonclip allows one save in flight, so a writer that has not
@@ -242,12 +209,23 @@ class MoonclipBackend(CheckpointBackend):
             "store": time.perf_counter() - flattened,
         }
 
+    def _rebuild(self, raw) -> Optional[Dict[str, Any]]:
+        """Ravex's own payload out of a snapshot's flat tensor map.
+
+        `MoonclipManager` hands back `{name: bytes}` and applies nothing,
+        which is what this backend wants: there is no live model here to load
+        into, only a state tree to give the registry. `unflatten_state_dict`
+        is the supported way back, and reimplementing it here would be a copy
+        of Moonclip's own format living in the wrong repository.
+        """
+        return self._moonclip.unflatten_state_dict(raw).get(_PREFIX)
+
     def load_latest(self) -> Optional[Dict[str, Any]]:
         snapshots = self._manager.list_snapshots()
         if not snapshots:
             return None
         _, loaded = self._manager.load_latest()
-        state = loaded.get(_PREFIX)
+        state = self._rebuild(loaded)
         if state is None:
             logger.warning(
                 "Latest snapshot has no %r payload - it was probably written by "
@@ -278,7 +256,7 @@ class MoonclipBackend(CheckpointBackend):
             if int(snapshot.get("step", -1)) != step:
                 continue
             loaded = self._manager.load(snapshot["id"])
-            return loaded.get(_PREFIX)
+            return self._rebuild(loaded)
         return None
 
     def has_checkpoint(self) -> bool:
@@ -292,12 +270,7 @@ class MoonclipBackend(CheckpointBackend):
         self._manager.flush()
 
     def restore_from_remote(self) -> bool:
-        try:
-            return bool(self._manager.restore_from_remote())
-        except AttributeError:
-            # An older Moonclip: the remote was push-only until 0.0.8, so there
-            # is no way back and saying so beats crashing the resume.
-            return False
+        return bool(self._manager.restore_from_remote())
 
     def consolidate(self) -> None:
         """Fold the delta chain into one full snapshot.

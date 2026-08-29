@@ -549,6 +549,9 @@ def exchange_stores(
     incoming = 0
 
     # Sizes first, so the receiver allocates before anything large moves.
+    # The wait is deferred past the recv rather than folded into the block
+    # above: two ranks both sitting in a blocking send is how the ring stalls.
+    handle = None
     if sending:
         size = torch.tensor([outgoing], dtype=torch.int64)
         handle = dist.isend(size, dst=send_to, group=group)
@@ -556,7 +559,7 @@ def exchange_stores(
         size_in = torch.zeros(1, dtype=torch.int64)
         dist.recv(size_in, src=receive_from, group=group)
         incoming = int(size_in[0].item())
-    if sending:
+    if handle is not None:
         handle.wait()
 
     mine = fixed_chunks(encode_store(source, chunk=chunk), chunk) if sending else None
@@ -569,7 +572,11 @@ def exchange_stores(
         for index in range(max(my_chunks, their_chunks)):
             handle = None
             outgoing_chunk = None
-            if index < my_chunks:
+            # `my_chunks` is zero unless there is something to send, so it
+            # already implies `mine`. Said out loud because the implication
+            # runs through four assignments, and a reader — or a checker —
+            # should not have to reconstruct it to know this is safe.
+            if mine is not None and index < my_chunks:
                 block = next(mine)
                 # No copy on the way out. `fixed_chunks` yields a fresh
                 # immutable `bytes` per chunk, so nothing can rewrite this
@@ -580,7 +587,7 @@ def exchange_stores(
                 outgoing_chunk = _wire_tensor(block)
                 handle = dist.isend(outgoing_chunk, dst=send_to, group=group)
 
-            if index < their_chunks:
+            if writer is not None and index < their_chunks:
                 expected = min(chunk, incoming - index * chunk)
                 buffer = torch.empty(expected, dtype=torch.uint8)
                 dist.recv(buffer, src=receive_from, group=group)

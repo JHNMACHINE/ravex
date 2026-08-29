@@ -51,7 +51,7 @@ dependencies = ["PyYAML>=5.1"]
 #            method". The same release also made a write over 5 GiB reach S3
 #            at all, which `sharded_checkpoints: gather` produces on its own
 #            for a model of any size.
-moonclip = ["moonclip>=0.0.8"]
+moonclip = ["moonclip>=0.0.9"]
 dev = ["pytest>=7", "numpy"]
 
 [project.urls]
