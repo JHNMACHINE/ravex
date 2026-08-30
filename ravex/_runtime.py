@@ -91,18 +91,14 @@ class RavexRuntime:
     #: a job that has not established a transport has not got one.
     _byte_transport_ok = False
     _byte_group = None
-    #: Whether the ranks agreed to split `drain` (RAVEX_SPLIT_DRAIN).
-    #: None until the first checkpoint asks them; never read per rank,
-    #: because a barrier only some ranks enter is a hang.
-    _split_drain = None
     #: Set only from `_install_signal_handler`'s closure - the one thing that
     #: code is allowed to do. See `on_step` for why.
     _emergency_requested = False
     #: Whether this rank participates in the SIGTERM detection channel at
     #: all: sharded, multi-machine, and turned on. Decided once from facts
     #: identical on every rank (config plus launcher environment), the same
-    #: way `_storage_split` is - so unlike `_split_drain` this needs no
-    #: agreement collective of its own to be safe to branch on.
+    #: way `_storage_split` is - so it needs no agreement collective of its
+    #: own to be safe to branch on.
     _emergency_active: Optional[bool] = None
     _emergency_group = None
 
@@ -131,7 +127,6 @@ class RavexRuntime:
         # and whether the observation has already been made.
         self._last_checkpoint_end: Optional[float] = None
         self._cadence_warned = False
-        self._split_drain: Optional[bool] = None
         self._emergency_requested = False
         self._emergency_active: Optional[bool] = None
         self._emergency_group = None
@@ -192,52 +187,6 @@ class RavexRuntime:
         except Exception as exc:
             logger.error("Activation failed: %s", exc, exc_info=True)
             self._disable("activation failed")
-
-    def _drain_split_agreed(self, sharded: bool) -> bool:
-        """Whether every rank asked for `RAVEX_SPLIT_DRAIN`. **Collective, once.**
-
-        The diagnostic it gates puts a `barrier()` in the checkpoint path, and
-        a barrier some ranks enter and others do not is two different
-        collectives posted on one process group: a hang until NCCL gives up
-        six hundred seconds later, and then a dead run.
-
-        So the ranks *agree* rather than each reading the variable, and one
-        rank without it turns the probe off for everybody. That is the safe
-        direction — a diagnostic that does not run costs a measurement, one
-        that hangs costs the run.
-
-        Setting it on one machine and not the other is not a far-fetched
-        mistake. `RAVEX_ASSUME_NO_NUMPY`, the other diagnostic added the same
-        day, is *meant* to be used exactly that way, and the two sit next to
-        each other in the documentation.
-
-        Asked once and remembered: the answer cannot change mid-run, and the
-        agreement is itself a collective that must not be posted from a
-        varying number of places. The caller has it inside the region with no
-        early `return`, which is what makes every rank reach it.
-        """
-        if self._split_drain is None:
-            # `sharded and world > 1` is the condition under which *every*
-            # rank reaches this line — the same guard the verdict at the end
-            # of the save carries, and for the same reason. Without it, a
-            # replicated (non-sharded) job sends rank 0 alone into a gather
-            # the others left before, at the early `return` above: a hang
-            # until the collective times out, which is the failure this whole
-            # function was written to avoid, reintroduced by the machinery
-            # meant to avoid it.
-            #
-            # Python short-circuits, so the gather is posted only where it is
-            # safe to post it. Anywhere else the probe is simply off: on one
-            # rank there is no peer to be skewed from and nothing to measure,
-            # and on a replicated job the barrier would have no one to meet.
-            self._split_drain = (
-                sharded
-                and get_world_size() > 1
-                and all_ranks_agree(
-                    os.environ.get("RAVEX_SPLIT_DRAIN", "") not in ("", "0", "false")
-                )
-            )
-        return self._split_drain
 
     def _announce_storage_topology(self) -> None:
         """Say which of the three situations this multi-machine job is in.
@@ -579,32 +528,27 @@ class RavexRuntime:
 
         started = time.perf_counter()
         phases: dict = {}
-        # Diagnostic, off unless asked for. `drain` is one `synchronize()`,
-        # and its justification for being excluded from the reported cost is
-        # that it waits for work the training loop had already queued — true
-        # for compute, false for a rank waiting on a peer that is late
-        # *because it was checkpointing*. Measured 2026-08-30 on two machines,
-        # the same five checkpoints: 34.6 s flat on one rank and 104-139 s on
-        # the other, which is not a difference compute explains.
+        # `drain` is one `synchronize()`, and its justification for being
+        # excluded from the reported cost is that it waits for work the
+        # training loop had already queued — true for compute, false for a
+        # rank waiting on a peer that is late *because it was checkpointing*.
+        # Measured 2026-08-30 on two machines, the same five checkpoints:
+        # 34.6 s flat on one rank and 104-139 s on the other, which is not a
+        # difference compute explains. A barrier first splits them: what it
+        # absorbs is skew, what is left in `drain` after it is queue. See
+        # GPU-98. `skew` is not excluded from `cost` below — it is exactly the
+        # part of the old `drain` number that was never queued compute.
         #
-        # A barrier first splits them: what it absorbs is skew, what is left
-        # in `drain` after it is queue. See GPU-98.
-        #
-        # **The ranks agree on it; they do not each read it.** A barrier some
-        # ranks enter and others do not is two different collectives posted on
-        # one process group — a hang until NCCL times out, six hundred
-        # seconds, and then a failed run. That is not a hypothetical way to
-        # set it wrong: `RAVEX_ASSUME_NO_NUMPY`, the other diagnostic added
-        # the same day, is *meant* to be set on one machine and not the other,
-        # so the habit this one has to survive already exists.
-        #
-        # So the agreement is unconditional and the barrier is conditional.
-        # Every rank calls `all_ranks_agree` — it sits inside the region below
-        # that has no early `return` for exactly this reason — and unanimity
-        # is what turns the probe on. One rank without the variable turns it
-        # off for everybody, which is the safe direction: a diagnostic that
-        # does not run costs a measurement, one that hangs costs the run.
-        if self._drain_split_agreed(sharded):
+        # Same guard as the verdict at the end of the save: every rank of a
+        # sharded, multi-rank run reaches this line, because `sharded` and
+        # `get_world_size()` read the same on every rank. A replicated
+        # (non-sharded) job leaves the non-main ranks at the early `return`
+        # above, so a barrier here without this guard would send rank 0 alone
+        # into a collective the other seven already left — a hang until NCCL
+        # times out, not an error. On one rank there is no peer to be skewed
+        # from and nothing to measure, so the guard also just skips the cost
+        # of a no-op barrier there.
+        if sharded and get_world_size() > 1:
             from ravex._distributed import barrier
 
             barrier()
@@ -1142,10 +1086,10 @@ class RavexRuntime:
         Decided once and cached, from facts identical on every rank by
         construction: the config (loaded the same way everywhere) and
         `has_sharded_models` / `spans_several_machines`, both local,
-        structural questions with no rank-specific answer. Unlike
-        `_drain_split_agreed`, that means no agreement collective is needed
-        to make this safe to branch on - every rank reaches the same verdict
-        without asking.
+        structural questions with no rank-specific answer. That means no
+        agreement collective is needed to make this safe to branch on -
+        every rank reaches the same verdict without asking, which is not
+        true of every flag in this class and is why this one says so.
 
         Off for a plain-replicated (DDP) job: rank 0 already holds the whole
         state locally and writes it without needing anything from anyone,
@@ -1171,8 +1115,8 @@ class RavexRuntime:
         """Look for a SIGTERM on any rank; save together if one landed.
 
         Reached by every rank at the same `emergency_check_every` cadence,
-        unconditionally - the same discipline `_drain_split_agreed` documents
-        for its own barrier, extended from "the same rank count" to "the same
+        unconditionally - the same discipline the checkpoint path's own
+        barrier follows, extended from "the same rank count" to "the same
         step". A rank that acted on its own flag the moment it noticed it,
         instead of waiting for this shared cadence, would be exactly the
         single-rank-in-a-collective hang this mechanism exists to avoid. The

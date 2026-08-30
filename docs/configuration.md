@@ -290,10 +290,31 @@ none of it caused by the checkpoint. Reading it as checkpoint overhead leads to
 the wrong conclusion; that mistake is what
 [GPU-54](https://linear.app/gpuzero/issue/GPU-54) cost.
 
-The phases that *are* the handoff are `collect` (building the state dict, a
-collective on a sharded model), `store` (the shadow copy the backend takes so
-the loop can carry on mutating weights), and `backpressure` (waiting for the
-*previous* checkpoint's writer, which allows one write in flight).
+On a sharded checkpoint with more than one rank, a `skew` phase can appear
+before it:
+
+```
+Checkpoint at step 200 handed off in 141.2s (skew 138.6s, drain 0.1s, collect 1.4s, store 1.0s)
+```
+
+**`skew` *is* a cost, and it is usually the checkpoint's own.** A barrier runs
+immediately before the accelerator drain, so what it absorbs — a rank that
+reaches the checkpoint before its peers, and waits there — is measured apart
+from the device queue. Splitting them mattered because they look identical
+from outside: two machines running the same job, one flat at ~35 s of `drain`
+and the other oscillating between ~104 s and ~139 s, with the *other* phases of
+the same checkpoints identical on both. Compute does not explain a three- to
+four-fold difference between otherwise identical ranks; a peer that is late
+because it is itself checkpointing does. Measured on two machines, the same
+five checkpoints: `skew 34.6s / drain 0.000s` on one rank and `skew 103.8s /
+drain 0.000s` on the other — all of what a single `drain` number would have
+hidden. See [GPU-98](https://linear.app/gpuzero/issue/GPU-98).
+
+The phases that *are* the handoff are `skew` (waiting for a peer at the
+barrier), `collect` (building the state dict, a collective on a sharded
+model), `store` (the shadow copy the backend takes so the loop can carry on
+mutating weights), and `backpressure` (waiting for the *previous* checkpoint's
+writer, which allows one write in flight).
 
 `store` and `backpressure` are reported apart because they answer to different
 things: `store` is memory bandwidth and grows with the model, `backpressure`
@@ -402,9 +423,9 @@ out-of-cadence checkpoint, not a stopped job.
 
 ## Diagnostics
 
-Two environment variables exist to make something measurable that is otherwise
-unreachable. **Neither is a setting.** They have no place in `ravex.yaml`, they
-do nothing useful in a real run, and each carries a rule about how it must be
+One environment variable exists to make something measurable that is
+otherwise unreachable. **Not a setting.** It has no place in `ravex.yaml`, it
+does nothing useful in a real run, and it carries a rule about how it must be
 applied across machines.
 
 ### `RAVEX_ASSUME_NO_NUMPY`
@@ -424,24 +445,9 @@ NumPy and one without, which is what two boxes from one provider look like
 when they come up from different images. Setting it on one node and not the
 other is the *intended* use.
 
-### `RAVEX_SPLIT_DRAIN`
-
-Adds a `skew` phase to the checkpoint breakdown: a barrier before the
-accelerator drain, timed separately.
-
-`drain` waits for the device queue, and is left out of the reported handoff
-cost on the grounds that it is work the training loop had already queued. The
-barrier separates that from a rank waiting on a peer — what the barrier
-absorbs is skew, what remains in `drain` is queue. On two machines on
-2026-08-30 the split came out `skew 34.6 s / drain 0.000 s` on one rank and
-`skew 103.8 s / drain 0.000 s` on the other: all of it was skew.
-
-**Set it on every rank or on none.** Unlike the variable above, this one puts
-a collective in the checkpoint path, and a barrier some ranks enter and others
-do not is a hang until NCCL gives up. Ravex will not let that happen — the
-ranks agree on the flag rather than each reading it, and one rank without it
-turns the probe off for everybody — but a partial setting silently gets you no
-measurement rather than the one you asked for.
+`RAVEX_SPLIT_DRAIN` used to live here as a second diagnostic. It has been
+promoted to the normal path — see [Reading the handoff
+log](#reading-the-handoff-log) — and is no longer read.
 
 ## Step budgets
 

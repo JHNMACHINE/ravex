@@ -157,29 +157,46 @@
 
 ### Changed
 
-- **Two diagnostics, `RAVEX_ASSUME_NO_NUMPY` and `RAVEX_SPLIT_DRAIN`.**
-  Neither is a setting: they have no place in `ravex.yaml`, do nothing
-  useful in a real run, and exist to make something measurable that is
-  otherwise unreachable. See [Diagnostics](docs/configuration.md#diagnostics).
+- **A diagnostic, `RAVEX_ASSUME_NO_NUMPY`.** Not a setting: it has no place
+  in `ravex.yaml` and does nothing useful in a real run — it exists to make
+  something measurable that is otherwise unreachable. See
+  [Diagnostics](docs/configuration.md#diagnostics).
 
-  The first forces the NumPy-free object-gather path, which no ordinary
-  image reaches because they all ship NumPy — without it that code would
-  have shipped having never run on a network. It is *meant* to be set on
-  one machine and not the other: a rank with NumPy and a rank without is
-  what two rented boxes from different images look like.
+  It forces the NumPy-free object-gather path, which no ordinary image
+  reaches because they all ship NumPy — without it that code would have
+  shipped having never run on a network. It is *meant* to be set on one
+  machine and not the other: a rank with NumPy and a rank without is what
+  two rented boxes from different images look like.
 
-  The second adds a `skew` phase: a barrier before the accelerator drain,
-  timed apart, which separates a rank waiting for its own device from a
-  rank waiting for a peer. Measured on two machines: `skew 34.6 s / drain
-  0.000 s` on one rank and `skew 103.8 s / drain 0.000 s` on the other.
+- **The checkpoint handoff always reports `skew` apart from `drain`, on a
+  sharded run with more than one rank.** A barrier now runs before the
+  accelerator drain unconditionally in that case, timed apart, separating a
+  rank waiting for its own device from a rank waiting for a peer.
 
-  **The ranks agree on the second rather than each reading it**, and one
-  rank without it turns the probe off for everybody. A barrier some ranks
-  enter and others do not is two different collectives on one process
-  group — a hang until NCCL gives up. Given that the variable beside it is
-  designed to be set asymmetrically, leaving that to a documented
-  convention would have been a trap rather than an instruction. It costs
-  one collective at the first checkpoint of a run and none after.
+  This was `RAVEX_SPLIT_DRAIN`, an opt-in diagnostic added earlier in this
+  same release. It has been promoted to the normal path rather than kept
+  behind a flag, because what it measured on two machines settled the
+  question it was written to ask: `skew 34.6 s / drain 0.000 s` on one rank
+  and `skew 103.8 s / drain 0.000 s` on the other — all of what used to be
+  called `drain`, and excluded from the reported cost on the theory that it
+  was queued compute, was in fact a rank waiting on a peer that was late
+  because *it* was checkpointing. See GPU-98.
+
+  `drain` keeps its exclusion — genuine queued device work still is not a
+  cost of checkpointing. `skew` does not: it is counted like every other
+  phase, which means the cadence warning (`checkpoint_every=... is costing
+  N% of wall time`) can now fire on a run where it previously stayed quiet,
+  because time that was always being spent is no longer hidden under a name
+  that excluded it. That is the point of the change, not a side effect of
+  it.
+
+  The guard is `sharded and get_world_size() > 1`, computed identically on
+  every rank — the same condition the save's own verdict collective already
+  carries. A replicated (non-sharded) job never reaches the barrier, for the
+  same reason it never reached the diagnostic's version of it: the non-main
+  ranks are gone by then, and a barrier only rank 0 entered is a hang until
+  NCCL gives up. `RAVEX_SPLIT_DRAIN` is no longer read; setting it does
+  nothing.
 - **Python 3.9 and 3.10 are no longer supported.** The floor is 3.11, and the
   CI matrix runs 3.11 through 3.14.
 

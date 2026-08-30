@@ -235,21 +235,51 @@ def test_a_rank_with_nothing_to_write_still_answers_the_verdict(storage, monkeyp
     )
 
     runtime.checkpoint()
-    # Two, in this order, and the count is part of what is being checked.
-    #
-    #   False  the one-off agreement on RAVEX_SPLIT_DRAIN — unset here, so
-    #          nobody barriers. It is posted unconditionally and cached, so it
-    #          costs one collective per run and none per checkpoint after the
-    #          first; a rank that read the variable locally instead would be
-    #          the hang this whole test is about, one level down.
-    #   True   the verdict, which is what the test was written for.
-    #
-    # Asserted as a sequence rather than as `True in asked`: a rank that
-    # entered one collective and skipped the other is exactly the failure
-    # here, and a membership check would not see it.
-    assert asked == [False, True], (
-        "a rank with nothing of its own to write skipped one of the collectives"
+    # One: the verdict, which is what the test was written for. Asserted as a
+    # sequence rather than as `True in asked` so a rank that skipped it
+    # entirely — zero calls rather than one — would also fail this.
+    assert asked == [True], (
+        "a rank with nothing of its own to write skipped the verdict collective"
     )
+
+
+def test_a_sharded_multirank_checkpoint_splits_skew_from_drain_by_default(
+    storage, monkeypatch
+):
+    """GPU-98: `skew` used to require `RAVEX_SPLIT_DRAIN`. It is unconditional
+    now for a sharded run with more than one rank — the diagnostic itself
+    established, on two real machines, that what a single `drain` number was
+    hiding was mostly a rank waiting on a checkpointing peer, not queued
+    device work, so the split no longer needs a flag to opt into.
+    """
+    ravex.activate(backend="torch_save", checkpoint_every=10_000)
+    model, optimizer, loader = make_loop()
+    run_steps(model, optimizer, loader, 1)
+
+    runtime = get_runtime()
+    _as_one_rank_of_eight(monkeypatch, runtime, main=True)
+
+    from ravex import _distributed as distributed_module
+
+    barriers = []
+    monkeypatch.setattr(distributed_module, "barrier", lambda: barriers.append(1))
+    monkeypatch.setattr(runtime_module, "all_ranks_agree", lambda ok: ok)
+
+    seen_phases = []
+    monkeypatch.setattr(
+        runtime,
+        "_warn_if_cadence_is_expensive",
+        lambda step, started, finished, phases: seen_phases.append(phases),
+    )
+
+    assert runtime.checkpoint() is True
+    assert barriers == [1], (
+        "no barrier ran before the drain on a sharded, multi-rank checkpoint"
+    )
+    assert seen_phases and "skew" in seen_phases[0], (
+        "the handoff phases did not include `skew`"
+    )
+    assert "drain" in seen_phases[0]
 
 
 def test_a_replicated_job_posts_no_collective_from_rank_zero_alone(
@@ -263,10 +293,13 @@ def test_a_replicated_job_posts_no_collective_from_rank_zero_alone(
     collective posted there waits for seven ranks that already went home, and
     the job stops at the timeout rather than at an error.
 
-    That is not hypothetical — it is how the `RAVEX_SPLIT_DRAIN` agreement was
-    written the first time, and it turned the CI integration job into a
-    ten-minute wall. Both collectives in the save now carry the same guard;
-    this pins it for the one that is easy to add without.
+    That is not hypothetical — it is how the `RAVEX_SPLIT_DRAIN` diagnostic's
+    agreement was written the first time, and it turned the CI integration job
+    into a ten-minute wall. The skew barrier that diagnostic grew into (see
+    GPU-98) is unconditional now, gated only by `sharded and get_world_size()
+    > 1` — the same guard the verdict below it carries, and for the same
+    reason. This pins both: a replicated job must enter neither the barrier
+    nor the verdict collective from rank 0 alone.
     """
     ravex.activate(backend="torch_save", checkpoint_every=10_000)
     model, optimizer, loader = make_loop()
@@ -278,19 +311,24 @@ def test_a_replicated_job_posts_no_collective_from_rank_zero_alone(
     monkeypatch.setattr(runtime.registry, "has_sharded_models", lambda: False)
     monkeypatch.setattr(runtime_module, "get_world_size", lambda: 8)
     monkeypatch.setattr(runtime_module, "is_main_process", lambda: True)
-    monkeypatch.setenv("RAVEX_SPLIT_DRAIN", "1")
 
     asked = []
     monkeypatch.setattr(
         runtime_module, "all_ranks_agree", lambda ok: (asked.append(ok), ok)[1]
     )
+    from ravex import _distributed as distributed_module
+
+    barriers = []
+    monkeypatch.setattr(distributed_module, "barrier", lambda: barriers.append(1))
 
     runtime.checkpoint()
 
     assert asked == [], (
         "rank 0 posted a collective the other seven ranks had already left before"
     )
-    assert runtime._split_drain is False, "the probe must be off where it cannot run"
+    assert barriers == [], (
+        "rank 0 entered the skew barrier alone on a replicated job"
+    )
 
 
 def test_a_failure_on_another_rank_stops_this_one_too(storage, monkeypatch):

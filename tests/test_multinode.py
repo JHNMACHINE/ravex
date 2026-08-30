@@ -924,52 +924,44 @@ class TestTheObjectGatherOnTwoRanks:
         assert distributed._torch_can_reach_numpy() is True
 
 
-def _split_drain_worker(rank, world_size, port, env_value, out):
+def _drain_split_worker(rank, world_size, port, sharded, out):
     """One rank deciding whether to split `drain`, the way the runtime does."""
     import os
 
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
-    if env_value is None:
-        os.environ.pop("RAVEX_SPLIT_DRAIN", None)
-    else:
-        os.environ["RAVEX_SPLIT_DRAIN"] = env_value
 
     try:
         import torch.distributed as dist
 
-        from ravex._distributed import all_ranks_agree, barrier
-        from ravex._runtime import RavexRuntime
+        from ravex._distributed import all_ranks_agree, barrier, get_world_size
 
         dist.init_process_group("gloo", rank=rank, world_size=world_size)
         try:
-            # The runtime's own decision, not a copy of it — built with
-            # `__new__` to exercise the one method, which is what the class
-            # level defaults in `RavexRuntime` exist for.
-            runtime = RavexRuntime.__new__(RavexRuntime)
-            agreed = runtime._drain_split_agreed(sharded=True)
-            if agreed:
+            # The runtime's own guard, not a copy of it: `sharded and
+            # get_world_size() > 1`, unconditional since GPU-98 — no
+            # environment variable left to read asymmetrically.
+            split = sharded and get_world_size() > 1
+            if split:
                 barrier()
             # A second collective every rank posts. If the ranks had disagreed
             # about the barrier above, this is where the mismatch would show.
             settled = all_ranks_agree(True)
         finally:
             dist.destroy_process_group()
-        out.put((rank, agreed, settled))
+        out.put((rank, split, settled))
     except Exception as exc:  # pragma: no cover - reported, not swallowed
         out.put((rank, None, f"{type(exc).__name__}: {exc}"))
 
 
-def _decide_across_two_ranks(env_by_rank):
+def _decide_drain_split_across_two_ranks(sharded):
     import multiprocessing as mp
 
     ctx = mp.get_context("spawn")
     out = ctx.Queue()
     port = _free_port()
     procs = [
-        ctx.Process(
-            target=_split_drain_worker, args=(rank, 2, port, env_by_rank[rank], out)
-        )
+        ctx.Process(target=_drain_split_worker, args=(rank, 2, port, sharded, out))
         for rank in (0, 1)
     ]
     for p in procs:
@@ -977,8 +969,8 @@ def _decide_across_two_ranks(env_by_rank):
     results = {}
     try:
         for _ in procs:
-            rank, agreed, settled = out.get(timeout=120)
-            results[rank] = (agreed, settled)
+            rank, split, settled = out.get(timeout=120)
+            results[rank] = (split, settled)
     finally:
         for p in procs:
             p.join(timeout=30)
@@ -988,37 +980,41 @@ def _decide_across_two_ranks(env_by_rank):
     return results
 
 
-class TestTheDrainSplitIsAgreedNotRead:
-    """`RAVEX_SPLIT_DRAIN` puts a barrier in the checkpoint path.
+class TestTheDrainSplitGuardMatchesTheVerdict:
+    """The skew barrier (GPU-98) puts a collective in the checkpoint path,
+    gated by `sharded and get_world_size() > 1` — the same guard the
+    checkpoint's own verdict collective carries, and for the same reason: a
+    barrier some ranks enter and others do not is two different collectives
+    posted on one process group, a hang until NCCL gives up rather than an
+    error.
 
-    A barrier some ranks enter and others do not is two different collectives
-    posted on one process group: a hang until NCCL gives up, six hundred
-    seconds later, and then a dead run. So the ranks agree on the flag rather
-    than each reading it — and one rank without it turns the probe off for
-    everybody, which is the safe direction. A diagnostic that does not run
-    costs a measurement; one that hangs costs the run.
-
-    Setting it on one machine and not the other is not a far-fetched mistake:
-    `RAVEX_ASSUME_NO_NUMPY`, the other diagnostic of the same day, is *meant*
-    to be used that way.
+    This used to be `RAVEX_SPLIT_DRAIN`, an opt-in diagnostic agreed on by
+    every rank rather than read locally, because the variable could be set
+    asymmetrically. There is no variable left to set wrong now — the guard
+    comes from `sharded` and `get_world_size()`, which read the same on every
+    rank by construction — but that symmetry is exactly the kind of thing that
+    is easy to believe and wrong to assume: this pins it on two real
+    processes, where `world_size=1` would show nothing and a mock could not
+    be trusted either way.
     """
 
-    def test_both_ranks_asking_for_it_get_it(self):
-        results = _decide_across_two_ranks({0: "1", 1: "1"})
+    def test_both_ranks_split_on_a_sharded_run(self):
+        results = _decide_drain_split_across_two_ranks(sharded=True)
         assert set(results) == {0, 1}, results
-        for rank, (agreed, settled) in results.items():
-            assert agreed is True, f"rank {rank}: {agreed!r}"
+        for rank, (split, settled) in results.items():
+            assert split is True, f"rank {rank}: {split!r}"
             assert settled is True, f"rank {rank} did not reach the end: {settled!r}"
 
-    def test_one_rank_without_it_turns_it_off_for_both(self):
-        """The case that would otherwise hang."""
-        results = _decide_across_two_ranks({0: "1", 1: None})
+    def test_neither_rank_splits_on_a_replicated_run(self):
+        """Not sharded: the guard must keep both ranks out of the barrier,
+        the same way it keeps the non-main ranks of a real replicated job out
+        of the verdict collective (see
+        `test_a_replicated_job_posts_no_collective_from_rank_zero_alone` in
+        `test_patches.py`) — a barrier only rank 0 entered is a hang, not an
+        error, and this is the multi-process pin for that guard.
+        """
+        results = _decide_drain_split_across_two_ranks(sharded=False)
         assert set(results) == {0, 1}, results
-        for rank, (agreed, settled) in results.items():
-            assert agreed is False, f"rank {rank} barriered alone: {agreed!r}"
+        for rank, (split, settled) in results.items():
+            assert split is False, f"rank {rank} barriered alone: {split!r}"
             assert settled is True, f"rank {rank} did not reach the end: {settled!r}"
-
-    def test_nobody_asking_is_off_and_costs_nothing(self):
-        results = _decide_across_two_ranks({0: None, 1: None})
-        assert all(agreed is False for agreed, _ in results.values()), results
-        assert all(settled is True for _, settled in results.values()), results
