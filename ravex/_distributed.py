@@ -86,8 +86,8 @@ def _object_device(dist):
     return torch.device("cpu")
 
 
-def _all_gather_object(dist, value) -> List[Any]:
-    """One picklable value from every rank, in rank order. **Collective.**
+def _all_gather_object(dist, value, group=None) -> List[Any]:
+    """One picklable value from every rank of ``group``, in rank order. **Collective.**
 
     ``dist.all_gather_object`` decodes what it gathered with
     ``tensor.numpy().tobytes()``, so on an install where that conversion is
@@ -100,12 +100,20 @@ def _all_gather_object(dist, value) -> List[Any]:
     The replacement posts the same two ``all_gather`` calls, in the same order
     and with the same shapes and dtypes as torch's own, so a rank that took
     this path and a rank that did not still meet on the wire.
+
+    ``group`` defaults to ``None``, which every call below already treats as
+    "the default group" — so every existing caller, all of which gather on
+    the main training group, is unaffected. It exists so a caller can gather
+    on an isolated group instead (GPU-94's topology channel, built on the
+    same isolated-gloo-subgroup pattern GPU-92 uses for SIGTERM detection,
+    needs to agree on more than a bit — who is joining, at what step — which
+    means gathering objects there rather than reducing one boolean).
     """
-    world = dist.get_world_size()
+    world = dist.get_world_size(group=group)
     if _torch_can_reach_numpy():
         # Pre-sized because `all_gather_object` fills the list in place.
         gathered: List[Any] = [None] * world
-        dist.all_gather_object(gathered, value)
+        dist.all_gather_object(gathered, value, group=group)
         return gathered
 
     import pickle
@@ -118,7 +126,7 @@ def _all_gather_object(dist, value) -> List[Any]:
 
     sizes = torch.zeros(world, dtype=torch.long, device=device)
     length = torch.tensor([payload.numel()], dtype=torch.long, device=device)
-    dist.all_gather([sizes[i].unsqueeze(0) for i in range(world)], length)
+    dist.all_gather([sizes[i].unsqueeze(0) for i in range(world)], length, group=group)
 
     # Every rank sends the same number of bytes, so the short ones are padded
     # and the length gathered above says where each one really ends.
@@ -126,7 +134,7 @@ def _all_gather_object(dist, value) -> List[Any]:
     padded = torch.zeros(widest, dtype=torch.uint8, device=device)
     padded[: payload.numel()] = payload
     chunks = [torch.empty(widest, dtype=torch.uint8, device=device) for _ in range(world)]
-    dist.all_gather(chunks, padded)
+    dist.all_gather(chunks, padded, group=group)
 
     # `bytes(tensor.tolist())` is the NumPy-free spelling of `.numpy().tobytes()`.
     return [
