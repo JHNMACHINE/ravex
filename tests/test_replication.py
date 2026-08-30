@@ -19,6 +19,7 @@ from ravex._replication import (
     REPLICA_DIR,
     StoreWriter,
     encode_store,
+    encoded_size,
     local_recoveries,
     machine_count,
     machine_of,
@@ -157,6 +158,27 @@ def move(source, destination, chunk=64):
     """Stream a store across, one chunk at a time, as the wire would."""
     writer = StoreWriter(str(destination))
     for block in encode_store(str(source), chunk=chunk):
+        writer.feed(block)
+    writer.close()
+    return writer
+
+
+def move_incremental(source, destination, chunk=64):
+    """Stream a store across, skipping what the destination already has.
+
+    What `exchange_stores` does over the wire, done in one process: the
+    destination's own `store_files` stands in for the manifest it would
+    report, the source keeps only the names that match on both name and
+    size, and only those bytes travel.
+    """
+    existing = {relative: size for relative, size in store_files(str(destination))}
+    skip = {
+        relative
+        for relative, size in store_files(str(source))
+        if existing.get(relative) == size
+    }
+    writer = StoreWriter(str(destination))
+    for block in encode_store(str(source), chunk=chunk, skip=skip):
         writer.feed(block)
     writer.close()
     return writer
@@ -361,6 +383,110 @@ class TestAReplicaThatCanBeTrusted:
         writer.close()
 
         assert not replica_is_complete(str(destination))
+
+
+class TestIncrementalTransfer:
+    """GPU-97: a checkpoint's unchanged pack files must not cross the wire twice.
+
+    Safe because moonclip's store files are immutable once written — a name
+    that matches on both ends, at the same size, is the same bytes, with no
+    hash and no content read needed to know it.
+    """
+
+    def test_an_unchanged_file_is_not_resent(self, tmp_path):
+        source = tmp_path / "src"
+        destination = tmp_path / "dst"
+        build_store(source, {"pack.bin": b"p" * 3000, "manifest.json": b"{}"})
+        move(source, destination).commit()
+
+        build_store(source, {"manifest.json": b'{"v": 2}'})
+        full = encoded_size(str(source))
+
+        writer = move_incremental(source, destination)
+
+        assert writer.commit()
+        assert (destination / "pack.bin").read_bytes() == b"p" * 3000
+        assert (destination / "manifest.json").read_bytes() == b'{"v": 2}'
+        # pack.bin's 3000 bytes did not have to travel a second time.
+        assert encoded_size(str(source), skip={"pack.bin"}) < full
+
+    def test_a_name_match_with_a_different_size_still_travels(self, tmp_path):
+        """Immutability is the assumption, not something this code can verify
+        by itself. Matching on size too is the cheap half of the safety net,
+        and this is what it catches: same name, not the same bytes."""
+        source = tmp_path / "src"
+        destination = tmp_path / "dst"
+        build_store(source, {"a.bin": b"x" * 100})
+        move(source, destination).commit()
+
+        (source / "a.bin").write_bytes(b"y" * 250)
+
+        writer = move_incremental(source, destination)
+
+        assert writer.commit()
+        assert (destination / "a.bin").read_bytes() == b"y" * 250
+
+    def test_a_torn_incremental_transfer_is_not_marked(self, tmp_path):
+        """The same guarantee `test_a_torn_copy_is_not_marked` checks for a
+        full transfer, with a skipped file sitting in the same header."""
+        source = tmp_path / "src"
+        destination = tmp_path / "dst"
+        build_store(source, {"old.bin": b"a" * 100, "new.bin": b"b" * 500})
+        move(source, destination).commit()
+
+        build_store(source, {"new.bin": b"c" * 500})
+
+        writer = StoreWriter(str(destination))
+        blocks = list(encode_store(str(source), chunk=64, skip={"old.bin"}))
+        for block in blocks[:-1]:
+            writer.feed(block)
+        writer.close()
+
+        assert not writer.commit()
+        assert not replica_is_complete(str(destination))
+
+    def test_pruning_still_reaches_a_skipped_copy(self, tmp_path):
+        """The same guarantee `test_what_the_source_pruned_is_pruned_in_the_copy`
+        checks for a full transfer: retention drops a step, the incremental
+        copy must drop it too, even though the surviving file was skipped
+        rather than resent."""
+        source = tmp_path / "src"
+        destination = tmp_path / "dst"
+
+        build_store(source, {"step_1.pt": b"1", "step_2.pt": b"2"})
+        move_incremental(source, destination).commit()
+        assert {p.name for p in destination.iterdir()} == {
+            "step_1.pt",
+            "step_2.pt",
+            COMPLETE_MARKER,
+        }
+
+        # Retention drops the oldest; step_2.pt is unchanged and skipped.
+        (source / "step_1.pt").unlink()
+        build_store(source, {"step_3.pt": b"3"})
+        move_incremental(source, destination).commit()
+
+        assert {p.name for p in destination.iterdir()} == {
+            "step_2.pt",
+            "step_3.pt",
+            COMPLETE_MARKER,
+        }
+
+    def test_skip_does_not_disturb_the_agreed_order(self, tmp_path):
+        """The order comes from `store_files` alone; a skip flag must not
+        reshuffle it, or a torn transfer would leave a scatter instead of a
+        prefix."""
+        source = build_store(
+            tmp_path / "src",
+            {"z.bin": b"1" * 10, "a.bin": b"2" * 10, "m/b.bin": b"3" * 10},
+        )
+        expected = [name for name, _ in store_files(str(source))]
+
+        writer = StoreWriter(str(tmp_path / "dst"))
+        header = next(encode_store(str(source), skip={"a.bin", "z.bin"}))
+        writer.feed(header)
+
+        assert [relative for relative, _, _ in writer._entries] == expected
 
 
 class TestWhoSendsWhatBackToWhom:

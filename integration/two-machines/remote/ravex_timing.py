@@ -62,13 +62,37 @@ def install():
 
     _backends.MoonclipBackend.consolidate = consolidate
 
+    # Since GPU-97, `exchange_stores` skips files the peer already has, so
+    # `encoded_size(source)` overstates what actually crosses the wire — it
+    # is the number that used to be true when every round sent the whole
+    # store, and reporting it unchanged here would hide the fix it exists to
+    # measure. `exchange_stores` computes the real figure itself, as
+    # `encoded_size(source, skip=...)`, right before sizing the transfer;
+    # this hooks that same call to read it back rather than recomputing a
+    # skip set this wrapper has no way to reproduce (it does not see what the
+    # peer reported over the wire).
+    original_encoded_size = _replication.encoded_size
+    last_outgoing = {"value": None}
+
+    def encoded_size(path, skip=None):
+        value = original_encoded_size(path, skip=skip)
+        if skip is not None:
+            last_outgoing["value"] = value
+        return value
+
+    _replication.encoded_size = encoded_size
+
     original_exchange = _replication.exchange_stores
 
     def exchange_stores(source, destination, send_to, receive_from, **kwargs):
-        sent = _replication.encoded_size(source) if source else 0
+        last_outgoing["value"] = None
         started = time.perf_counter()
         ok = original_exchange(source, destination, send_to, receive_from, **kwargs)
         seconds = time.perf_counter() - started
+        sent = last_outgoing["value"] or 0
+        # The store's current size on disk, not "bytes pulled this round" —
+        # a skipped file is already there and never crosses the wire, but it
+        # is still part of what this replica now holds.
         received = _replication.encoded_size(destination) if destination else 0
         _sink.write(
             kind="exchange",
