@@ -122,22 +122,64 @@ def store_files(path: str) -> "list[tuple[str, int]]":
     return found
 
 
-def encode_store(path: str, chunk: int = CHUNK):
+#: One byte after each entry in the transfer header: 1 when the peer already
+#: has this file and no bytes for it follow on the wire, 0 when they do. Not
+#: part of the plain manifest exchanged in :func:`exchange_stores` to learn
+#: what a peer already holds — that one is never itself skippable.
+_FLAG = struct.Struct("<B")
+
+
+def _encode_manifest(entries: "list[tuple[str, int]]") -> bytes:
+    """``(name, size)`` pairs as bytes, no flag — what one side already holds."""
+    blob = bytearray(_COUNT.pack(len(entries)))
+    for relative, size in entries:
+        encoded = relative.encode("utf-8")
+        blob += _ENTRY.pack(len(encoded), size) + encoded
+    return bytes(blob)
+
+
+def _parse_manifest(blob: bytes) -> "list[tuple[str, int]]":
+    """The inverse of :func:`_encode_manifest`."""
+    (count,) = _COUNT.unpack_from(blob, 0)
+    offset = _COUNT.size
+    entries = []
+    for _ in range(count):
+        name_len, size = _ENTRY.unpack_from(blob, offset)
+        offset += _ENTRY.size
+        entries.append((blob[offset : offset + name_len].decode("utf-8"), size))
+        offset += name_len
+    return entries
+
+
+def encode_store(path: str, chunk: int = CHUNK, skip: "set[str] | None" = None):
     """Yield a store as a byte stream, reading from disk as it goes.
 
     A generator rather than a buffer, and read file by file rather than
     packed into a temporary archive first: the archive would be a second full
     copy on a disk that is already the binding constraint on these machines —
     the reason ``measure_handoff.sh`` has space guards at all.
+
+    ``skip`` names files whose bytes must not be read or sent — the peer
+    already holds them, byte for byte, and said so before this call. They are
+    still listed in the header, flagged, so the receiver's manifest and
+    pruning stay exactly as complete as a full transfer's; only the body is
+    shorter.
     """
     entries = store_files(path)
     header = bytearray(_COUNT.pack(len(entries)))
     for relative, size in entries:
         encoded = relative.encode("utf-8")
-        header += _ENTRY.pack(len(encoded), size) + encoded
+        already_there = skip is not None and relative in skip
+        header += (
+            _ENTRY.pack(len(encoded), size)
+            + encoded
+            + _FLAG.pack(1 if already_there else 0)
+        )
     yield bytes(header)
 
     for relative, size in entries:
+        if skip is not None and relative in skip:
+            continue
         absolute = os.path.join(path, *relative.split("/"))
         sent = 0
         with open(absolute, "rb") as handle:
@@ -219,10 +261,15 @@ class StoreWriter:
         except OSError:
             pass
         self._pending = bytearray()
-        self._entries: "list[tuple[str, int]] | None" = None
+        self._entries: "list[tuple[str, int, bool]] | None" = None
         self._index = 0
         self._left = 0
         self._handle = None
+        # Set when a file flagged "already here" turns out not to be, on
+        # disk, what the sender was told it was. `complete` must not go true
+        # over that — a wrong local file is exactly as unusable as a missing
+        # one, and the marker's whole job is to not vouch for either.
+        self._broken = False
 
     def feed(self, block) -> None:
         """Take one chunk off the wire. Any object with a buffer will do.
@@ -284,13 +331,32 @@ class StoreWriter:
             offset += _ENTRY.size
             if len(self._pending) < offset + name_len:
                 return False
-            entries.append(
-                (self._pending[offset : offset + name_len].decode("utf-8"), size)
-            )
+            if len(self._pending) < offset + name_len + _FLAG.size:
+                return False
+            relative = self._pending[offset : offset + name_len].decode("utf-8")
             offset += name_len
+            (flag,) = _FLAG.unpack_from(self._pending, offset)
+            offset += _FLAG.size
+            entries.append((relative, size, bool(flag)))
         del self._pending[:offset]
         self._entries = entries
         return True
+
+    def _verify_skip(self, relative: str, size: int) -> None:
+        """A file the sender didn't send because we said we already had it.
+
+        Said moments earlier, in the same synchronous call, by us — but
+        checked again rather than trusted blindly, because a wrong file
+        marked complete is the one failure this whole module exists to rule
+        out.
+        """
+        target = os.path.join(self.path, *relative.split("/"))
+        try:
+            ok = os.path.getsize(target) == size
+        except OSError:
+            ok = False
+        if not ok:
+            self._broken = True
 
     def _write_body(self) -> bool:
         assert self._entries is not None
@@ -298,7 +364,11 @@ class StoreWriter:
             if self._handle is None:
                 if self._index >= len(self._entries):
                     return False
-                relative, size = self._entries[self._index]
+                relative, size, skip = self._entries[self._index]
+                if skip:
+                    self._verify_skip(relative, size)
+                    self._index += 1
+                    continue
                 target = os.path.join(self.path, *relative.split("/"))
                 os.makedirs(os.path.dirname(target) or self.path, exist_ok=True)
                 self._handle = open(target, "wb")
@@ -323,11 +393,12 @@ class StoreWriter:
 
     @property
     def complete(self) -> bool:
-        """Whether every file the header promised has been written whole."""
+        """Whether every file the header promised is present here, whole."""
         return (
             self._entries is not None
             and self._index >= len(self._entries)
             and self._handle is None
+            and not self._broken
         )
 
     def close(self) -> None:
@@ -348,7 +419,7 @@ class StoreWriter:
             return False
 
         assert self._entries is not None
-        wanted = {relative for relative, _ in self._entries}
+        wanted = {relative for relative, _, _ in self._entries}
         for relative, _ in store_files(self.path):
             if relative == COMPLETE_MARKER or relative in wanted:
                 continue
@@ -367,16 +438,21 @@ class StoreWriter:
         return True
 
 
-def encoded_size(path: str) -> int:
+def encoded_size(path: str, skip: "set[str] | None" = None) -> int:
     """Bytes :func:`encode_store` will produce, without producing them.
 
     Needed before the first byte moves: the receiving side allocates buffers
     from this, and both ends have to agree on how many chunks there will be.
+    Must be called with the same ``skip`` the matching :func:`encode_store`
+    call gets, or the two disagree about the stream's length and the chunk
+    count desyncs mid-transfer.
     """
     entries = store_files(path)
     total = _COUNT.size
     for relative, size in entries:
-        total += _ENTRY.size + len(relative.encode("utf-8")) + size
+        total += _ENTRY.size + _FLAG.size + len(relative.encode("utf-8"))
+        if skip is None or relative not in skip:
+            total += size
     return total
 
 
@@ -562,6 +638,15 @@ def exchange_stores(
     was expected. The caller must not read that as the answer for everybody: a
     round is a recovery point only if every rank succeeded, which is a separate
     agreement.
+
+    Before any store bytes move, the receiving side reports what its
+    destination already holds — file names and sizes, nothing read — and the
+    sending side uses that to skip files that would arrive unchanged. Safe on
+    names alone, no hash, because the files a store is made of are immutable
+    once written; see GPU-97. This travels opposite to the size and body
+    exchange further down (the receiver is the one with something to say
+    here, not the sender), so it is its own pair of messages rather than
+    riding along with those.
     """
     import torch
     import torch.distributed as dist
@@ -571,7 +656,43 @@ def exchange_stores(
     if not sending and not receiving:
         return True
 
-    outgoing = encoded_size(source) if sending else 0
+    existing_blob = _encode_manifest(store_files(destination)) if receiving else b""
+    peer_existing: "dict[str, int]" = {}
+    incoming_blob_len = 0
+
+    handle = None
+    if receiving:
+        blob_len = torch.tensor([len(existing_blob)], dtype=torch.int64)
+        handle = dist.isend(blob_len, dst=receive_from, group=group)
+    if sending:
+        blob_len_in = torch.zeros(1, dtype=torch.int64)
+        dist.recv(blob_len_in, src=send_to, group=group)
+        incoming_blob_len = int(blob_len_in[0].item())
+    if handle is not None:
+        handle.wait()
+
+    handle = None
+    if receiving and existing_blob:
+        blob_tensor = _wire_tensor(existing_blob)
+        handle = dist.isend(blob_tensor, dst=receive_from, group=group)
+    if sending and incoming_blob_len:
+        blob_buffer = torch.empty(incoming_blob_len, dtype=torch.uint8)
+        dist.recv(blob_buffer, src=send_to, group=group)
+        peer_existing = dict(_parse_manifest(blob_buffer.numpy().tobytes()))
+    if handle is not None:
+        handle.wait()
+
+    skip_names = (
+        {
+            relative
+            for relative, size in store_files(source)
+            if peer_existing.get(relative) == size
+        }
+        if sending
+        else set()
+    )
+
+    outgoing = encoded_size(source, skip=skip_names) if sending else 0
     incoming = 0
 
     # Sizes first, so the receiver allocates before anything large moves.
@@ -588,7 +709,11 @@ def exchange_stores(
     if handle is not None:
         handle.wait()
 
-    mine = fixed_chunks(encode_store(source, chunk=chunk), chunk) if sending else None
+    mine = (
+        fixed_chunks(encode_store(source, chunk=chunk, skip=skip_names), chunk)
+        if sending
+        else None
+    )
     writer = StoreWriter(destination) if receiving else None
 
     my_chunks = -(-outgoing // chunk) if outgoing else 0

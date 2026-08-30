@@ -114,12 +114,52 @@ def time_exchange(source, destination, peer, chunk):
 
 
 def time_phases(source, destination, peer, chunk, report):
-    """`exchange_stores`, step by step. See the note at the top of the file."""
+    """`exchange_stores`, step by step. See the note at the top of the file.
+
+    Destination is emptied before every round (see `time_exchange`), so the
+    manifest round trip below never finds anything to skip — this arm is
+    still the right place to see what that round trip costs on its own, as
+    the fixed floor GPU-97's fix adds to every replication, not to see the
+    incremental win, which needs a destination that already holds a copy.
+    """
     shutil.rmtree(destination, ignore_errors=True)
-    outgoing = encoded_size(source)
+    existing_blob = _replication._encode_manifest(_replication.store_files(destination))
 
     dist.barrier()
     started = time.perf_counter()
+
+    spent = {
+        "manifest": 0.0, "read": 0.0, "isend": 0.0, "recv": 0.0,
+        "write": 0.0, "wait": 0.0,
+    }
+
+    mark = time.perf_counter()
+    blob_len = torch.tensor([len(existing_blob)], dtype=torch.int64)
+    handle = dist.isend(blob_len, dst=peer)
+    blob_len_in = torch.zeros(1, dtype=torch.int64)
+    dist.recv(blob_len_in, src=peer)
+    incoming_blob_len = int(blob_len_in[0].item())
+    handle.wait()
+
+    handle = None
+    if existing_blob:
+        blob_tensor = _replication._wire_tensor(existing_blob)
+        handle = dist.isend(blob_tensor, dst=peer)
+    peer_existing = {}
+    if incoming_blob_len:
+        blob_buffer = torch.empty(incoming_blob_len, dtype=torch.uint8)
+        dist.recv(blob_buffer, src=peer)
+        peer_existing = dict(_replication._parse_manifest(blob_buffer.numpy().tobytes()))
+    if handle is not None:
+        handle.wait()
+    spent["manifest"] = time.perf_counter() - mark
+
+    skip = {
+        relative
+        for relative, size in _replication.store_files(source)
+        if peer_existing.get(relative) == size
+    }
+    outgoing = encoded_size(source, skip=skip)
 
     size = torch.tensor([outgoing], dtype=torch.int64)
     handle = dist.isend(size, dst=peer)
@@ -128,12 +168,10 @@ def time_phases(source, destination, peer, chunk, report):
     incoming = int(size_in[0].item())
     handle.wait()
 
-    mine = fixed_chunks(encode_store(source, chunk=chunk), chunk)
+    mine = fixed_chunks(encode_store(source, chunk=chunk, skip=skip), chunk)
     writer = StoreWriter(destination)
     my_chunks = -(-outgoing // chunk)
     their_chunks = -(-incoming // chunk)
-
-    spent = {"read": 0.0, "isend": 0.0, "recv": 0.0, "write": 0.0, "wait": 0.0}
 
     for index in range(max(my_chunks, their_chunks)):
         handle = None

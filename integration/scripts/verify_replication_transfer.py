@@ -7,6 +7,11 @@ the framing. This covers the thing that unit test cannot: `exchange_stores`
 between two processes, with sizes agreed on the wire, chunks arriving in the
 order the sender posted them, and the completeness marker written at the end.
 
+A second round follows the first, changing only one file: real processes are
+what can catch the GPU-97 manifest round trip disagreeing with itself between
+two live ranks in a way an in-process unit test, which only ever plays both
+ends of the wire with the same Python objects, could not surface.
+
 The store is built to be awkward on purpose. Since 2026-08-21 the receiving
 side writes straight from the wire's memory whenever nothing is half-parsed,
 and falls back to buffering for headers and file boundaries — so the cases
@@ -80,6 +85,27 @@ def tree_digest(root):
     return entries
 
 
+def run_round(source, destination, peer, expected, label, problems, report):
+    dist.barrier()
+    ok = exchange_stores(source, destination, peer, peer, chunk=CHUNK)
+    got = tree_digest(destination)
+    marker = os.path.exists(os.path.join(destination, COMPLETE_MARKER))
+
+    if not ok:
+        problems.append(f"{label}: exchange_stores reported an incomplete arrival")
+    if not marker:
+        problems.append(f"{label}: {COMPLETE_MARKER} is missing")
+    for name in sorted(set(expected) | set(got)):
+        if expected.get(name) != got.get(name):
+            problems.append(
+                f"{label} {name}: expected {expected.get(name, '<absent>')[:12]}, "
+                f"got {got.get(name, '<absent>')[:12]}"
+            )
+
+    if report and not problems:
+        print(f"  ok    {label}: {len(got)} files, byte for byte, marker written")
+
+
 def child():
     dist.init_process_group("gloo")
     rank = dist.get_rank()
@@ -89,36 +115,28 @@ def child():
     root = tempfile.mkdtemp(prefix=f"ravex-verify-{rank}-")
     source = os.path.join(root, "store")
     build_awkward_store(source, CHUNK)
-    expected = tree_digest(source)
     destination = os.path.join(root, "copy")
 
     if report:
-        print(f"\n  {len(expected)} files, {encoded_size(source)} encoded bytes, "
-              f"{CHUNK // 1024} KiB chunks")
-
-    dist.barrier()
-    ok = exchange_stores(source, destination, peer, peer, chunk=CHUNK)
-    got = tree_digest(destination)
-    marker = os.path.exists(os.path.join(destination, COMPLETE_MARKER))
+        print(f"\n  {len(tree_digest(source))} files, {encoded_size(source)} encoded "
+              f"bytes, {CHUNK // 1024} KiB chunks")
 
     problems = []
-    if not ok:
-        problems.append("exchange_stores reported an incomplete arrival")
-    if not marker:
-        problems.append(f"{COMPLETE_MARKER} is missing")
-    for name in sorted(set(expected) | set(got)):
-        if expected.get(name) != got.get(name):
-            problems.append(
-                f"{name}: expected {expected.get(name, '<absent>')[:12]}, "
-                f"got {got.get(name, '<absent>')[:12]}"
-            )
+    run_round(source, destination, peer, tree_digest(source), "first", problems, report)
 
-    if report:
-        if problems:
-            for problem in problems:
-                print(f"  FAIL  {problem}")
-        else:
-            print(f"  ok    {len(got)} files, byte for byte, marker written")
+    # A second round, changing one file. GPU-97's manifest round trip has to
+    # agree between two live ranks on which files it may skip; an in-process
+    # unit test plays both ends with the same Python objects and cannot catch
+    # the two disagreeing about what is actually on each rank's disk.
+    changed = os.path.join(source, "small.bin")
+    with open(changed, "wb") as handle:
+        handle.write(hashlib.sha256(b"round-two").digest() * 64)
+
+    run_round(source, destination, peer, tree_digest(source), "second", problems, report)
+
+    if report and problems:
+        for problem in problems:
+            print(f"  FAIL  {problem}")
 
     dist.barrier()
     dist.destroy_process_group()
