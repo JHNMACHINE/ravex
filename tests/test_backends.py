@@ -120,16 +120,49 @@ def test_the_handoff_says_which_phase_it_spent_its_time_in(tmp_path):
 
 @pytest.mark.skipif(not HAVE_MOONCLIP, reason="moonclip not installed")
 def test_the_moonclip_handoff_separates_flattening_from_storing(tmp_path):
-    """The two halves answer different questions: `flatten` is Python walking
-    the state tree, `store` is the shadow copy plus any writer still draining."""
+    """Each phase answers a different question: `flatten` is Python walking the
+    state tree, `store` is the shadow copy, `backpressure` is the wait for the
+    previous checkpoint's writer to get out of the way."""
     from ravex._backends import MoonclipBackend
 
     backend = MoonclipBackend(make_config(tmp_path, backend="moonclip"))
     phases = backend.save(1, sample_state(1), {"step": "1"})
     backend.close()
 
-    assert list(phases) == ["flatten", "store"]
+    assert list(phases) == ["flatten", "store", "backpressure"]
     assert all(seconds >= 0 for seconds in phases.values())
+
+
+@pytest.mark.skipif(not HAVE_MOONCLIP, reason="moonclip not installed")
+def test_waiting_for_the_previous_writer_is_not_charged_to_the_copy(tmp_path):
+    """GPU-61. The shadow copy and the wait for the previous writer were one
+    number, and the sum reads like the writer: watching `store` grow is what
+    opened GPU-55 against a writer in deficit, when the phase was a memcpy all
+    along. Charged to `store`, the wait makes the copy look slow; named, it
+    points at the cadence and the storage, which is where it comes from.
+
+    The second save is the one that can wait — the first has nothing in front
+    of it — so this saves twice with nothing draining in between.
+    """
+    from ravex._backends import MoonclipBackend
+
+    backend = MoonclipBackend(make_config(tmp_path, backend="moonclip"))
+    try:
+        first = backend.save(1, sample_state(1), {"step": "1"})
+        second = backend.save(2, sample_state(2), {"step": "2"})
+    finally:
+        backend.close()
+
+    # Nothing was in flight before the first one, so it waited for nobody.
+    # Not asserted as exactly zero: the clock starts before the lock is taken,
+    # so an uncontended submit still reports the hundred nanoseconds it took to
+    # find that out. What matters is that it is nothing, and at three decimal
+    # places in the log line it prints as nothing.
+    assert first["backpressure"] < 0.001
+    assert second["backpressure"] >= 0.0
+    # Whatever the wait was, it is not sitting inside the copy as well. The
+    # phases still account for the call: `store` is what is left of it.
+    assert second["store"] >= 0.0
 
 
 # ─── per-rank stores ────────────────────────────────────────────────

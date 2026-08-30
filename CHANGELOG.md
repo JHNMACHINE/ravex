@@ -84,7 +84,61 @@
   point and wanted only the first half. Until 0.0.9 the first half had no
   public name, so taking it meant taking the second as well.
 
+- **The checkpoint handoff reports `backpressure` apart from `store`.** They
+  were one number, and the sum reads like the writer.
+
+  `store` is the shadow copy — the reason the training loop can carry on
+  mutating weights while the writer is still working. It is memory bandwidth,
+  it scales with the model, and it comes down by making the state smaller.
+  `backpressure` is the wait for the *previous* checkpoint's writer: Moonclip
+  allows one save in flight, so a writer that has not drained stops the next
+  save before any of its work starts. It scales with the cadence and with the
+  storage, and it comes down by checkpointing less often or writing somewhere
+  faster.
+
+  Added together they name neither. Watching the combined figure grow is what
+  produced a hypothesis about a writer in deficit, several A/B runs, and an
+  issue filed against the writer — while the phase was a 2 GiB `memcpy` for
+  the whole of it. On a 1.5B model at cadence 2 the wait was 4-12% of what the
+  single number showed.
+
+  Now, on a run whose writer is genuinely behind, the log line says which:
+
+  ```
+  step 2: flatten 0.001s, store 0.101s, backpressure 1.655s
+  ```
+
+  where before it said `store 1.756s` and left the reader to guess. Needs
+  Moonclip 0.0.9, whose `last_queue_wait()` is where the number comes from —
+  it existed before, but only as a line `MOONCLIP_PROFILE=1` printed to
+  stderr, which is not somewhere a program can read it. The cadence alarm
+  counts the new phase like every other one: it is wall time the training loop
+  pays, and it was already in the total.
+
 ### Fixed
+
+- **A store recovered over the network stayed marked as a copy.** A rank that
+  came up without its own store and took one back from a peer was left holding
+  `.ravex-replica-ok` in its own store directory. Promoting a copy off this
+  machine's own disk removed it; the two roads home ended differently.
+
+  The cause is that `StoreWriter` writes the marker into whatever directory it
+  filled, which is right — from where it stands it is always building a copy,
+  and while the bytes are arriving the absence of that file is the only thing
+  separating a half-built store from a whole one. What was missing is the
+  other end of the same act: `promote_copy` removes it deliberately once the
+  store is whole, and the network path did not.
+
+  No known consequence today — `replica_is_complete()` is asked about replica
+  paths, not about a rank's own store, so nothing read the file where it
+  should not have been. It is worth correcting because the claim goes false
+  immediately: it says a copy is complete about a directory that is, from the
+  next save onward, a live store being rewritten. True for one instant and
+  left where a later reader would believe it.
+
+  Found on the first pair of real machines this project has run on (two RunPod
+  pods, 2026-08-21). Nothing compared the two paths, which is why a divergence
+  this small reached rented hardware; a test now holds them side by side.
 
 - **A shard rebuilt on an older torch could come back with a global shape
   nobody asked for.** `DTensor.from_local` is given `shape=`/`stride=` so

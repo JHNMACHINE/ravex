@@ -169,6 +169,33 @@ def replica_is_complete(path: str) -> bool:
     return os.path.exists(os.path.join(path, COMPLETE_MARKER))
 
 
+def unmark_replica(path: str) -> None:
+    """Drop the marker from a directory that has stopped being a copy.
+
+    Both promotions end here: the one that rebuilds a store from a copy on
+    this machine's own disk, and the one that takes it back off a peer. They
+    used to end differently — :func:`promote_copy` removed the marker and the
+    network path left it — because the code that writes it, `StoreWriter`, is
+    building a copy as far as it knows and cannot tell the two destinations
+    apart. The same logical act left two different states on disk depending on
+    which way the bytes travelled, which is the sort of difference that
+    survives until someone rents a machine and looks.
+
+    What the marker asserts is that a *copy* is whole. About a store the rank
+    is about to start rewriting, that is true for one instant and false ever
+    after, and it is left exactly where a later reader — code or person — would
+    take it at its word.
+
+    Removed after the store is whole and never before. While the transfer is
+    still running, the absence of this file is the only thing separating a
+    half-built store from a finished one.
+    """
+    try:
+        os.remove(os.path.join(path, COMPLETE_MARKER))
+    except OSError:
+        pass
+
+
 class StoreWriter:
     """Turns the stream back into files, writing as the bytes arrive.
 
@@ -464,10 +491,11 @@ def promote_copy(copy_path: str, store_path: str) -> bool:
     that looks like a store and is not — ``rank_<n>`` is what everything
     scans for, and a leading dot is not.
 
-    The completeness marker stays behind. It says something true about a copy,
-    and what is being built here is not one. The owner record does come across:
-    it is what lets the resume recognise which history it is continuing, and
-    dropping it would undo the check that allowed this promotion.
+    The completeness marker stays behind — see :func:`unmark_replica`, which
+    the recovery over the network calls for the same reason. The owner record
+    does come across: it is what lets the resume recognise which history it is
+    continuing, and dropping it would undo the check that allowed this
+    promotion.
     """
     if not replica_is_complete(copy_path):
         return False
@@ -480,9 +508,7 @@ def promote_copy(copy_path: str, store_path: str) -> bool:
         os.makedirs(parent, exist_ok=True)
         shutil.copytree(copy_path, staging)
 
-        marker = os.path.join(staging, COMPLETE_MARKER)
-        if os.path.exists(marker):
-            os.remove(marker)
+        unmark_replica(staging)
 
         # The caller only gets here when this rank has no usable store, so what
         # is being removed is a missing or empty directory — and `rename` onto

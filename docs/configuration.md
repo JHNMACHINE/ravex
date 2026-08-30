@@ -186,7 +186,15 @@ the wrong conclusion; that mistake is what
 [GPU-54](https://linear.app/gpuzero/issue/GPU-54) cost.
 
 The phases that *are* the handoff are `collect` (building the state dict, a
-collective on a sharded model) and `store` (handing it to the backend).
+collective on a sharded model), `store` (the shadow copy the backend takes so
+the loop can carry on mutating weights), and `backpressure` (waiting for the
+*previous* checkpoint's writer, which allows one write in flight).
+
+`store` and `backpressure` are reported apart because they answer to different
+things: `store` is memory bandwidth and grows with the model, `backpressure`
+grows with the cadence and with the speed of the storage. A large
+`backpressure` means checkpoint less often or write somewhere faster; a large
+`store` means the state is big, and no cadence will change it.
 
 ### Storage
 

@@ -770,6 +770,155 @@ class TestPromotingACopy:
         assert os.path.exists(os.path.join(store, "manifest.json"))
 
 
+class TestBothRoadsHomeLeaveTheSameThing:
+    """GPU-85: a store recovered over the wire stayed marked as a copy.
+
+    Two ways exist for a rank to get its store back — promote a copy off this
+    machine's own disk, or take one back from a peer — and until this test
+    nothing compared them. `StoreWriter.commit` writes the completeness marker
+    into whatever directory it filled, because from where it stands it is
+    always building a copy; `promote_copy` removes it deliberately. So the
+    local road ended clean and the network road ended with a file claiming a
+    live store was a finished copy: true for one instant, false from the first
+    save onward, and left where a later reader would believe it.
+
+    Found on the first pair of real machines (two RunPod pods, 2026-08-21),
+    which is what a divergence costs when no test holds the two side by side.
+    """
+
+    def runtime(self, config):
+        from ravex._runtime import RavexRuntime
+
+        runtime = RavexRuntime.__new__(RavexRuntime)
+        runtime.config = config
+        runtime._backend = None
+        runtime._resume_manager = None
+        runtime._storage_split = True
+        runtime._byte_transport_ok = True
+        runtime._byte_group = None
+        runtime._per_rank_active = lambda: True
+        runtime._ensure_backend = lambda: True
+        return runtime
+
+    def a_peer_sends_the_store_back(self, monkeypatch, tmp_path, rank=0, world=6):
+        """Drive the recovery down the network road and hand back the store.
+
+        The stand-in for `exchange_stores` does what the real one does to the
+        destination directory and nothing else: it fills it through
+        `StoreWriter`, which is the code that writes the marker. Patching the
+        marker away here instead would test the mock.
+        """
+        import ravex._distributed as distributed
+        import ravex._replication as replication
+        import ravex._runtime as runtime_module
+        from ravex._replication import StoreWriter, encode_store
+
+        source = a_store(tmp_path / "elsewhere", rank, "run-a")
+
+        def hand_it_over(src, destination, *args, **kwargs):
+            assert destination is not None, "this rank was supposed to receive"
+            writer = StoreWriter(destination)
+            for block in encode_store(source):
+                writer.feed(block)
+            writer.close()
+            return writer.commit()
+
+        monkeypatch.setattr(runtime_module, "get_rank", lambda: rank)
+        monkeypatch.setattr(runtime_module, "get_world_size", lambda: world)
+        monkeypatch.setattr(distributed, "local_world_size", lambda: 1)
+        monkeypatch.setattr(replication, "exchange_stores", hand_it_over)
+
+        # This rank lost its machine and has no copy of itself on this disk, so
+        # the local promotion cannot fire. Every peer is whole and holding the
+        # copy the ring gave it, which is what makes one of them able to send.
+        def gather(value):
+            mine = (True, True, False, None, None)
+            theirs = (False, True, False, None, "run-a")
+            return [mine if r == rank else theirs for r in range(world)]
+
+        monkeypatch.setattr(distributed, "gather_objects", gather)
+
+        runtime = self.runtime(local_config(tmp_path))
+        runtime._recover_missing_stores()
+        return os.path.join(str(tmp_path), "rank_%d" % rank)
+
+    def test_the_store_arrives(self, tmp_path, monkeypatch):
+        """The recovery itself works, and did before this fix. Asserted so a
+        later failure here is not mistaken for the marker regressing."""
+        store = self.a_peer_sends_the_store_back(monkeypatch, tmp_path)
+
+        assert os.path.exists(os.path.join(store, "manifest.json"))
+
+    def test_what_came_over_the_wire_is_not_left_marked_as_a_copy(
+        self, tmp_path, monkeypatch
+    ):
+        store = self.a_peer_sends_the_store_back(monkeypatch, tmp_path)
+
+        assert not os.path.exists(os.path.join(store, COMPLETE_MARKER))
+
+    def test_the_two_roads_end_the_same_way(self, tmp_path, monkeypatch):
+        """The point of the issue, said as one assertion.
+
+        Same logical act, two transports, and the directory left behind should
+        not be able to say which one was taken.
+        """
+        over_the_wire = self.a_peer_sends_the_store_back(monkeypatch, tmp_path)
+
+        off_the_disk = os.path.join(str(tmp_path), "local", "rank_0")
+        promote_copy(a_complete_copy(tmp_path / "local", 0, "run-a"), off_the_disk)
+
+        def marked(path):
+            return os.path.exists(os.path.join(path, COMPLETE_MARKER))
+
+        assert marked(over_the_wire) == marked(off_the_disk)
+
+    def test_the_marker_is_gone_only_once_the_store_is_whole(
+        self, tmp_path, monkeypatch
+    ):
+        """It is not dead weight during the transfer, and must not be dropped
+        early: while the bytes are still arriving, its absence is the only
+        thing separating a half-built store from a finished one. A transfer
+        that fails leaves the directory unmarked, which is what says so."""
+        import ravex._distributed as distributed
+        import ravex._replication as replication
+        import ravex._runtime as runtime_module
+        from ravex._replication import StoreWriter, encode_store
+
+        source = a_store(tmp_path / "elsewhere", 0, "run-a")
+        seen = []
+
+        def cut_off_half_way(src, destination, *args, **kwargs):
+            writer = StoreWriter(destination)
+            for block in encode_store(source):
+                seen.append(os.path.exists(os.path.join(destination, COMPLETE_MARKER)))
+                writer.feed(block)
+                break
+            writer.close()
+            return False
+
+        monkeypatch.setattr(runtime_module, "get_rank", lambda: 0)
+        monkeypatch.setattr(runtime_module, "get_world_size", lambda: 6)
+        monkeypatch.setattr(distributed, "local_world_size", lambda: 1)
+        monkeypatch.setattr(replication, "exchange_stores", cut_off_half_way)
+        monkeypatch.setattr(
+            distributed,
+            "gather_objects",
+            lambda value: [
+                (True, True, False, None, None)
+                if r == 0
+                else (False, True, False, None, "run-a")
+                for r in range(6)
+            ],
+        )
+
+        runtime = self.runtime(local_config(tmp_path))
+        runtime._recover_missing_stores()
+
+        store = os.path.join(str(tmp_path), "rank_0")
+        assert seen and not any(seen), "the marker was standing during the transfer"
+        assert not os.path.exists(os.path.join(store, COMPLETE_MARKER))
+
+
 class TestTheRuntimeRebuildsFromItsOwnDisk:
     """The wiring, which is where GPU-79 actually lived.
 

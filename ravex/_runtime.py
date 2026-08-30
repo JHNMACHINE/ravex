@@ -709,6 +709,7 @@ class RavexRuntime:
             recovery_roles,
             replica_is_complete,
             replication_ring,
+            unmark_replica,
         )
 
         if not self._storage_split or not self._per_rank_active():
@@ -799,6 +800,12 @@ class RavexRuntime:
             return
 
         if do_receive and ok:
+            # The copy has come home, so this directory is now this rank's own
+            # store and not a copy of anybody's. `StoreWriter` marked it whole
+            # on the way in, which was the right thing to do while the bytes
+            # were still arriving and the wrong thing to leave behind. Removing
+            # it here is what `promote_copy` does at the end of the local road.
+            unmark_replica(own)
             logger.info(
                 "This rank had no store of its own and took one back from rank "
                 "%d, where a copy had been kept.",

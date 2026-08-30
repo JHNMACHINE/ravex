@@ -189,14 +189,27 @@ That wall time is time the loop is stopped, so the log line for each checkpoint
 carries the breakdown rather than only the total — the shape of it being:
 
 ```
-Checkpoint at step 240 handed off in 0.412s (collect 0.031s, flatten 0.220s, store 0.161s)
+Checkpoint at step 240 handed off in 0.412s (collect 0.031s, flatten 0.220s, store 0.161s, backpressure 0.000s)
 ```
 
-`collect` is gathering the state, `flatten` the walk through the state tree, and
-`store` the shadow copy — plus, if the previous checkpoint's writer has not
-drained, however long that took: Moonclip allows one write in flight. Setting
-`MOONCLIP_PROFILE=1` separates those two. The `torch_save` backend reports `copy`
-and `queue` instead, which is the same split.
+`collect` is gathering the state, `flatten` the walk through the state tree,
+`store` the shadow copy, and `backpressure` the wait for the *previous*
+checkpoint's writer — Moonclip allows one write in flight, so a writer that has
+not drained stops the next save before it does anything.
+
+The last two are worth keeping apart, and were one number until 0.0.5. They
+move for unrelated reasons: `store` is memory bandwidth and grows with the
+model, `backpressure` grows with the cadence and with how fast the storage is.
+Summed, a large figure names neither, and the natural reading of it — that the
+copy is slow — is wrong precisely when the writer is the problem:
+
+```
+Checkpoint at step 2 handed off in 1.757s (flatten 0.001s, store 0.101s, backpressure 1.655s)
+```
+
+The copy took 101 ms. Everything else was waiting for the previous checkpoint,
+which says: checkpoint less often, or write somewhere faster. The `torch_save`
+backend reports `copy` and `queue`, which is the same distinction.
 
 ## Distributed
 

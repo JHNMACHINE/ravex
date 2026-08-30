@@ -19,11 +19,15 @@ is the whole point: it lets the training loop mutate the live tensors while the
 writer is still working, without the writer reading half-updated weights.
 
 ``save`` reports how long each phase of that handoff took, and the runtime puts
-those numbers in its per-checkpoint log line. On 8× RTX 5060 Ti the handoff came
-out at 10.6 s against 1.5 s of state collection, and three A/B runs against the
-suspects — thread count, compression level, checkpoint cadence — each moved it
-by under a second. Guessing has a poor record here; the breakdown is cheap
-enough to always be on.
+those numbers in its per-checkpoint log line. Each phase is meant to have one
+cause and one lever: where a single number covered two of them it has been
+split, which is why the wait for the previous writer is reported apart from the
+copy that precedes it rather than added to it.
+
+On 8× RTX 5060 Ti the handoff came out at 10.6 s against 1.5 s of state
+collection, and three A/B runs against the suspects — thread count, compression
+level, checkpoint cadence — each moved it by under a second. Guessing has a poor
+record here; the breakdown is cheap enough to always be on.
 """
 
 from __future__ import annotations
@@ -55,6 +59,11 @@ class CheckpointBackend(ABC):
         *where* a slow handoff went instead of only how long it took — the
         difference between a number that ends an investigation and one that
         starts another.
+
+        A phase is worth reporting separately when it has a cause of its own.
+        Two costs with different causes summed into one name is the shape of a
+        wrong investigation: the number moves, and the reason it moved is not
+        in the log.
         """
 
     @abstractmethod
@@ -199,14 +208,34 @@ class MoonclipBackend(CheckpointBackend):
         tensors, _ = self._moonclip.flatten_state_dict(state, _PREFIX, as_tensors=True)
         flattened = time.perf_counter()
         self._manager.save_tensors(step=step, tensors=tensors, metadata=metadata)
-        # `store` is not the write: that runs in the background. It is the
-        # shadow copy, plus however long the previous checkpoint's writer still
-        # needed — Moonclip allows one save in flight, so a writer that has not
-        # drained is backpressure landing on this line. `MOONCLIP_PROFILE=1`
-        # separates the two.
+        inside_save = time.perf_counter() - flattened
+
+        # Neither of these is the write — that runs in the background. They are
+        # the two things the calling thread pays for before it gets back:
+        #
+        # `store`, the shadow copy, without which the writer would be reading
+        # memory the next step is about to overwrite. Memory bandwidth; it
+        # scales with the model and comes down by making the state smaller.
+        #
+        # `backpressure`, the wait for the previous checkpoint's writer.
+        # Moonclip allows one save in flight, so a writer that has not drained
+        # stops this line before any work starts. It scales with the cadence
+        # and with the storage, and comes down by checkpointing less often or
+        # writing somewhere faster.
+        #
+        # They were one number until GPU-61, and the sum reads like the writer:
+        # watching `store` grow is what opened GPU-55 against a writer in
+        # deficit, when the phase was a 2 GiB memcpy the whole time. Measured
+        # on 2026-08-18 the wait was 4-12% of it.
+        #
+        # `max` because the two are read off different clocks — Moonclip's
+        # `Instant` against `perf_counter` here — and a phase reported as
+        # slightly negative would be a worse lie than a rounding error.
+        waited = self._manager.last_queue_wait()
         return {
             "flatten": flattened - started,
-            "store": time.perf_counter() - flattened,
+            "store": max(inside_save - waited, 0.0),
+            "backpressure": waited,
         }
 
     def _rebuild(self, raw) -> Optional[Dict[str, Any]]:
