@@ -181,7 +181,7 @@ class RavexRuntime:
             logger.error("Activation failed: %s", exc, exc_info=True)
             self._disable("activation failed")
 
-    def _drain_split_agreed(self) -> bool:
+    def _drain_split_agreed(self, sharded: bool) -> bool:
         """Whether every rank asked for `RAVEX_SPLIT_DRAIN`. **Collective, once.**
 
         The diagnostic it gates puts a `barrier()` in the checkpoint path, and
@@ -205,8 +205,25 @@ class RavexRuntime:
         early `return`, which is what makes every rank reach it.
         """
         if self._split_drain is None:
-            self._split_drain = all_ranks_agree(
-                os.environ.get("RAVEX_SPLIT_DRAIN", "") not in ("", "0", "false")
+            # `sharded and world > 1` is the condition under which *every*
+            # rank reaches this line — the same guard the verdict at the end
+            # of the save carries, and for the same reason. Without it, a
+            # replicated (non-sharded) job sends rank 0 alone into a gather
+            # the others left before, at the early `return` above: a hang
+            # until the collective times out, which is the failure this whole
+            # function was written to avoid, reintroduced by the machinery
+            # meant to avoid it.
+            #
+            # Python short-circuits, so the gather is posted only where it is
+            # safe to post it. Anywhere else the probe is simply off: on one
+            # rank there is no peer to be skewed from and nothing to measure,
+            # and on a replicated job the barrier would have no one to meet.
+            self._split_drain = (
+                sharded
+                and get_world_size() > 1
+                and all_ranks_agree(
+                    os.environ.get("RAVEX_SPLIT_DRAIN", "") not in ("", "0", "false")
+                )
             )
         return self._split_drain
 
@@ -562,7 +579,7 @@ class RavexRuntime:
         # is what turns the probe on. One rank without the variable turns it
         # off for everybody, which is the safe direction: a diagnostic that
         # does not run costs a measurement, one that hangs costs the run.
-        if self._drain_split_agreed():
+        if self._drain_split_agreed(sharded):
             from ravex._distributed import barrier
 
             barrier()

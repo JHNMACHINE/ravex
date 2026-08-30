@@ -252,6 +252,47 @@ def test_a_rank_with_nothing_to_write_still_answers_the_verdict(storage, monkeyp
     )
 
 
+def test_a_replicated_job_posts_no_collective_from_rank_zero_alone(
+    storage, monkeypatch
+):
+    """The gather layout sends only rank 0 past the guard above.
+
+    Every rank of a *sharded* run reaches the collectives in the save, which
+    is what makes them safe. A replicated run is the opposite: the non-main
+    ranks leave at the early `return`, and rank 0 is alone from there on. A
+    collective posted there waits for seven ranks that already went home, and
+    the job stops at the timeout rather than at an error.
+
+    That is not hypothetical — it is how the `RAVEX_SPLIT_DRAIN` agreement was
+    written the first time, and it turned the CI integration job into a
+    ten-minute wall. Both collectives in the save now carry the same guard;
+    this pins it for the one that is easy to add without.
+    """
+    ravex.activate(backend="torch_save", checkpoint_every=10_000)
+    model, optimizer, loader = make_loop()
+    run_steps(model, optimizer, loader, 1)
+
+    runtime = get_runtime()
+    # Replicated, not sharded: eight ranks, and this is the only one that gets
+    # past the guard.
+    monkeypatch.setattr(runtime.registry, "has_sharded_models", lambda: False)
+    monkeypatch.setattr(runtime_module, "get_world_size", lambda: 8)
+    monkeypatch.setattr(runtime_module, "is_main_process", lambda: True)
+    monkeypatch.setenv("RAVEX_SPLIT_DRAIN", "1")
+
+    asked = []
+    monkeypatch.setattr(
+        runtime_module, "all_ranks_agree", lambda ok: (asked.append(ok), ok)[1]
+    )
+
+    runtime.checkpoint()
+
+    assert asked == [], (
+        "rank 0 posted a collective the other seven ranks had already left before"
+    )
+    assert runtime._split_drain is False, "the probe must be off where it cannot run"
+
+
 def test_a_failure_on_another_rank_stops_this_one_too(storage, monkeypatch):
     """This rank's own save was fine. Somebody else's was not.
 

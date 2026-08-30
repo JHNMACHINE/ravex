@@ -947,7 +947,7 @@ def _split_drain_worker(rank, world_size, port, env_value, out):
             # `__new__` to exercise the one method, which is what the class
             # level defaults in `RavexRuntime` exist for.
             runtime = RavexRuntime.__new__(RavexRuntime)
-            agreed = runtime._drain_split_agreed()
+            agreed = runtime._drain_split_agreed(sharded=True)
             if agreed:
                 barrier()
             # A second collective every rank posts. If the ranks had disagreed
