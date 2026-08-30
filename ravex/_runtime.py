@@ -503,6 +503,23 @@ class RavexRuntime:
 
         started = time.perf_counter()
         phases: dict = {}
+        # Diagnostic, off unless asked for. `drain` is one `synchronize()`,
+        # and its justification for being excluded from the reported cost is
+        # that it waits for work the training loop had already queued — true
+        # for compute, false for a rank waiting on a peer that is late
+        # *because it was checkpointing*. Measured 2026-08-30 on two machines,
+        # the same five checkpoints: 34.6 s flat on one rank and 104-139 s on
+        # the other, which is not a difference compute explains.
+        #
+        # A barrier first splits them: what it absorbs is skew, what is left
+        # in `drain` after it is queue. See GPU-98.
+        if os.environ.get("RAVEX_SPLIT_DRAIN", "") not in ("", "0", "false"):
+            from ravex._distributed import barrier
+
+            barrier()
+            skew_done = time.perf_counter()
+            phases["skew"] = skew_done - started
+            started = skew_done
         _drain_accelerator()
         collect_started = time.perf_counter()
         phases["drain"] = collect_started - started
