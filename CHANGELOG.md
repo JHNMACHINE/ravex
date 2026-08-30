@@ -4,6 +4,59 @@
 
 ### Added
 
+- **`save_dtype`: what precision each part of a checkpoint is stored at.**
+
+  ```yaml
+  save_dtype:
+    optimizer: bf16
+  ```
+
+  Keys are component names — `model`, `optimizer`, `scheduler`, `scaler`,
+  `dataloader` — or raw Moonclip globs for anything they do not cover. **The
+  first matching rule wins**, in the order written, so an exception is
+  expressed by putting it first: `{model: none, "*": bf16}`. A bare value
+  applies to everything. `RAVEX_SAVE_DTYPE=model:none,optimizer:bf16` from the
+  environment, ordered left to right.
+
+  It is the largest saving available on a run that checkpoints often. On a
+  1.5B model under FSDP2, per rank: the weights are a third of the state and
+  delta well, −70%; `exp_avg` and `exp_avg_sq` are the other two thirds and
+  delta essentially not at all, −1.1% and −4.0%. With β₁ = 0.9 a tenth of each
+  moment is replaced by fresh gradient every step, which moves nearly every
+  mantissa bit, so the XOR between two steps is noise. **85% of the bytes
+  written are the part that does not compress** — and it is also the part that
+  tolerates the least precision, since `exp_avg_sq` reaches Adam through
+  `sqrt(v)`, which halves the relative error. `{optimizer: bf16}` halves 85%
+  of the volume and leaves the model exactly as it was.
+
+  **Components rather than patterns, and the reason is not tidiness.** An
+  optimizer is written in two places: under `ravex/optimizers/…` when it is
+  not sharded, and under `ravex/sharded/<key>/optimizer/…` when it is, because
+  sharded state has its own collection path. A pattern written by hand as
+  `ravex/optimizers/*` is right on one GPU and casts **nothing** on the
+  sharded run the setting was chosen for — no error, no warning, a
+  full-precision checkpoint. Naming the component expands to both. Raw
+  patterns still work and pass through untouched, and there is a test that
+  documents the trap rather than pretending it is unreachable.
+
+  **Off by default, and it stays off across an upgrade.** It changes the
+  numbers a resumed run gets back, and a library that did that to an in-flight
+  run because someone bumped a version would be wrong to. What it does instead
+  is log one line per run naming the setting when it is unset — at `INFO`, not
+  as a warning, because nothing is wrong; the setting is simply worth a great
+  deal and is invisible otherwise.
+
+  Values are checked when the config loads rather than when the checkpoint
+  manager is built. Moonclip refuses a bad dtype too, but it does so at
+  construction, which under Ravex is mid-run and inside the `except` that
+  falls back to `torch.save` — so a typo would have cost the run its Moonclip
+  checkpointing and said one line about it. A bad rule is now dropped, that
+  component is stored unchanged, and the reason lands in the startup problem
+  report with everything else. One bad rule does not take the correctly
+  spelled ones with it.
+
+  Needs Moonclip 0.0.9, which is already the floor.
+
 - **`reshard_on_resume`: a `per_rank` checkpoint can be resumed at a different
   world size.** Each rank rebuilds its own shard out of the old ones — eight
   ranks' shards onto four, or four onto three, where no new shard equals any
@@ -116,6 +169,31 @@
   pays, and it was already in the total.
 
 ### Fixed
+
+- **Torch without NumPy broke every collective on the resume path.** Ravex
+  depends on PyYAML alone, and torch does not require NumPy either, so an
+  install with neither is a supported way to run this. But
+  `dist.all_gather_object` decodes what it gathered with
+  `tensor.numpy().tobytes()`, so on that install every agreement between ranks
+  raised `RuntimeError: Numpy is not available` — not at import and not at
+  startup, but at the first collective of a resume, after the wire work had
+  already happened and with nothing left for the caller to fall back to.
+
+  The five object collectives — the step every rank holds, the stores each
+  machine can see, the run id, the shared-storage probe and the all-or-nothing
+  resume flag — now go through one wrapper. Where the conversion works it is
+  still torch's own call. Where it does not, the wrapper posts the same two
+  `all_gather` calls in the same order and with the same shapes and dtypes,
+  and decodes with `bytes(tensor.tolist())`. Matching torch on the wire is the
+  point of that care: a job whose ranks disagree about NumPy still meets,
+  which is checked with two gloo ranks, one of each.
+
+  The probe is `tensor.numpy()` itself, asked once, rather than `import
+  numpy` — torch initialises NumPy on its own, and a version it was not built
+  against imports perfectly well and then fails the conversion.
+
+  Found by CI rather than by a user: the unit job installs torch and pytest
+  and nothing else, which is exactly this configuration.
 
 - **A store recovered over the network stayed marked as a copy.** A rank that
   came up without its own store and took one back from a peer was left holding

@@ -30,6 +30,7 @@ ravex status
 | `keep_base_in_memory` | `RAVEX_KEEP_BASE_IN_MEMORY` | `true` | Moonclip only: keep the last full snapshot's bytes resident so the next delta does not have to read them back. Costs a copy of the saved state. See [The write path](#the-write-path). |
 | `async_save` | `RAVEX_ASYNC_SAVE` | `true` | Moonclip only: write in the background. Off, the loop stops until the checkpoint is durable. Diagnostic; see [The write path](#the-write-path). |
 | `compression` | `RAVEX_COMPRESSION` | `zstd` | `zstd` or `none`. |
+| `save_dtype` | `RAVEX_SAVE_DTYPE` | `null` | Moonclip only: what precision each part of the checkpoint is stored at. A dtype for everything, or a mapping of component to dtype. See [Precision per component](#precision-per-component). |
 | `compression_level` | `RAVEX_COMPRESSION_LEVEL` | `3` | zstd level. |
 | `keep_last` | `RAVEX_KEEP_LAST` | `5` | Checkpoints to retain. Older ones are deleted. |
 | `sharded_checkpoints` | `RAVEX_SHARDED_CHECKPOINTS` | `gather` | How FSDP state is written: `gather` or `per_rank`. See [Sharded models](#sharded-models). |
@@ -167,6 +168,107 @@ durable, which took the average total stall from ~10 s to ~27 s per checkpoint
 on that same configuration. It exists to make timings attributable while
 diagnosing something, not to make a run safer. The background write is already
 durable before the next one starts.
+
+### Precision per component
+
+`save_dtype` decides what precision each part of a checkpoint is stored at. It
+is off by default, and it is the single largest saving available on a run that
+checkpoints often.
+
+```yaml
+save_dtype:
+  optimizer: bf16
+```
+
+Keys are component names — `model`, `optimizer`, `scheduler`, `scaler`,
+`dataloader` — or raw Moonclip globs over the tensor name for anything they do
+not cover. Values are `none`, `bf16`, `fp16`, `fp32`, `fp64`, `fp8`
+(= `fp8_e4m3`) or `fp8_e5m2`. A bare value applies to everything:
+
+```yaml
+save_dtype: bf16
+```
+
+**The first matching rule wins**, in the order written, which is how an
+exception is expressed:
+
+```yaml
+save_dtype:
+  model: none      # the weights, untouched
+  "*": bf16        # everything else
+```
+
+Written the other way round the catch-all comes first and the exception never
+applies.
+
+From the environment, `RAVEX_SAVE_DTYPE=bf16` for the bare form and
+`RAVEX_SAVE_DTYPE=model:none,optimizer:bf16` for rules, ordered left to right.
+
+#### Why it is worth setting
+
+Measured on a 1.5B model under FSDP2, 8x RTX 5060 Ti, per rank per checkpoint:
+
+| component | share of the state | what the delta saves |
+|---|---|---|
+| model weights | ~1/3 | **-70%** |
+| `exp_avg` | ~1/3 | -1.1% |
+| `exp_avg_sq` | ~1/3 | -4.0% |
+
+The optimizer moments are two thirds of the state and **85% of the bytes
+actually written**, because they are the part deltas cannot compress: with
+β₁ = 0.9 a tenth of each value is replaced by fresh gradient every step, which
+moves nearly every mantissa bit, so the XOR between two steps is noise.
+
+They are also the part that tolerates the least precision. `exp_avg_sq` reaches
+Adam through `sqrt(v)`, which halves the relative error — the same reason
+8-bit optimizers are ordinary practice rather than an experiment. The weights
+are the model and are left alone.
+
+So `{optimizer: bf16}` halves 85% of the volume and changes nothing about the
+model. It is the best ratio of saving to risk in the whole write path.
+
+#### What it does not do
+
+Integer, boolean and complex tensors are stored unchanged whatever this says —
+step counters, causal masks and indices travel through, they are never cast.
+Casting weights to an integer type would be quantization, which needs a scale
+and a zero-point a checkpoint entry has nowhere to keep, so those names are
+refused rather than accepted into something that produces wrong numbers
+quietly.
+
+`fp64` is a valid target but only ever widens: it recovers no precision the
+source did not have and writes twice the bytes. It is there for reference runs
+that want one width throughout.
+
+The float8 targets quantize against a per-tensor scale. They are a quarter the
+size of fp32 and keep four significant bits — a few percent of relative error
+on every element, twenty times what bf16 costs. Reasonable for an archived copy,
+poor for a checkpoint a run will resume from, and optimizer moments in
+particular do not survive it.
+
+#### Why components rather than patterns
+
+An optimizer is written in two places. Unsharded, its state goes under
+`ravex/optimizers/…`; under FSDP, the same optimizer goes under
+`ravex/sharded/<key>/optimizer/…`, because sharded state has its own
+collection path. A pattern written by hand as `ravex/optimizers/*` is correct
+on a single GPU and silently casts **nothing** on the sharded run the setting
+was chosen for. Naming the component covers both.
+
+Raw patterns still work for anything the component names do not reach, and they
+are passed through untouched.
+
+#### Turning it on mid-run
+
+It changes the numbers a resumed run gets back, so it stays off across an
+upgrade and is never enabled for you. Turning it on part-way through a run is
+safe — a checkpoint records the original dtype of every tensor it cast and
+restores it on load — but the steps written before and after are stored at
+different precision, and only the later ones are smaller.
+
+An unusable value never stops a run: it is dropped, the run continues storing
+that component unchanged, and the reason is logged once at startup along with
+every other configuration problem.
 
 ### Reading the handoff log
 

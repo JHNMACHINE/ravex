@@ -153,6 +153,27 @@ class MoonclipBackend(CheckpointBackend):
         if not config.keep_base_in_memory:
             kwargs["keep_base_in_memory"] = False
 
+        # Component names became globs on the way out of the config: Moonclip
+        # matches names and deliberately does not know what an optimizer is.
+        save_dtype = config.resolve_save_dtype()
+        if save_dtype is not None:
+            kwargs["save_dtype"] = save_dtype
+            logger.info("save_dtype=%s", save_dtype)
+        else:
+            # Said once per run, and not as a warning, because nothing is
+            # wrong — the default is deliberately "store what arrived". It is
+            # here because the setting is worth a great deal and is invisible
+            # otherwise: on a 1.5B model under FSDP2 the optimizer moments are
+            # ~85% of the bytes written and barely delta at all, and they are
+            # the part that tolerates the least precision. Someone paying for
+            # that every checkpoint should at least know the knob exists.
+            logger.info(
+                "save_dtype is unset: every tensor is stored at the precision "
+                "it arrives in. Optimizer state is typically ~85%% of a "
+                "checkpoint and compresses worst; save_dtype={optimizer: "
+                "bf16} halves that part and leaves the model untouched."
+            )
+
         if not config.async_save:
             logger.warning(
                 "async_save=false: the training loop will block until each "

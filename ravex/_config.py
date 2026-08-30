@@ -17,7 +17,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 CONFIG_FILENAMES = ("ravex.yaml", "ravex.yml")
 
@@ -43,6 +43,89 @@ def _as_int(value: Any, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+#: Every ``save_dtype`` target Moonclip accepts, in every spelling it accepts
+#: it. Duplicated here on purpose: Moonclip reports a bad target when the
+#: manager is *constructed*, which under Ravex is mid-run and inside the
+#: ``except`` that falls back to ``torch.save``. Checking here puts a typo in
+#: ``problems`` at config load instead, next to every other bad value.
+#:
+#: Integers, ``bool`` and complex are absent because they are not cast
+#: targets: they travel through unchanged whatever this is set to.
+_SAVE_DTYPES = frozenset(
+    {
+        "none",
+        "bf16",
+        "bfloat16",
+        "fp16",
+        "float16",
+        "fp32",
+        "float32",
+        "fp64",
+        "float64",
+        "double",
+        "fp8",
+        "float8",
+        "fp8_e4m3",
+        "float8_e4m3fn",
+        "fp8_e5m2",
+        "float8_e5m2",
+    }
+)
+
+#: Component name → the tensor-name globs it covers.
+#:
+#: Moonclip matches patterns and knows nothing about optimizers, which is the
+#: right division: the structure lives in the names, and Ravex is the layer
+#: that chose them. So Ravex is also the layer that should spell out what a
+#: component *is* — and there is a real reason not to leave that to the user.
+#:
+#: **A component lives in two places, not one.** An unsharded optimizer is
+#: written under ``ravex/optimizers/…``; the same optimizer under FSDP is
+#: written under ``ravex/sharded/<key>/optimizer/…``, because sharded state
+#: goes through its own collection path. Someone writing patterns by hand
+#: would reach for ``ravex/optimizers/*``, get it right on a single GPU, and
+#: silently cast nothing on the sharded run that motivated the setting — which
+#: is precisely the case the measurement came from. Naming the component
+#: covers both.
+_SAVE_DTYPE_COMPONENTS: Dict[str, Tuple[str, ...]] = {
+    "model": ("ravex/models/*", "ravex/sharded/*/model/*"),
+    "optimizer": ("ravex/optimizers/*", "ravex/sharded/*/optimizer/*"),
+    "scheduler": ("ravex/schedulers/*",),
+    "scaler": ("ravex/scalers/*",),
+    "dataloader": ("ravex/dataloaders/*",),
+}
+
+
+def _save_dtype_from_env(value: str) -> Union[str, Dict[str, str]]:
+    """Parse ``RAVEX_SAVE_DTYPE``.
+
+    Two forms, distinguished by a colon:
+
+        RAVEX_SAVE_DTYPE=bf16
+        RAVEX_SAVE_DTYPE=optimizer:bf16,model:none
+
+    The second is comma-separated and **ordered**, because the rules are: the
+    first match wins, and an environment variable is a list of characters, so
+    the order is right there for free.
+
+    Nothing is validated here. Whatever comes out goes through
+    :meth:`RavexConfig._normalize_save_dtype` like a value from the YAML,
+    which is the one place that decides what is usable and records what was
+    not — two checks would eventually disagree.
+    """
+    text = value.strip()
+    if ":" not in text:
+        return text
+
+    rules: Dict[str, str] = {}
+    for clause in text.split(","):
+        key, _, dtype = clause.partition(":")
+        key = key.strip()
+        if key:
+            rules[key] = dtype.strip()
+    return rules
 
 
 def find_config_file() -> Optional[Path]:
@@ -148,6 +231,44 @@ class RavexConfig:
     compression: str = "zstd"
     compression_level: int = 3
     keep_last: int = 5
+
+    # What precision each part of the checkpoint is stored at.
+    #
+    #   save_dtype: bf16                    # everything
+    #   save_dtype: {optimizer: bf16}       # only the optimizer state
+    #   save_dtype: {model: none, "*": bf16}  # everything except the weights
+    #
+    # Keys are component names — ``model``, ``optimizer``, ``scheduler``,
+    # ``scaler``, ``dataloader`` — or raw Moonclip globs over the tensor name
+    # for anything they do not cover. **The first matching rule wins**, in the
+    # order written, which is what makes the third line above express an
+    # exception rather than a contradiction.
+    #
+    # Why it is worth setting. Measured 2026-08-18 on 8× RTX 5060 Ti, a 1.5B
+    # model under FSDP2, per rank: the weights are about a third of the bytes
+    # and delta well, −70%. `exp_avg` and `exp_avg_sq` are the other two
+    # thirds and delta essentially not at all, −1.1% and −4.0% — between two
+    # steps their XOR is high-entropy, because with β₁ = 0.9 a tenth of the
+    # value is replaced by fresh gradient every step and that moves nearly
+    # every mantissa bit. So **85% of what gets written is the part that does
+    # not compress**, and it is also the part that tolerates the least
+    # precision: `exp_avg_sq` reaches Adam through `sqrt(v)`, which halves the
+    # relative error, which is why 8-bit optimizers are ordinary practice.
+    # ``{optimizer: bf16}`` halves 85% of the volume and leaves the model
+    # exactly as it was.
+    #
+    # **Defaults to off, and stays off on upgrade.** Turning it on changes the
+    # numbers a resumed run gets back, and a library that did that to an
+    # in-flight run because someone bumped a version would be wrong to. The
+    # backend logs one line per run pointing at this setting when it is unset,
+    # which is how it stays discoverable without being imposed.
+    #
+    # Not every dtype is a target: integers, ``bool`` and complex tensors are
+    # transported unchanged whatever this says. Casting weights to ``int8``
+    # would be quantization, which needs a scale and a zero-point that a
+    # checkpoint entry has nowhere to keep, so the name is refused rather than
+    # accepted into something that produces wrong numbers quietly.
+    save_dtype: Optional[Union[str, Dict[str, str]]] = None
 
     # How often each rank sends a copy of its store to a peer on another
     # machine, counted in checkpoints. Only ever used when the storage turns
@@ -303,6 +424,8 @@ class RavexConfig:
             self.compression_level = _as_int(value, self.compression_level)
         if (value := get("KEEP_LAST")) is not None:
             self.keep_last = _as_int(value, self.keep_last)
+        if (value := get("SAVE_DTYPE")) is not None:
+            self.save_dtype = _save_dtype_from_env(value)
         if (value := get("REPLICATE_EVERY")) is not None:
             self.replicate_every = _as_int(value, self.replicate_every)
         if (value := get("KEEP_BASE_IN_MEMORY")) is not None:
@@ -448,8 +571,104 @@ class RavexConfig:
         if self.storage.is_remote and not self.storage.bucket:
             self.storage.type = "local"
 
+        self._normalize_save_dtype()
+
         if self.run_id and not self.storage.prefix:
             self.storage.prefix = self.run_id
+
+    def _normalize_save_dtype(self) -> None:
+        """Check ``save_dtype`` at load time, and drop what cannot be honoured.
+
+        Moonclip refuses a bad target too, but it does so when the manager is
+        *constructed* — which under Ravex is mid-run, inside the ``except``
+        that falls back to ``torch.save``. A typo would end up costing the
+        whole run's Moonclip checkpointing and saying one line about it. Here
+        it lands in ``problems`` next to every other bad value, before
+        anything starts.
+
+        A rule with an unusable dtype is dropped rather than the whole
+        setting: the other rules were spelled correctly and there is no reason
+        to punish them. A dropped rule means that component is stored
+        unchanged, which is the safe direction.
+        """
+        value = self.save_dtype
+        if value is None:
+            return
+
+        if isinstance(value, str):
+            name = value.strip().lower()
+            if name not in _SAVE_DTYPES:
+                self.problems.append(
+                    f"save_dtype={value!r} is not a dtype Moonclip can store; "
+                    f"ignoring it. Use one of: {', '.join(sorted(_SAVE_DTYPES))}"
+                )
+                self.save_dtype = None
+            else:
+                self.save_dtype = None if name == "none" else name
+            return
+
+        if not isinstance(value, dict):
+            self.problems.append(
+                f"save_dtype={value!r} is neither a dtype nor a mapping of "
+                "component to dtype; ignoring it"
+            )
+            self.save_dtype = None
+            return
+
+        kept: Dict[str, str] = {}
+        for raw_key, raw_value in value.items():
+            key = str(raw_key).strip()
+            dtype = str(raw_value).strip().lower()
+
+            if dtype not in _SAVE_DTYPES:
+                self.problems.append(
+                    f"save_dtype[{key!r}]={raw_value!r} is not a dtype "
+                    f"Moonclip can store; dropping that rule. Use one of: "
+                    f"{', '.join(sorted(_SAVE_DTYPES))}"
+                )
+                continue
+
+            # A component name, or a glob. Anything else is neither: Ravex
+            # names every tensor under `ravex/`, so a bare word that is not a
+            # component can only match a tensor called exactly that, which
+            # does not exist. `{"weights": "bf16"}` is the shape of the
+            # mistake — right idea, wrong noun — and it would otherwise cast
+            # nothing at all and never say so.
+            if key.lower() in _SAVE_DTYPE_COMPONENTS:
+                kept[key.lower()] = dtype
+            elif "*" in key or "/" in key:
+                kept[key] = dtype
+            else:
+                self.problems.append(
+                    f"save_dtype key {key!r} is neither a component "
+                    f"({', '.join(sorted(_SAVE_DTYPE_COMPONENTS))}) nor a "
+                    "pattern containing '*' or '/'; dropping that rule"
+                )
+
+        self.save_dtype = kept or None
+
+    def resolve_save_dtype(self) -> Optional[Union[str, Dict[str, str]]]:
+        """``save_dtype`` in the form Moonclip takes: globs, not components.
+
+        Component names expand **in place**, so the order the rules were
+        written in survives — and it has to, because Moonclip applies the
+        first rule that matches. ``{"model": "none", "*": "bf16"}`` becomes
+        three rules with the two model globs still ahead of the catch-all,
+        which is what keeps it meaning "everything except the weights".
+
+        Returns ``None`` when nothing is configured, so the caller can leave
+        the argument out entirely rather than pass a value that means the
+        same as not passing one.
+        """
+        value = self.save_dtype
+        if value is None or isinstance(value, str):
+            return value
+
+        expanded: Dict[str, str] = {}
+        for key, dtype in value.items():
+            for pattern in _SAVE_DTYPE_COMPONENTS.get(key, (key,)):
+                expanded.setdefault(pattern, dtype)
+        return expanded or None
 
     def describe(self) -> str:
         target = (

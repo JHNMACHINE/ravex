@@ -37,6 +37,94 @@ def _dist():
     return dist
 
 
+_torch_numpy: Optional[bool] = None
+
+
+def _torch_can_reach_numpy() -> bool:
+    """Whether ``tensor.numpy()`` works in this interpreter.
+
+    Not ``import numpy``: torch initialises NumPy itself, and a version it was
+    not built against imports perfectly well and then fails the conversion. The
+    probe asks the question the object collectives actually ask, once.
+    """
+    global _torch_numpy
+    if _torch_numpy is None:
+        try:
+            import torch
+
+            torch.zeros(1, dtype=torch.uint8).numpy()
+            _torch_numpy = True
+        except Exception:
+            _torch_numpy = False
+    return _torch_numpy
+
+
+def _object_device(dist):
+    """Where the byte tensors behind an object collective have to live.
+
+    NCCL only moves GPU tensors, which is why torch's own object collectives
+    reach for the current CUDA device; gloo stays on the host.
+    """
+    import torch
+
+    try:
+        backend = str(dist.get_backend())
+    except Exception:
+        backend = ""
+    if "nccl" in backend and torch.cuda.is_available():
+        return torch.device("cuda", torch.cuda.current_device())
+    return torch.device("cpu")
+
+
+def _all_gather_object(dist, value) -> List[Any]:
+    """One picklable value from every rank, in rank order. **Collective.**
+
+    ``dist.all_gather_object`` decodes what it gathered with
+    ``tensor.numpy().tobytes()``, so on an install where that conversion is
+    unavailable every object collective in this module raises "Numpy is not
+    available" — after the wire work is done, which makes it a crash rather
+    than something a caller could fall back from. Ravex depends on PyYAML and
+    nothing else, and torch itself does not require NumPy, so that install is a
+    configuration we have to keep working in.
+
+    The replacement posts the same two ``all_gather`` calls, in the same order
+    and with the same shapes and dtypes as torch's own, so a rank that took
+    this path and a rank that did not still meet on the wire.
+    """
+    world = dist.get_world_size()
+    if _torch_can_reach_numpy():
+        # Pre-sized because `all_gather_object` fills the list in place.
+        gathered: List[Any] = [None] * world
+        dist.all_gather_object(gathered, value)
+        return gathered
+
+    import pickle
+
+    import torch
+
+    device = _object_device(dist)
+    payload = torch.frombuffer(bytearray(pickle.dumps(value)), dtype=torch.uint8)
+    payload = payload.to(device)
+
+    sizes = torch.zeros(world, dtype=torch.long, device=device)
+    length = torch.tensor([payload.numel()], dtype=torch.long, device=device)
+    dist.all_gather([sizes[i].unsqueeze(0) for i in range(world)], length)
+
+    # Every rank sends the same number of bytes, so the short ones are padded
+    # and the length gathered above says where each one really ends.
+    widest = int(sizes.max().item())
+    padded = torch.zeros(widest, dtype=torch.uint8, device=device)
+    padded[: payload.numel()] = payload
+    chunks = [torch.empty(widest, dtype=torch.uint8, device=device) for _ in range(world)]
+    dist.all_gather(chunks, padded)
+
+    # `bytes(tensor.tolist())` is the NumPy-free spelling of `.numpy().tobytes()`.
+    return [
+        pickle.loads(bytes(chunk[: int(size)].cpu().tolist()))
+        for chunk, size in zip(chunks, sizes.tolist())
+    ]
+
+
 def get_rank() -> int:
     """Global rank of this process, 0 when not distributed."""
     dist = _dist()
@@ -674,9 +762,7 @@ def agree_on_step(local_step: int) -> int:
     if dist is None or not dist.is_available() or not dist.is_initialized():
         return local_step
 
-    # Pre-sized because `all_gather_object` fills the list in place.
-    steps: List[Any] = [None] * dist.get_world_size()
-    dist.all_gather_object(steps, int(local_step))
+    steps = _all_gather_object(dist, int(local_step))
     return min(int(step) for step in steps)
 
 
@@ -699,8 +785,7 @@ def gather_visible_stores(visible):
     if dist is None or not dist.is_available() or not dist.is_initialized():
         return [visible]
 
-    seen: List[Any] = [None] * dist.get_world_size()
-    dist.all_gather_object(seen, visible)
+    seen = _all_gather_object(dist, visible)
     return [entry if entry else {} for entry in seen]
 
 
@@ -722,8 +807,7 @@ def agree_on_run_id(provenance: int, candidate: str) -> str:
     if dist is None or not dist.is_available() or not dist.is_initialized():
         return candidate
 
-    votes: List[Any] = [None] * dist.get_world_size()
-    dist.all_gather_object(votes, (int(provenance), str(candidate)))
+    votes = _all_gather_object(dist, (int(provenance), str(candidate)))
 
     best = None
     for entry in votes:
@@ -748,9 +832,9 @@ def storage_is_shared(path: str) -> bool:
     fine, or silence on a job whose checkpoint is being split across disks.
 
     Every rank drops a uniquely named marker and then looks for everyone
-    else's. ``all_gather_object`` is the synchronisation: a rank's name only
-    reaches the others after it has written the file, so by the time the list
-    comes back every marker exists on the filesystem that will hold it.
+    else's. The gather is the synchronisation: a rank's name only reaches the
+    others after it has written the file, so by the time the list comes back
+    every marker exists on the filesystem that will hold it.
 
     A directory that cannot be written to answers False. That is the safe
     reading — it makes the caller assume the checkpoint is split — and an
@@ -775,8 +859,7 @@ def storage_is_shared(path: str) -> bool:
             # for a job that is not distributed at all.
             return True
 
-        names: List[Any] = [None] * dist.get_world_size()
-        dist.all_gather_object(names, marker)
+        names = _all_gather_object(dist, marker)
         shared = all(
             isinstance(name, str) and os.path.exists(os.path.join(path, name))
             for name in names
@@ -804,9 +887,7 @@ def gather_objects(value):
     if dist is None or not dist.is_available() or not dist.is_initialized():
         return [value]
 
-    gathered: List[Any] = [None] * dist.get_world_size()
-    dist.all_gather_object(gathered, value)
-    return gathered
+    return _all_gather_object(dist, value)
 
 
 def all_ranks_agree(ok: bool) -> bool:
@@ -821,8 +902,7 @@ def all_ranks_agree(ok: bool) -> bool:
     if dist is None or not dist.is_available() or not dist.is_initialized():
         return bool(ok)
 
-    flags: List[Any] = [None] * dist.get_world_size()
-    dist.all_gather_object(flags, bool(ok))
+    flags = _all_gather_object(dist, bool(ok))
     return all(bool(flag) for flag in flags)
 
 

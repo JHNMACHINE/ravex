@@ -230,3 +230,145 @@ def test_moonclip_can_be_asked_for_a_specific_step(tmp_path):
     )
     assert backend.load_step(9) is None
     backend.close()
+
+
+# ─── save_dtype reaches Moonclip ────────────────────────────────────
+
+
+def _both_layouts(step=1):
+    """State holding optimizer moments in both the places Ravex writes them.
+
+    Unsharded state goes under ``optimizers``; a sharded model's optimizer
+    goes under ``sharded/<key>/optimizer``, because sharded collection has its
+    own path. A checkpoint of a real FSDP run has the second and not the
+    first, and it is the one the precision measurement came from.
+    """
+    g = torch.Generator().manual_seed(step)
+    r = lambda: torch.randn(32, 32, generator=g)
+    return {
+        "ravex_version": 1,
+        "step": step,
+        "models": {"model_a": {"weight": r()}},
+        "optimizers": {
+            "opt_a": {
+                "state": {0: {"exp_avg": r()}},
+                "param_groups": [{"lr": 0.1}],
+            }
+        },
+        "schedulers": {},
+        "scalers": {},
+        "dataloaders": {},
+        "sharded": {
+            "fsdp": {
+                "model": {"weight": r()},
+                "optimizer": {"state": {"weight": {"exp_avg": r()}}},
+                "parameters": ["weight"],
+                "layout": "per_rank",
+                "world_size": 1,
+                "rank": 0,
+            }
+        },
+    }
+
+
+def _roundtrip_errors(tmp_path, save_dtype):
+    """Save two steps and reload, returning how far each part moved.
+
+    Two steps rather than one so the second is a delta against the first,
+    which is the path where a cast and the retained base have to agree.
+    """
+    from ravex._backends import MoonclipBackend
+
+    config = make_config(
+        tmp_path, backend="moonclip", async_save=False, save_dtype=save_dtype
+    )
+    assert not config.problems, config.problems
+
+    backend = MoonclipBackend(config)
+    backend.save(1, _both_layouts(1), {})
+    want = _both_layouts(2)
+    backend.save(2, want, {})
+    backend.flush()
+
+    got = MoonclipBackend(config).load_latest()
+
+    def moved(*path):
+        a, b = got, want
+        for key in path:
+            a, b = a[key], b[key]
+        return (a - b).abs().max().item()
+
+    return {
+        "model": moved("models", "model_a", "weight"),
+        "optimizer": moved("optimizers", "opt_a", "state", 0, "exp_avg"),
+        "sharded_model": moved("sharded", "fsdp", "model", "weight"),
+        "sharded_optimizer": moved(
+            "sharded", "fsdp", "optimizer", "state", "weight", "exp_avg"
+        ),
+    }
+
+
+@pytest.mark.skipif(not HAVE_MOONCLIP, reason="moonclip not installed")
+def test_without_save_dtype_nothing_is_cast(tmp_path):
+    assert set(_roundtrip_errors(tmp_path, None).values()) == {0.0}
+
+
+@pytest.mark.skipif(not HAVE_MOONCLIP, reason="moonclip not installed")
+def test_a_component_reaches_both_places_it_is_written(tmp_path):
+    """The whole reason `optimizer` is a component name and not a pattern.
+
+    Casting the optimizer has to catch the sharded copy as well, because on
+    the runs where the setting is worth anything that is the only copy there
+    is.
+    """
+    moved = _roundtrip_errors(tmp_path, {"optimizer": "bf16"})
+    assert moved["model"] == 0.0
+    assert moved["sharded_model"] == 0.0
+    assert moved["optimizer"] > 0
+    assert moved["sharded_optimizer"] > 0
+    # bf16 keeps eight significant bits. Anything larger is not rounding.
+    assert moved["sharded_optimizer"] < 0.1
+
+
+@pytest.mark.skipif(not HAVE_MOONCLIP, reason="moonclip not installed")
+def test_a_hand_written_pattern_misses_the_sharded_half(tmp_path):
+    """Documents the trap the component names exist to close, rather than
+    asserting it cannot happen — a raw pattern is still allowed, and someone
+    who writes this one should be able to find out from a test why their
+    sharded run saved nothing."""
+    moved = _roundtrip_errors(tmp_path, {"ravex/optimizers/*": "bf16"})
+    assert moved["optimizer"] > 0
+    assert moved["sharded_optimizer"] == 0.0
+
+
+@pytest.mark.skipif(not HAVE_MOONCLIP, reason="moonclip not installed")
+def test_an_exception_written_first_spares_the_model(tmp_path):
+    moved = _roundtrip_errors(tmp_path, {"model": "none", "*": "bf16"})
+    assert moved["model"] == 0.0
+    assert moved["sharded_model"] == 0.0
+    assert moved["optimizer"] > 0
+    assert moved["sharded_optimizer"] > 0
+
+
+@pytest.mark.skipif(not HAVE_MOONCLIP, reason="moonclip not installed")
+def test_a_bare_dtype_casts_every_component(tmp_path):
+    moved = _roundtrip_errors(tmp_path, "bf16")
+    assert all(value > 0 for value in moved.values()), moved
+
+
+@pytest.mark.skipif(not HAVE_MOONCLIP, reason="moonclip not installed")
+def test_the_unset_setting_is_mentioned_once(tmp_path, caplog):
+    """Not a warning — nothing is wrong. It is here because the setting is
+    worth a great deal and is otherwise invisible."""
+    from ravex._backends import MoonclipBackend
+
+    with caplog.at_level("INFO", logger="ravex"):
+        MoonclipBackend(make_config(tmp_path, backend="moonclip"))
+    assert any("save_dtype is unset" in r.message for r in caplog.records)
+
+    caplog.clear()
+    with caplog.at_level("INFO", logger="ravex"):
+        MoonclipBackend(
+            make_config(tmp_path, backend="moonclip", save_dtype={"optimizer": "bf16"})
+        )
+    assert not any("save_dtype is unset" in r.message for r in caplog.records)

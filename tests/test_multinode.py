@@ -13,6 +13,7 @@ used to blame a change in world size, in a run whose world size never changed.
 """
 
 import logging
+import os
 
 import pytest
 
@@ -680,3 +681,77 @@ class TestTheOldSignatureFallback:
         assert "(12, 4)" in message, "the wrong shape it would have produced"
         assert "(10, 4)" in message, "and the right one"
         assert "shape=" in message, "and why this torch cannot say so"
+
+
+@pytest.fixture
+def one_rank_group():
+    """A real gloo group, so the collectives below are on the wire."""
+    import torch.distributed as dist
+
+    if dist.is_initialized():  # pragma: no cover - a leaked group from elsewhere
+        dist.destroy_process_group()
+
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29614")
+    dist.init_process_group("gloo", rank=0, world_size=1)
+    try:
+        yield
+    finally:
+        dist.destroy_process_group()
+
+
+class TestWhenTorchCannotReachNumpy:
+    """Torch is installed, NumPy is not, and the object collectives still work.
+
+    ``dist.all_gather_object`` decodes what it gathered with
+    ``tensor.numpy().tobytes()``, so on such an install every one of them dies
+    with "Numpy is not available" — after the wire work, which makes it a crash
+    and not something a caller could recover from. Ravex requires PyYAML and
+    nothing else and torch does not require NumPy either, so this is a
+    configuration people can and do run in; it is also what the unit job in CI
+    installs, which is how it was found: three reshard tests, all of them at
+    the first collective.
+    """
+
+    def test_the_probe_answers_no_when_the_conversion_raises(self, monkeypatch):
+        """Asked of ``tensor.numpy()`` rather than of ``import numpy``.
+
+        Torch initialises NumPy itself, and a version it was not built against
+        imports perfectly well and then fails the conversion.
+        """
+        import torch
+
+        from ravex import _distributed as distributed
+
+        def refuse(self, *args, **kwargs):
+            raise RuntimeError("Numpy is not available")
+
+        monkeypatch.setattr(torch.Tensor, "numpy", refuse, raising=False)
+        monkeypatch.setattr(distributed, "_torch_numpy", None)
+
+        assert distributed._torch_can_reach_numpy() is False
+
+    def test_objects_survive_the_round_trip(self, one_rank_group, monkeypatch):
+        """The encode, the padding and the NumPy-free decode, end to end."""
+        from ravex import _distributed as distributed
+
+        monkeypatch.setattr(distributed, "_torch_numpy", False)
+
+        assert distributed.gather_objects({"rank": 0, "held": [1, 2, 3]}) == [
+            {"rank": 0, "held": [1, 2, 3]}
+        ]
+
+    def test_the_agreements_built_on_it_still_answer(
+        self, one_rank_group, monkeypatch
+    ):
+        """The three callers a resume cannot get past: the step every rank
+        holds, whether every rank restored, and the run id."""
+        from ravex import _distributed as distributed
+        from ravex._identity import FROM_STORE
+
+        monkeypatch.setattr(distributed, "_torch_numpy", False)
+
+        assert distributed.agree_on_step(7) == 7
+        assert distributed.all_ranks_agree(True) is True
+        assert distributed.all_ranks_agree(False) is False
+        assert distributed.agree_on_run_id(FROM_STORE, "run-abc") == "run-abc"
