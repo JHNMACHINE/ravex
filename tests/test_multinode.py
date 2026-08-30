@@ -755,3 +755,135 @@ class TestWhenTorchCannotReachNumpy:
         assert distributed.all_ranks_agree(True) is True
         assert distributed.all_ranks_agree(False) is False
         assert distributed.agree_on_run_id(FROM_STORE, "run-abc") == "run-abc"
+
+
+def _free_port():
+    import socket
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _object_gather_worker(rank, world_size, port, no_numpy, payload, out):
+    """One rank of a real gloo group, gathering `payload`.
+
+    Top level and argument-driven because spawn has to pickle it.
+    """
+    import os
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    if no_numpy:
+        os.environ["RAVEX_ASSUME_NO_NUMPY"] = "1"
+    else:
+        os.environ.pop("RAVEX_ASSUME_NO_NUMPY", None)
+
+    try:
+        import torch.distributed as dist
+
+        from ravex import _distributed as distributed
+
+        # The module-level cache is per process, and this process is fresh;
+        # clearing it makes the env variable the only thing deciding.
+        distributed._torch_numpy = None
+        took_the_new_path = not distributed._torch_can_reach_numpy()
+
+        dist.init_process_group("gloo", rank=rank, world_size=world_size)
+        try:
+            got = distributed._all_gather_object(dist, payload)
+        finally:
+            dist.destroy_process_group()
+        out.put((rank, took_the_new_path, got))
+    except Exception as exc:  # pragma: no cover - reported, not swallowed
+        out.put((rank, None, f"{type(exc).__name__}: {exc}"))
+
+
+def _gather_across_two_ranks(no_numpy_by_rank, payloads):
+    """Run a two-rank gather and return each rank's result, in rank order."""
+    import multiprocessing as mp
+
+    ctx = mp.get_context("spawn")
+    out = ctx.Queue()
+    port = _free_port()
+    procs = [
+        ctx.Process(
+            target=_object_gather_worker,
+            args=(rank, 2, port, no_numpy_by_rank[rank], payloads[rank], out),
+        )
+        for rank in (0, 1)
+    ]
+    for p in procs:
+        p.start()
+
+    results = {}
+    try:
+        for _ in procs:
+            rank, took_new, got = out.get(timeout=120)
+            results[rank] = (took_new, got)
+    finally:
+        for p in procs:
+            p.join(timeout=30)
+            if p.is_alive():  # pragma: no cover - a hung collective
+                p.terminate()
+                p.join(timeout=10)
+    return results
+
+
+class TestTheObjectGatherOnTwoRanks:
+    """What one rank cannot ask.
+
+    With ``world_size=1`` the replacement in `_all_gather_object` barely runs:
+    `widest` is always this rank's own length, so the padding — the part most
+    likely to be wrong — is never exercised, and there is no second rank to
+    disagree with about the wire. These use two real processes and payloads of
+    deliberately different sizes.
+
+    Two processes on one box, not two machines: the question here is the shape
+    of what goes on the wire, which loopback answers honestly. What loopback
+    cannot answer — bandwidth, a peer that disappears — is what the rented kit
+    in `integration/two-machines` is for.
+    """
+
+    # Sizes chosen to differ by a lot, so a rank that padded to the wrong
+    # length produces garbage rather than something that happens to fit.
+    PAYLOADS = [{"rank": 0, "blob": "a"}, {"rank": 1, "blob": "b" * 5000}]
+
+    def test_both_ranks_without_numpy_agree(self):
+        results = _gather_across_two_ranks([True, True], self.PAYLOADS)
+        assert set(results) == {0, 1}, results
+        for rank, (took_new, got) in results.items():
+            assert took_new is True, f"rank {rank} did not take the new path"
+            assert got == self.PAYLOADS, f"rank {rank} gathered {got!r}"
+
+    def test_a_rank_with_numpy_and_a_rank_without_still_meet(self):
+        """The claim `_all_gather_object` makes in its own docstring, and the
+        one nothing else checks: the replacement posts the same collectives, in
+        the same order and with the same shapes, as torch's own — so a mixed
+        pair still agrees.
+
+        It is not hypothetical. Two machines rented from one provider can come
+        up from different images, and the unit job in CI installs no NumPy
+        while every other job does.
+        """
+        results = _gather_across_two_ranks([False, True], self.PAYLOADS)
+        assert set(results) == {0, 1}, results
+        assert results[0][0] is False, "rank 0 was supposed to keep torch's path"
+        assert results[1][0] is True, "rank 1 was supposed to take the new one"
+        for rank, (_, got) in results.items():
+            assert got == self.PAYLOADS, f"rank {rank} gathered {got!r}"
+
+    def test_the_env_override_is_what_selects_the_path(self, monkeypatch):
+        """`RAVEX_ASSUME_NO_NUMPY` exists so the replacement is reachable at
+        all: every image that matters ships NumPy, so without it the code that
+        replaces torch's object collectives would reach a release having never
+        run on a network."""
+        from ravex import _distributed as distributed
+
+        monkeypatch.setattr(distributed, "_torch_numpy", None)
+        monkeypatch.setenv("RAVEX_ASSUME_NO_NUMPY", "1")
+        assert distributed._torch_can_reach_numpy() is False
+
+        monkeypatch.setattr(distributed, "_torch_numpy", None)
+        monkeypatch.setenv("RAVEX_ASSUME_NO_NUMPY", "0")
+        assert distributed._torch_can_reach_numpy() is True

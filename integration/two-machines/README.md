@@ -107,6 +107,41 @@ you how large `PARAMS` can be before a phase takes longer than the rental. The
 store each rank writes is roughly `params × 16 / world_size` bytes, and it has
 to cross the wire at whatever that measurement said.
 
+## The object collectives, which a stock image will not test
+
+Since 2026-08-30 every agreement between ranks — the step to resume from,
+which stores each machine can see, the run id, whether the storage is shared,
+whether every rank succeeded — goes through `_all_gather_object`. It has two
+implementations, and it picks the second **only when torch cannot reach
+NumPy**:
+
+```python
+if _torch_can_reach_numpy():
+    dist.all_gather_object(gathered, value)   # torch's own, as before
+    return gathered
+# the replacement is below here
+```
+
+Every image worth renting ships NumPy. So on two stock boxes the replacement
+**never executes**, and a session that runs the phases below proves nothing
+about it while the meter runs.
+
+`RAVEX_ASSUME_NO_NUMPY=1` forces the second path. `launch` is `torchrun`, which
+inherits the environment, so exporting it before a phase covers that machine's
+ranks — and exporting it on **one** machine is how the mixed case is reached:
+
+| both machines | what it exercises |
+| -- | -- |
+| unset | torch's collectives — the baseline, and what shipped before |
+| `=1` on both | the replacement, end to end, on a real network |
+| `=1` on one | a rank with NumPy and a rank without, meeting on the wire |
+
+The third is not hypothetical: two boxes from one provider can come up from
+different images. Its wire format is checked by
+`TestTheObjectGatherOnTwoRanks` in `tests/test_multinode.py`, which runs two
+real gloo processes locally — so what is left for two machines is latency,
+ordering and a peer that disappears, not the encoding.
+
 ## Rules that cost money to relearn
 
 **Interrupting the command on your machine does not stop the phase on the box.**

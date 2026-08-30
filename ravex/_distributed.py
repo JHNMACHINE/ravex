@@ -46,9 +46,19 @@ def _torch_can_reach_numpy() -> bool:
     Not ``import numpy``: torch initialises NumPy itself, and a version it was
     not built against imports perfectly well and then fails the conversion. The
     probe asks the question the object collectives actually ask, once.
+
+    ``RAVEX_ASSUME_NO_NUMPY=1`` forces the answer to no. That exists because
+    the NumPy-free path in :func:`_all_gather_object` is otherwise unreachable
+    on any ordinary machine — every image that matters ships NumPy — so the
+    code that replaces torch's object collectives would go to a release having
+    never run on a network. A diagnostic, not a feature: it makes an untested
+    path testable, and there is no reason to set it in a real run.
     """
     global _torch_numpy
     if _torch_numpy is None:
+        if os.environ.get("RAVEX_ASSUME_NO_NUMPY", "") not in ("", "0", "false"):
+            _torch_numpy = False
+            return _torch_numpy
         try:
             import torch
 
