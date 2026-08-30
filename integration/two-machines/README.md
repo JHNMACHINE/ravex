@@ -28,6 +28,24 @@ over SSH with `scp` working. That is a shorter list than it sounds:
   vast.ai it is an overlay network, and only between instances in one physical
   cluster. Both must be chosen **when the machine is created** — a running box
   cannot be added to either.
+
+  **Check it on every pod, before anything else, with one command:**
+
+  ```sh
+  hostname -I
+  ```
+
+  There must be a `10.x.x.x` in the output — on RunPod it arrives on an
+  interface called `podnet1`. A pod showing only its `172.x` bridge address was
+  created without the private network, cannot reach the other machine in either
+  direction, and cannot be fixed: destroy it and make another. On 2026-08-30
+  three pairs of boxes out of four died exactly here, and always the same way —
+  the toggle set on the first pod and not the second. The failure looks like a
+  plain `TimeoutError` much later, after the kit is pushed and the meter has
+  been running for a while.
+
+  The pod's own SSH string does not tell you: it is the public address, which
+  every pod has whether or not it is on the private network.
 - **Full SSH, not a proxy shell.** `push.sh` and `fetch.sh` move files with
   `scp`, and the convenience SSH some providers offer does not carry it.
 - **A GPU whose architecture the image's torch was built for.** This is checked
