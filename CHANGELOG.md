@@ -108,6 +108,29 @@
 
 ### Changed
 
+- **Two diagnostics, `RAVEX_ASSUME_NO_NUMPY` and `RAVEX_SPLIT_DRAIN`.**
+  Neither is a setting: they have no place in `ravex.yaml`, do nothing
+  useful in a real run, and exist to make something measurable that is
+  otherwise unreachable. See [Diagnostics](docs/configuration.md#diagnostics).
+
+  The first forces the NumPy-free object-gather path, which no ordinary
+  image reaches because they all ship NumPy — without it that code would
+  have shipped having never run on a network. It is *meant* to be set on
+  one machine and not the other: a rank with NumPy and a rank without is
+  what two rented boxes from different images look like.
+
+  The second adds a `skew` phase: a barrier before the accelerator drain,
+  timed apart, which separates a rank waiting for its own device from a
+  rank waiting for a peer. Measured on two machines: `skew 34.6 s / drain
+  0.000 s` on one rank and `skew 103.8 s / drain 0.000 s` on the other.
+
+  **The ranks agree on the second rather than each reading it**, and one
+  rank without it turns the probe off for everybody. A barrier some ranks
+  enter and others do not is two different collectives on one process
+  group — a hang until NCCL gives up. Given that the variable beside it is
+  designed to be set asymmetrically, leaving that to a documented
+  convention would have been a trap rather than an instruction. It costs
+  one collective at the first checkpoint of a run and none after.
 - **Python 3.9 and 3.10 are no longer supported.** The floor is 3.11, and the
   CI matrix runs 3.11 through 3.14.
 

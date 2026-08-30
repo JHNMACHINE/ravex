@@ -922,3 +922,103 @@ class TestTheObjectGatherOnTwoRanks:
         monkeypatch.setattr(distributed, "_torch_numpy", None)
         monkeypatch.setenv("RAVEX_ASSUME_NO_NUMPY", "0")
         assert distributed._torch_can_reach_numpy() is True
+
+
+def _split_drain_worker(rank, world_size, port, env_value, out):
+    """One rank deciding whether to split `drain`, the way the runtime does."""
+    import os
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    if env_value is None:
+        os.environ.pop("RAVEX_SPLIT_DRAIN", None)
+    else:
+        os.environ["RAVEX_SPLIT_DRAIN"] = env_value
+
+    try:
+        import torch.distributed as dist
+
+        from ravex._distributed import all_ranks_agree, barrier
+        from ravex._runtime import RavexRuntime
+
+        dist.init_process_group("gloo", rank=rank, world_size=world_size)
+        try:
+            # The runtime's own decision, not a copy of it — built with
+            # `__new__` to exercise the one method, which is what the class
+            # level defaults in `RavexRuntime` exist for.
+            runtime = RavexRuntime.__new__(RavexRuntime)
+            agreed = runtime._drain_split_agreed()
+            if agreed:
+                barrier()
+            # A second collective every rank posts. If the ranks had disagreed
+            # about the barrier above, this is where the mismatch would show.
+            settled = all_ranks_agree(True)
+        finally:
+            dist.destroy_process_group()
+        out.put((rank, agreed, settled))
+    except Exception as exc:  # pragma: no cover - reported, not swallowed
+        out.put((rank, None, f"{type(exc).__name__}: {exc}"))
+
+
+def _decide_across_two_ranks(env_by_rank):
+    import multiprocessing as mp
+
+    ctx = mp.get_context("spawn")
+    out = ctx.Queue()
+    port = _free_port()
+    procs = [
+        ctx.Process(
+            target=_split_drain_worker, args=(rank, 2, port, env_by_rank[rank], out)
+        )
+        for rank in (0, 1)
+    ]
+    for p in procs:
+        p.start()
+    results = {}
+    try:
+        for _ in procs:
+            rank, agreed, settled = out.get(timeout=120)
+            results[rank] = (agreed, settled)
+    finally:
+        for p in procs:
+            p.join(timeout=30)
+            if p.is_alive():  # pragma: no cover - a hung collective
+                p.terminate()
+                p.join(timeout=10)
+    return results
+
+
+class TestTheDrainSplitIsAgreedNotRead:
+    """`RAVEX_SPLIT_DRAIN` puts a barrier in the checkpoint path.
+
+    A barrier some ranks enter and others do not is two different collectives
+    posted on one process group: a hang until NCCL gives up, six hundred
+    seconds later, and then a dead run. So the ranks agree on the flag rather
+    than each reading it — and one rank without it turns the probe off for
+    everybody, which is the safe direction. A diagnostic that does not run
+    costs a measurement; one that hangs costs the run.
+
+    Setting it on one machine and not the other is not a far-fetched mistake:
+    `RAVEX_ASSUME_NO_NUMPY`, the other diagnostic of the same day, is *meant*
+    to be used that way.
+    """
+
+    def test_both_ranks_asking_for_it_get_it(self):
+        results = _decide_across_two_ranks({0: "1", 1: "1"})
+        assert set(results) == {0, 1}, results
+        for rank, (agreed, settled) in results.items():
+            assert agreed is True, f"rank {rank}: {agreed!r}"
+            assert settled is True, f"rank {rank} did not reach the end: {settled!r}"
+
+    def test_one_rank_without_it_turns_it_off_for_both(self):
+        """The case that would otherwise hang."""
+        results = _decide_across_two_ranks({0: "1", 1: None})
+        assert set(results) == {0, 1}, results
+        for rank, (agreed, settled) in results.items():
+            assert agreed is False, f"rank {rank} barriered alone: {agreed!r}"
+            assert settled is True, f"rank {rank} did not reach the end: {settled!r}"
+
+    def test_nobody_asking_is_off_and_costs_nothing(self):
+        results = _decide_across_two_ranks({0: None, 1: None})
+        assert all(agreed is False for agreed, _ in results.values()), results
+        assert all(settled is True for _, settled in results.values()), results

@@ -91,6 +91,10 @@ class RavexRuntime:
     #: a job that has not established a transport has not got one.
     _byte_transport_ok = False
     _byte_group = None
+    #: Whether the ranks agreed to split `drain` (RAVEX_SPLIT_DRAIN).
+    #: None until the first checkpoint asks them; never read per rank,
+    #: because a barrier only some ranks enter is a hang.
+    _split_drain = None
 
 
     def __init__(self, config: Optional[RavexConfig] = None):
@@ -118,6 +122,7 @@ class RavexRuntime:
         # and whether the observation has already been made.
         self._last_checkpoint_end: Optional[float] = None
         self._cadence_warned = False
+        self._split_drain: Optional[bool] = None
         self._shutdown_done = False
         self._lock = threading.RLock()
         self._framework = "unknown"
@@ -175,6 +180,35 @@ class RavexRuntime:
         except Exception as exc:
             logger.error("Activation failed: %s", exc, exc_info=True)
             self._disable("activation failed")
+
+    def _drain_split_agreed(self) -> bool:
+        """Whether every rank asked for `RAVEX_SPLIT_DRAIN`. **Collective, once.**
+
+        The diagnostic it gates puts a `barrier()` in the checkpoint path, and
+        a barrier some ranks enter and others do not is two different
+        collectives posted on one process group: a hang until NCCL gives up
+        six hundred seconds later, and then a dead run.
+
+        So the ranks *agree* rather than each reading the variable, and one
+        rank without it turns the probe off for everybody. That is the safe
+        direction — a diagnostic that does not run costs a measurement, one
+        that hangs costs the run.
+
+        Setting it on one machine and not the other is not a far-fetched
+        mistake. `RAVEX_ASSUME_NO_NUMPY`, the other diagnostic added the same
+        day, is *meant* to be used exactly that way, and the two sit next to
+        each other in the documentation.
+
+        Asked once and remembered: the answer cannot change mid-run, and the
+        agreement is itself a collective that must not be posted from a
+        varying number of places. The caller has it inside the region with no
+        early `return`, which is what makes every rank reach it.
+        """
+        if self._split_drain is None:
+            self._split_drain = all_ranks_agree(
+                os.environ.get("RAVEX_SPLIT_DRAIN", "") not in ("", "0", "false")
+            )
+        return self._split_drain
 
     def _announce_storage_topology(self) -> None:
         """Say which of the three situations this multi-machine job is in.
@@ -513,7 +547,22 @@ class RavexRuntime:
         #
         # A barrier first splits them: what it absorbs is skew, what is left
         # in `drain` after it is queue. See GPU-98.
-        if os.environ.get("RAVEX_SPLIT_DRAIN", "") not in ("", "0", "false"):
+        #
+        # **The ranks agree on it; they do not each read it.** A barrier some
+        # ranks enter and others do not is two different collectives posted on
+        # one process group — a hang until NCCL times out, six hundred
+        # seconds, and then a failed run. That is not a hypothetical way to
+        # set it wrong: `RAVEX_ASSUME_NO_NUMPY`, the other diagnostic added
+        # the same day, is *meant* to be set on one machine and not the other,
+        # so the habit this one has to survive already exists.
+        #
+        # So the agreement is unconditional and the barrier is conditional.
+        # Every rank calls `all_ranks_agree` — it sits inside the region below
+        # that has no early `return` for exactly this reason — and unanimity
+        # is what turns the probe on. One rank without the variable turns it
+        # off for everybody, which is the safe direction: a diagnostic that
+        # does not run costs a measurement, one that hangs costs the run.
+        if self._drain_split_agreed():
             from ravex._distributed import barrier
 
             barrier()

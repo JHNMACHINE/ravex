@@ -359,6 +359,49 @@ empty disk pulls its store back. See
 [More than one machine](how-it-works.md#more-than-one-machine) for what each
 one actually guarantees.
 
+## Diagnostics
+
+Two environment variables exist to make something measurable that is otherwise
+unreachable. **Neither is a setting.** They have no place in `ravex.yaml`, they
+do nothing useful in a real run, and each carries a rule about how it must be
+applied across machines.
+
+### `RAVEX_ASSUME_NO_NUMPY`
+
+Forces Ravex to behave as though torch cannot convert a tensor to NumPy.
+
+Every agreement between ranks — the step to resume from, which stores each
+machine can see, the run id, whether the storage is shared, whether every rank
+succeeded — goes through one object-gather helper. That helper has two
+implementations, and it picks the NumPy-free one *only* when
+`tensor.numpy()` fails. Every image worth renting ships NumPy, so without this
+variable the replacement is unreachable on real hardware and would ship having
+never run on a network.
+
+**Set it per machine, deliberately.** The interesting case is one rank with
+NumPy and one without, which is what two boxes from one provider look like
+when they come up from different images. Setting it on one node and not the
+other is the *intended* use.
+
+### `RAVEX_SPLIT_DRAIN`
+
+Adds a `skew` phase to the checkpoint breakdown: a barrier before the
+accelerator drain, timed separately.
+
+`drain` waits for the device queue, and is left out of the reported handoff
+cost on the grounds that it is work the training loop had already queued. The
+barrier separates that from a rank waiting on a peer — what the barrier
+absorbs is skew, what remains in `drain` is queue. On two machines on
+2026-08-30 the split came out `skew 34.6 s / drain 0.000 s` on one rank and
+`skew 103.8 s / drain 0.000 s` on the other: all of it was skew.
+
+**Set it on every rank or on none.** Unlike the variable above, this one puts
+a collective in the checkpoint path, and a barrier some ranks enter and others
+do not is a hang until NCCL gives up. Ravex will not let that happen — the
+ranks agree on the flag rather than each reading it, and one rank without it
+turns the probe off for everybody — but a partial setting silently gets you no
+measurement rather than the one you asked for.
+
 ## Step budgets
 
 A resumed script runs its own loop from the top. `for epoch in range(10)` has

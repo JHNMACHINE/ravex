@@ -235,7 +235,21 @@ def test_a_rank_with_nothing_to_write_still_answers_the_verdict(storage, monkeyp
     )
 
     runtime.checkpoint()
-    assert asked == [True], "a rank with nothing of its own to write skipped the agreement"
+    # Two, in this order, and the count is part of what is being checked.
+    #
+    #   False  the one-off agreement on RAVEX_SPLIT_DRAIN — unset here, so
+    #          nobody barriers. It is posted unconditionally and cached, so it
+    #          costs one collective per run and none per checkpoint after the
+    #          first; a rank that read the variable locally instead would be
+    #          the hang this whole test is about, one level down.
+    #   True   the verdict, which is what the test was written for.
+    #
+    # Asserted as a sequence rather than as `True in asked`: a rank that
+    # entered one collective and skipped the other is exactly the failure
+    # here, and a membership check would not see it.
+    assert asked == [False, True], (
+        "a rank with nothing of its own to write skipped one of the collectives"
+    )
 
 
 def test_a_failure_on_another_rank_stops_this_one_too(storage, monkeypatch):
