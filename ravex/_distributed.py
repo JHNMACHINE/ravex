@@ -267,6 +267,52 @@ def byte_transport_group():
     return True, group
 
 
+def emergency_group(timeout_seconds: int):
+    """A dedicated group for the SIGTERM detection channel: ``(usable, group)``.
+
+    **Collective.** GPU-92's minimal coordination primitive — the mattone
+    GPU-94 (elastic torchrun) will need to generalize for broader multi-rank
+    coordination. Do not duplicate this pattern there; extend or replace this.
+
+    Unlike :func:`byte_transport_group`, this never answers ``(True, None)``.
+    Reusing the default group there is safe because the only thing being asked
+    is whether it can carry CPU tensors at all. Here the thing being asked for
+    is a *timeout independent of the main group's* — the whole reason this
+    channel is separate is so a stuck detection round fails in seconds rather
+    than however long the training job's own process group is configured to
+    wait (thirty minutes, unless the caller overrode it — see the checkpoint
+    path's own comment on what that costs in billed, idle GPUs). Answering
+    ``None`` would hand back the main group and quietly drop that guarantee.
+
+    ``None`` is returned instead when there is nothing safe to build: no
+    process group up, or no gloo available to build one on. The caller must
+    then treat the emergency channel as off for this run, the same as any
+    other collective this module refuses to post.
+    """
+    dist = _dist()
+    if dist is None or not dist.is_available() or not dist.is_initialized():
+        return False, None
+    if not dist.is_gloo_available():
+        return False, None
+
+    import datetime
+
+    try:
+        group = dist.new_group(
+            backend="gloo", timeout=datetime.timedelta(seconds=timeout_seconds)
+        )
+    except Exception as exc:
+        logger.warning(
+            "Could not open the emergency-signal group: %s. Preemption on "
+            "this job will not attempt a coordinated sharded checkpoint - "
+            "periodic checkpoints are unaffected.",
+            exc,
+        )
+        return False, None
+
+    return True, group
+
+
 def is_sharded(model) -> bool:
     """Whether this model's parameters are split across ranks.
 
@@ -914,6 +960,41 @@ def all_ranks_agree(ok: bool) -> bool:
 
     flags = _all_gather_object(dist, bool(ok))
     return all(bool(flag) for flag in flags)
+
+
+def emergency_signalled(local_flag: bool, group) -> bool:
+    """Whether *any* rank has raised its own SIGTERM flag. **Collective.**
+
+    GPU-92's minimal coordination primitive — see :func:`emergency_group`.
+    Posted only from the one call site (``RavexRuntime._check_emergency_signal``)
+    that reaches every rank at the same optimizer-step cadence, unconditionally
+    — the same discipline ``_drain_split_agreed`` documents for its own
+    barrier: a collective some ranks post and others do not is two different
+    collectives on one process group, which is a hang until the group's
+    timeout gives up, not a diagnostic that quietly does nothing.
+
+    Reduced with ``MAX`` rather than ``AND``, deliberately the opposite of
+    :func:`all_ranks_agree`: that one asks whether *everyone* succeeded, this
+    one asks whether *anyone* is asking for help. One rank with the flag set
+    is enough to pull every rank into the emergency checkpoint together.
+
+    Does not itself catch a timeout or any other failure of the underlying
+    collective — that decision belongs to the caller, which is expected to
+    treat any exception here as "no emergency this round" and carry on
+    exactly as if this function had never been called. Raising here rather
+    than swallowing keeps that fallback visible at the one call site instead
+    of hidden inside a collective that looks, from the outside, like a plain
+    bool.
+    """
+    dist = _dist()
+    if dist is None or not dist.is_available() or not dist.is_initialized() or group is None:
+        return bool(local_flag)
+
+    import torch
+
+    flag = torch.tensor([1 if local_flag else 0], dtype=torch.int32)
+    dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=group)
+    return bool(flag.item())
 
 
 def apply_sharded_state(model, optimizers, model_state, optimizer_state) -> None:

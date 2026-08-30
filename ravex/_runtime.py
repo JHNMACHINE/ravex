@@ -95,7 +95,16 @@ class RavexRuntime:
     #: None until the first checkpoint asks them; never read per rank,
     #: because a barrier only some ranks enter is a hang.
     _split_drain = None
-
+    #: Set only from `_install_signal_handler`'s closure - the one thing that
+    #: code is allowed to do. See `on_step` for why.
+    _emergency_requested = False
+    #: Whether this rank participates in the SIGTERM detection channel at
+    #: all: sharded, multi-machine, and turned on. Decided once from facts
+    #: identical on every rank (config plus launcher environment), the same
+    #: way `_storage_split` is - so unlike `_split_drain` this needs no
+    #: agreement collective of its own to be safe to branch on.
+    _emergency_active: Optional[bool] = None
+    _emergency_group = None
 
     def __init__(self, config: Optional[RavexConfig] = None):
         self.config = config or RavexConfig.load()
@@ -123,6 +132,9 @@ class RavexRuntime:
         self._last_checkpoint_end: Optional[float] = None
         self._cadence_warned = False
         self._split_drain: Optional[bool] = None
+        self._emergency_requested = False
+        self._emergency_active: Optional[bool] = None
+        self._emergency_group = None
         self._shutdown_done = False
         self._lock = threading.RLock()
         self._framework = "unknown"
@@ -439,6 +451,11 @@ class RavexRuntime:
             self._try_resume()
 
         self.registry.step_count += 1
+
+        if self._emergency_coordination_active():
+            if self.registry.step_count % self.config.emergency_check_every == 0:
+                self._check_emergency_signal()
+
         if self.registry.step_count % self.config.checkpoint_every == 0:
             # Not here: this is the middle of the iteration, before the LR
             # scheduler has stepped. Flag it and collect at the top of the next
@@ -529,13 +546,21 @@ class RavexRuntime:
 
     # ─── checkpointing ──────────────────────────────────────────────
 
-    def checkpoint(self, final: bool = False) -> bool:
+    def checkpoint(self, final: bool = False, emergency: bool = False) -> bool:
         """Collect and hand off a checkpoint. Returns True if one was written.
 
         Collection runs on the training thread on purpose: the state has to be
         consistent with the step that just finished. The backend copies it and
         writes in the background, so what the loop actually pays for is the
         copy, not the I/O.
+
+        ``emergency`` only adds a metadata flag (see below) — it changes
+        nothing about how this function collects or writes state. By the time
+        it is called with ``emergency=True``, from
+        ``_check_emergency_signal``, every rank that needs to be here already
+        is: the flag exists for recovery analysis afterward, not to change
+        this function's own safety logic, which does not know or need to know
+        why a given call happened.
         """
         if not self._enabled:
             return False
@@ -630,6 +655,14 @@ class RavexRuntime:
                         metadata["run_id"] = self.config.run_id
                     if final:
                         metadata["final"] = "true"
+                    if emergency:
+                        # For recovery analysis, not for resume: nothing reads
+                        # this back to make a decision. It says this was
+                        # written because a signal came in, not because the
+                        # process exited on its own - useful when reading a
+                        # manifest after the fact, irrelevant to whether the
+                        # checkpoint loads.
+                        metadata["emergency"] = "true"
 
                     phases.update(backend.save(step, state, metadata) or {})
                     wrote = True
@@ -1061,11 +1094,22 @@ class RavexRuntime:
     # ─── shutdown ───────────────────────────────────────────────────
 
     def _install_signal_handler(self) -> None:
-        """Checkpoint on SIGTERM — the signal a preempted spot instance gets.
+        """Catch SIGTERM — the signal a preempted spot instance gets.
 
         Only installed when nothing else has claimed SIGTERM and only on the
         main thread; stealing the user's handler would be worse than missing
         the last few steps.
+
+        The handler itself does almost nothing. A signal handler runs inside
+        whatever the main thread was doing when the signal landed — which, on
+        a sharded job, can be a training-thread collective already in flight.
+        Calling `shutdown()` from here, as this used to do, means posting a
+        *second* collective from inside a context that might already be
+        halfway through a first one: not a hang this code introduces on
+        purpose, but one it could trigger by accident. So the handler only
+        raises a flag; `on_step` — ordinary code, on the training thread,
+        between collectives rather than astride one — does the rest at the
+        next safe point. See `_check_emergency_signal`.
         """
         if not self.config.handle_sigterm or os.name == "nt":
             return
@@ -1077,14 +1121,125 @@ class RavexRuntime:
                 return
 
             def handler(signum, frame):
-                logger.warning("SIGTERM received - saving before exit")
-                self.shutdown()
-                signal.signal(signal.SIGTERM, signal.SIG_DFL)
-                os.kill(os.getpid(), signum)
+                # Signal-safe on purpose: a plain attribute write is atomic in
+                # CPython and nothing here can block or re-enter a collective.
+                # The process does not die from this - Python's own handling
+                # of SIGTERM only terminates the process when nothing has
+                # claimed the signal, and this function only reaches here
+                # having confirmed that was true at install time. It stays
+                # alive until `_check_emergency_signal` finishes with it, or
+                # until the cloud's own grace period runs out and sends
+                # SIGKILL, which no handler anywhere can catch or delay.
+                self._emergency_requested = True
 
             signal.signal(signal.SIGTERM, handler)
         except (ValueError, OSError) as exc:  # pragma: no cover - platform dependent
             logger.debug("Could not install SIGTERM handler: %s", exc)
+
+    def _emergency_coordination_active(self) -> bool:
+        """Whether this run should probe for SIGTERM on other ranks at all.
+
+        Decided once and cached, from facts identical on every rank by
+        construction: the config (loaded the same way everywhere) and
+        `has_sharded_models` / `spans_several_machines`, both local,
+        structural questions with no rank-specific answer. Unlike
+        `_drain_split_agreed`, that means no agreement collective is needed
+        to make this safe to branch on - every rank reaches the same verdict
+        without asking.
+
+        Off for a plain-replicated (DDP) job: rank 0 already holds the whole
+        state locally and writes it without needing anything from anyone,
+        which is already what happens on SIGTERM today. Off for a single
+        machine too: every local process gets SIGTERM at effectively the same
+        instant from the same source, so there is nothing to coordinate
+        across a channel for. On only for the one case that needs it -
+        sharded models split across more than one machine - which is the
+        case `_final_checkpoint_is_safe` otherwise skips outright.
+        """
+        if self._emergency_active is None:
+            from ravex._distributed import spans_several_machines
+
+            self._emergency_active = bool(
+                self.config.handle_sigterm
+                and self.config.emergency_coordination
+                and self.registry.has_sharded_models()
+                and spans_several_machines()
+            )
+        return self._emergency_active
+
+    def _check_emergency_signal(self) -> None:
+        """Look for a SIGTERM on any rank; save together if one landed.
+
+        Reached by every rank at the same `emergency_check_every` cadence,
+        unconditionally - the same discipline `_drain_split_agreed` documents
+        for its own barrier, extended from "the same rank count" to "the same
+        step". A rank that acted on its own flag the moment it noticed it,
+        instead of waiting for this shared cadence, would be exactly the
+        single-rank-in-a-collective hang this mechanism exists to avoid. The
+        flag is only ever *read* here; it is never what triggers the
+        collective by itself.
+
+        Any failure below - the group failing to open, the detection
+        collective's own short timeout firing, anything else - is caught and
+        treated as "no emergency this round". That is the whole of the
+        fallback: training continues exactly as it would have if
+        `emergency_coordination` were off, which is also exactly what happens
+        today for every sharded job. This is a best-effort attempt, not a
+        guarantee - see docs/configuration.md and the CHANGELOG for the
+        measured numbers behind that, most importantly that the local handoff
+        alone has been measured close to or past the whole SIGTERM budget on
+        its own, before this channel's own cost.
+        """
+        if self._emergency_group is None:
+            from ravex._distributed import emergency_group
+
+            usable, self._emergency_group = emergency_group(
+                self.config.emergency_timeout
+            )
+            if not usable:
+                # Asked once and remembered, the same as a failed byte
+                # transport: retrying every cadence would just repeat the
+                # same failure and the same log line for the rest of the run.
+                self._emergency_active = False
+                return
+
+        try:
+            from ravex._distributed import emergency_signalled
+
+            signalled = emergency_signalled(
+                self._emergency_requested, self._emergency_group
+            )
+        except Exception as exc:
+            logger.warning(
+                "Emergency-signal check failed (%s) - continuing without a "
+                "coordinated preemption checkpoint this round.",
+                exc,
+            )
+            return
+
+        if not signalled:
+            return
+
+        logger.warning(
+            "SIGTERM reported by at least one rank - attempting a "
+            "coordinated emergency checkpoint across %d ranks. SIGTERM "
+            "gives ~10s and this is not guaranteed to land in time.",
+            get_world_size(),
+        )
+        wrote = self.checkpoint(final=True, emergency=True)
+        logger.warning(
+            "Emergency checkpoint %s at step %d.",
+            "written" if wrote else "did not complete",
+            self.registry.step_count,
+        )
+
+        # Only the rank(s) actually preempted terminate. Everyone else - the
+        # whole point of doing this coordinated rather than unilaterally -
+        # goes back to ordinary training, the same as after any periodic
+        # checkpoint.
+        if self._emergency_requested:
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            os.kill(os.getpid(), signal.SIGTERM)
 
     def _final_checkpoint_is_safe(self) -> bool:
         """Whether a last checkpoint can be taken without risking a hang.

@@ -39,6 +39,9 @@ ravex status
 | `track_dataloaders` | `RAVEX_TRACK_DATALOADERS` | `true` | Track and restore the dataset position. |
 | `track_rng` | `RAVEX_TRACK_RNG` | `true` | Save and restore torch / CUDA / Python / NumPy RNG state. |
 | `handle_sigterm` | `RAVEX_HANDLE_SIGTERM` | `true` | Checkpoint on SIGTERM — the signal a preempted spot instance receives. Only installed if nothing else has claimed the signal. |
+| `emergency_coordination` | `RAVEX_EMERGENCY_COORDINATION` | `true` | For sharded models split across more than one machine only: wait for every rank to notice a SIGTERM before attempting the collective save FSDP checkpointing needs. No effect on a replicated (DDP) job or a single machine. See [Emergency checkpoint on preemption](#emergency-checkpoint-on-preemption-sharded-models). |
+| `emergency_check_every` | `RAVEX_EMERGENCY_CHECK_EVERY` | `1` | Optimizer steps between checks for a SIGTERM on any rank. Only spent when `emergency_coordination` is active for this run (sharded, multi-machine). |
+| `emergency_timeout` | `RAVEX_EMERGENCY_TIMEOUT` | `20` | Seconds before the SIGTERM-detection channel gives up, if the rank that raised it disappears before the others get there. Isolated from the main process group's own timeout — see the section below. |
 | `fallback_on_error` | `RAVEX_FALLBACK_ON_ERROR` | `true` | On an unexpected error, log it and let training continue; the checkpoint is retried at the next one. Set `false` to raise instead. |
 | `log_file` | `RAVEX_LOG_FILE` | `null` | Log destination. Unset means stderr, WARNING and above only. |
 | `log_level` | `RAVEX_LOG_LEVEL` | `INFO` | |
@@ -358,6 +361,44 @@ checkpoints leave the machines on their own, and a rank that comes up with an
 empty disk pulls its store back. See
 [More than one machine](how-it-works.md#more-than-one-machine) for what each
 one actually guarantees.
+
+### Emergency checkpoint on preemption (sharded models)
+
+**Read the numbers before relying on this.** A preempted spot instance gets
+SIGTERM roughly 10s before it is killed. The local handoff alone — copying
+state off the GPU and handing it to the backend, no network involved — has
+been measured at 10.6s on 8× RTX 5060 Ti (see the CHANGELOG). That is already
+the whole budget, before this mechanism's own cost. **This is a best-effort
+attempt that will often not complete, not a guarantee that spot training under
+FSDP is reliable.** For a plain-replicated (DDP) job the existing SIGTERM
+handling already writes a complete checkpoint reliably, with nothing in this
+section relevant — this only concerns `sharded_checkpoints: per_rank` split
+across more than one machine.
+
+The reason it needs anything beyond `handle_sigterm` at all: extracting even
+one rank's own shard goes through PyTorch's own checkpoint machinery
+(`torch.distributed.checkpoint.state_dict.get_state_dict`), which is
+collective even when nothing is being gathered across ranks. A lone rank
+cannot produce a writable shard by itself. So on SIGTERM, the affected rank
+raises a flag; every rank checks for that flag at the same cadence
+(`emergency_check_every` steps); if any rank has it set, every rank enters the
+same save together. If the flag never reaches every rank in time, or the
+detection channel itself fails, nothing happens beyond what already happens
+today — the last periodic checkpoint stands, same as if this were switched
+off.
+
+The detection channel runs on its own process group, separate from the one
+carrying gradient synchronization, with its own short timeout
+(`emergency_timeout`). That isolation is deliberate: this project's own
+two-machine testing has already shown the network between rented boxes to be
+flaky enough that shortening the *main* group's timeout would risk killing
+otherwise-healthy runs on an ordinary transient blip. A stuck detection round
+fails on its own short timeout without ever touching that.
+
+Only the rank that actually received SIGTERM terminates afterward. Every
+other rank that entered the save together goes back to ordinary training,
+exactly as after any periodic checkpoint — a false alarm costs one
+out-of-cadence checkpoint, not a stopped job.
 
 ## Diagnostics
 

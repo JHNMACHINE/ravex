@@ -348,6 +348,35 @@ class RavexConfig:
     # it is killed.
     handle_sigterm: bool = True
 
+    # The coordinated emergency path for sharded models: on SIGTERM, wait for
+    # every rank to notice before attempting the collective save that FSDP
+    # checkpointing needs. Independent of `handle_sigterm` — that one governs
+    # whether Ravex catches the signal at all; this one governs only the
+    # cross-rank coordination, and is a no-op for a plain-replicated (DDP) job
+    # or a job confined to one machine, where nothing needs coordinating. See
+    # GPU-92 and docs/configuration.md.
+    emergency_coordination: bool = True
+
+    #: How often, in optimizer steps, every rank checks whether any rank has
+    #: raised the flag. `1` — every step — because the measured local handoff
+    #: (10.6s on 8x RTX 5060 Ti, see CHANGELOG) already consumes essentially
+    #: the whole ~10s SIGTERM budget on its own, leaving no slack to spend on
+    #: detection latency. Not yet validated against the actual per-step cost
+    #: of the detection collective on real cross-machine networking (measured
+    #: at 7 MB/s on RunPod, overlay-dependent on Vast.ai) — raise this if the
+    #: two-machine bench (`integration/two-machines/`) shows it taxing steady
+    #: state training more than the emergency path is worth.
+    emergency_check_every: int = 1
+
+    #: Timeout, in seconds, for the dedicated group the detection collective
+    #: runs on. Deliberately its own group with its own short timeout — see
+    #: `ravex._distributed.emergency_group` — so a stuck detection round fails
+    #: fast without ever touching the timeout the main process group uses for
+    #: ordinary gradient synchronization, which this project's own two-machine
+    #: kit has already shown to be flaky enough that shortening it globally
+    #: would kill otherwise-healthy runs.
+    emergency_timeout: int = 20
+
     log_file: Optional[str] = None
     log_level: str = "INFO"
     fallback_on_error: bool = True
@@ -442,6 +471,12 @@ class RavexConfig:
             self.track_rng = _as_bool(value, self.track_rng)
         if (value := get("HANDLE_SIGTERM")) is not None:
             self.handle_sigterm = _as_bool(value, self.handle_sigterm)
+        if (value := get("EMERGENCY_COORDINATION")) is not None:
+            self.emergency_coordination = _as_bool(value, self.emergency_coordination)
+        if (value := get("EMERGENCY_CHECK_EVERY")) is not None:
+            self.emergency_check_every = _as_int(value, self.emergency_check_every)
+        if (value := get("EMERGENCY_TIMEOUT")) is not None:
+            self.emergency_timeout = _as_int(value, self.emergency_timeout)
         if (value := get("LOG_FILE")) is not None:
             self.log_file = value or None
         if (value := get("LOG_LEVEL")) is not None:
@@ -487,6 +522,8 @@ class RavexConfig:
             "keep_last",
             "compression_level",
             "replicate_every",
+            "emergency_check_every",
+            "emergency_timeout",
         )
         boolean = (
             "enabled",
@@ -499,6 +536,7 @@ class RavexConfig:
             "track_dataloaders",
             "track_rng",
             "handle_sigterm",
+            "emergency_coordination",
             "fallback_on_error",
             "framework_auto_detect",
         )
@@ -563,6 +601,10 @@ class RavexConfig:
             self.keep_last = 1
         if self.replicate_every < 0:
             self.replicate_every = 0
+        if self.emergency_check_every < 1:
+            self.emergency_check_every = 1
+        if self.emergency_timeout < 1:
+            self.emergency_timeout = 1
         if str(self.compression).strip().lower() in ("none", "off", ""):
             self.compression_level = 0
 

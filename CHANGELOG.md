@@ -1,5 +1,54 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Coordinated emergency checkpoint on SIGTERM, for sharded models split
+  across more than one machine (GPU-92).**
+
+  A preempted spot instance gets SIGTERM ~10s before it is killed. For a
+  plain-replicated (DDP) job that was already enough: rank 0 holds the whole
+  state and writes it without needing anything from anyone. For
+  `sharded_checkpoints: per_rank`, it was not — extracting even one rank's own
+  shard goes through PyTorch's own `get_state_dict`, which is collective even
+  when nothing is gathered across ranks, so a lone preempted rank could not
+  produce a checkpoint by itself. Until now the SIGTERM handler simply skipped
+  the final checkpoint for every sharded job, unconditionally.
+
+  This adds a minimal coordination channel: the rank that catches SIGTERM
+  raises a flag; every rank checks for it at the same cadence
+  (`emergency_check_every`, default every step); if any rank has it set, every
+  rank enters the same collective save together, on the process group they
+  were already going to use. Detection runs on its own short-timeout group,
+  isolated from the one carrying gradient synchronization, so a stuck
+  detection round fails in seconds rather than however long the training
+  job's own process group is configured to wait. See
+  `ravex._distributed.emergency_group` / `emergency_signalled`, and
+  `RavexRuntime._check_emergency_signal`.
+
+  **Read this before relying on it.** The local handoff alone — no network,
+  just copying state off the GPU and handing it to the backend — has been
+  measured at 10.6s on 8× RTX 5060 Ti, against a SIGTERM budget of roughly
+  10s. That number alone consumes essentially the whole budget before this
+  channel's own cost. **This is a best-effort attempt that will often not
+  complete, not a guarantee that spot training under FSDP is now reliable.**
+  It exists because a save that sometimes lands is worth more than one that
+  never does, not because the numbers were made to work.
+
+  The channel is deliberately narrow — it says "save now" and nothing else;
+  no rank ever waits for a new node or tears down its process group because
+  of it. It is the minimal building block GPU-94 (elastic torchrun) will
+  need to generalize for broader multi-rank coordination; it is not a
+  substitute for that work; do not duplicate this pattern there.
+
+  New checkpoints written this way carry `emergency: true` in their metadata,
+  for recovery analysis — nothing reads it back to make a resume decision.
+
+  Config: `emergency_coordination`, `emergency_check_every`,
+  `emergency_timeout`. See
+  [Emergency checkpoint on preemption](docs/configuration.md#emergency-checkpoint-on-preemption-sharded-models).
+
 ## 0.0.5 — 2026-08-30
 
 ### Added
