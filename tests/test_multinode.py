@@ -757,6 +757,34 @@ class TestWhenTorchCannotReachNumpy:
         assert distributed.agree_on_run_id(FROM_STORE, "run-abc") == "run-abc"
 
 
+def _numpy_is_reachable():
+    """Whether torch can convert a tensor to NumPy in this interpreter.
+
+    Not every runner can produce "a rank with NumPy". The unit job in CI
+    installs torch and nothing else on purpose — that is the configuration
+    `_all_gather_object` exists for, and how the defect it fixes was found —
+    so on those jobs both paths in a "mixed" pair would be the NumPy-free one
+    and the test would be asserting something it cannot arrange.
+
+    `dist.all_gather_object` decodes with `tensor.numpy().tobytes()`, so where
+    this is False torch's own object collectives do not work at all and there
+    is nothing to be compatible *with*.
+    """
+    try:
+        import torch
+
+        torch.zeros(1, dtype=torch.uint8).numpy()
+        return True
+    except Exception:
+        return False
+
+
+NEEDS_NUMPY = pytest.mark.skipif(
+    not _numpy_is_reachable(),
+    reason="torch cannot reach NumPy here, so there is no 'with NumPy' rank to pair",
+)
+
+
 def _free_port():
     import socket
 
@@ -856,6 +884,7 @@ class TestTheObjectGatherOnTwoRanks:
             assert took_new is True, f"rank {rank} did not take the new path"
             assert got == self.PAYLOADS, f"rank {rank} gathered {got!r}"
 
+    @NEEDS_NUMPY
     def test_a_rank_with_numpy_and_a_rank_without_still_meet(self):
         """The claim `_all_gather_object` makes in its own docstring, and the
         one nothing else checks: the replacement posts the same collectives, in
@@ -873,9 +902,9 @@ class TestTheObjectGatherOnTwoRanks:
         for rank, (_, got) in results.items():
             assert got == self.PAYLOADS, f"rank {rank} gathered {got!r}"
 
-    def test_the_env_override_is_what_selects_the_path(self, monkeypatch):
+    def test_the_env_override_forces_the_replacement(self, monkeypatch):
         """`RAVEX_ASSUME_NO_NUMPY` exists so the replacement is reachable at
-        all: every image that matters ships NumPy, so without it the code that
+        all: every image worth renting ships NumPy, so without it the code that
         replaces torch's object collectives would reach a release having never
         run on a network."""
         from ravex import _distributed as distributed
@@ -883,6 +912,12 @@ class TestTheObjectGatherOnTwoRanks:
         monkeypatch.setattr(distributed, "_torch_numpy", None)
         monkeypatch.setenv("RAVEX_ASSUME_NO_NUMPY", "1")
         assert distributed._torch_can_reach_numpy() is False
+
+    @NEEDS_NUMPY
+    def test_without_the_override_the_probe_decides(self, monkeypatch):
+        """Turned off, the answer comes from asking torch rather than from the
+        variable — which is only observable where the answer is yes."""
+        from ravex import _distributed as distributed
 
         monkeypatch.setattr(distributed, "_torch_numpy", None)
         monkeypatch.setenv("RAVEX_ASSUME_NO_NUMPY", "0")

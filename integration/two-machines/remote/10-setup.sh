@@ -32,7 +32,8 @@ VENV="${VENV:-/venv/main}"
 # Not `--upgrade setuptools`: torch 2.11 pins setuptools<82, and upgrading
 # it here breaks that quietly. Only fill in what is missing.
 pip install --quiet --upgrade pip
-python -c "import setuptools, wheel" 2>/dev/null \n    || pip install --quiet "setuptools<82" wheel
+python -c "import setuptools, wheel" 2>/dev/null \
+    || pip install --quiet "setuptools<82" wheel
 # The image's torch may not have kernels for the GPU the box actually has.
 # Found on RunPod 2026-08-21: an RTX PRO 4500 Blackwell (sm_120) with a torch
 # built up to sm_90. `torch.cuda.is_available()` answers True — the failure

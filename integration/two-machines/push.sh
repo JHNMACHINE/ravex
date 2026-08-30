@@ -70,7 +70,8 @@ send() {
         "mkdir -p $KIT_ROOT/ravex $KIT_ROOT/kit $KIT_ROOT/out $KIT_ROOT/run"
     tar czf - -C "$SRC" \
         --exclude .git --exclude .venv --exclude target --exclude build \
-        --exclude dist --exclude checkpoints --exclude '*.egg-info' \n        --exclude results \
+        --exclude dist --exclude checkpoints --exclude '*.egg-info' \
+        --exclude results \
         --exclude __pycache__ . \
         | "${SSH[@]}" -p "$port" "$host" "tar xzf - --no-same-owner -C $KIT_ROOT/ravex"
     tar czf - -C "$HERE/remote" . | "${SSH[@]}" -p "$port" "$host" "tar xzf - --no-same-owner -C $KIT_ROOT/kit"
