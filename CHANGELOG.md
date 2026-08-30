@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.0.5 — unreleased
+## 0.0.5 — 2026-08-30
 
 ### Added
 
@@ -56,6 +56,17 @@
   spelled ones with it.
 
   Needs Moonclip 0.0.9, which is already the floor.
+
+  And it says so rather than crashing into it. Moonclip before 0.0.9
+  declares `save_dtype` as a string, so the mapping form reaches it as a
+  `TypeError` — which `get_backend` catches along with everything else,
+  so one configuration line would have cost the run its Moonclip
+  checkpointing entirely, reported as "Moonclip backend unavailable". That
+  is the exact failure the 0.0.8 post-mortem named: a version requirement
+  wearing compatibility as a disguise. The version is now checked in the
+  open, and what degrades is the option rather than the backend —
+  checkpointing continues, at the precision the tensors arrived in, and
+  the log line says which Moonclip would be needed.
 
 - **`reshard_on_resume`: a `per_rank` checkpoint can be resumed at a different
   world size.** Each rank rebuilds its own shard out of the old ones — eight

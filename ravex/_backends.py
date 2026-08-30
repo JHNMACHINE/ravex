@@ -122,6 +122,31 @@ class CheckpointBackend(ABC):
 _PREFIX = "ravex"
 
 
+#: First Moonclip that accepts `save_dtype` as a mapping, and the first that
+#: knows `fp64`. Below it the argument is a plain string with a shorter
+#: vocabulary.
+_SAVE_DTYPE_SINCE = (0, 0, 9)
+
+
+def _supports_save_dtype(moonclip) -> bool:
+    """Whether the installed Moonclip understands this `save_dtype`.
+
+    An unreadable or unexpected version is taken as *supported*. The floor is
+    declared in `pyproject.toml`, so being here with something older is
+    already unusual; guessing "no" on a version string this cannot parse
+    would silently drop a setting that probably works, which is the failure
+    this function exists to prevent rather than to reproduce.
+    """
+    raw = getattr(moonclip, "__version__", None)
+    if not isinstance(raw, str):
+        return True
+    try:
+        parts = tuple(int(p) for p in raw.split(".")[:3])
+    except ValueError:
+        return True
+    return parts >= _SAVE_DTYPE_SINCE
+
+
 class MoonclipBackend(CheckpointBackend):
     """Default backend, built on the Moonclip checkpoint engine."""
 
@@ -156,10 +181,40 @@ class MoonclipBackend(CheckpointBackend):
         # Component names became globs on the way out of the config: Moonclip
         # matches names and deliberately does not know what an optimizer is.
         save_dtype = config.resolve_save_dtype()
+        if save_dtype is not None and not _supports_save_dtype(moonclip):
+            # Stated as a version requirement, out loud, rather than left to
+            # be discovered as an exception. Moonclip before 0.0.9 declares
+            # `save_dtype` as a string, so the mapping form arrives as a
+            # `TypeError` — and `get_backend` catches everything, so the run
+            # would lose Moonclip checkpointing *entirely* over one setting,
+            # reported as "Moonclip backend unavailable". One config option,
+            # the whole run downgraded to `torch.save`, and a message that
+            # blames the wrong thing.
+            #
+            # So the narrow thing degrades instead of the broad one: the
+            # option is dropped, checkpointing continues, and the reason names
+            # itself. `fp64` and the per-component form both arrived in 0.0.9,
+            # which is why this covers the setting rather than one spelling of
+            # it — emulating the older vocabulary here would put a copy of
+            # Moonclip's dtype table in the wrong repository.
+            logger.warning(
+                "save_dtype needs Moonclip >= 0.0.9 (installed: %s); storing "
+                "every tensor at the precision it arrives in. Upgrade "
+                "Moonclip to use it — checkpointing is otherwise unaffected.",
+                getattr(moonclip, "__version__", "unknown"),
+            )
+            save_dtype = None
+            # Already told, and told something more useful. Pointing at a
+            # setting they just used would read as if it had been ignored for
+            # no reason.
+            configured = True
+        else:
+            configured = save_dtype is not None
+
         if save_dtype is not None:
             kwargs["save_dtype"] = save_dtype
             logger.info("save_dtype=%s", save_dtype)
-        else:
+        elif not configured:
             # Said once per run, and not as a warning, because nothing is
             # wrong — the default is deliberately "store what arrived". It is
             # here because the setting is worth a great deal and is invisible
@@ -169,7 +224,7 @@ class MoonclipBackend(CheckpointBackend):
             # that every checkpoint should at least know the knob exists.
             logger.info(
                 "save_dtype is unset: every tensor is stored at the precision "
-                "it arrives in. Optimizer state is typically ~85%% of a "
+                "it arrives in. Optimizer state is typically ~85% of a "
                 "checkpoint and compresses worst; save_dtype={optimizer: "
                 "bf16} halves that part and leaves the model untouched."
             )

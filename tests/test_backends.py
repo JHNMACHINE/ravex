@@ -372,3 +372,119 @@ def test_the_unset_setting_is_mentioned_once(tmp_path, caplog):
             make_config(tmp_path, backend="moonclip", save_dtype={"optimizer": "bf16"})
         )
     assert not any("save_dtype is unset" in r.message for r in caplog.records)
+
+
+class TestSaveDtypeNeedsANewEnoughMoonclip:
+    """A version requirement stated out loud instead of found as a crash.
+
+    Moonclip before 0.0.9 declares `save_dtype` as a string, so the mapping
+    form reaches it as a `TypeError` — and `get_backend` catches everything.
+    Left alone, one configuration line would cost the whole run its Moonclip
+    checkpointing, reported as "Moonclip backend unavailable", which blames
+    the wrong thing. This is the rule from the 0.0.8 release post-mortem:
+    a capability probe around a backend call is a version requirement, and it
+    belongs in the open.
+    """
+
+    @staticmethod
+    def _with_version(monkeypatch, version, strict):
+        """Point the backend at a Moonclip claiming `version`.
+
+        With `strict`, the manager rejects a non-string `save_dtype` the way
+        0.0.8's binding does.
+        """
+        import moonclip
+
+        from ravex import _backends
+
+        real = moonclip.MoonclipManager
+
+        class Pinned:
+            def __new__(cls, **kwargs):
+                value = kwargs.get("save_dtype")
+                if strict and value is not None and not isinstance(value, str):
+                    raise TypeError(
+                        "argument 'save_dtype': 'dict' object cannot be "
+                        "converted to 'PyString'"
+                    )
+                return real(**kwargs)
+
+        monkeypatch.setattr(moonclip, "MoonclipManager", Pinned)
+        monkeypatch.setattr(moonclip, "__version__", version, raising=False)
+        monkeypatch.setattr(_backends, "moonclip", moonclip, raising=False)
+
+    @pytest.mark.skipif(not HAVE_MOONCLIP, reason="moonclip not installed")
+    def test_an_old_moonclip_loses_the_option_not_the_backend(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        from ravex._backends import get_backend
+
+        self._with_version(monkeypatch, "0.0.8", strict=True)
+        config = make_config(
+            tmp_path, backend="moonclip", save_dtype={"optimizer": "bf16"}
+        )
+
+        with caplog.at_level("INFO", logger="ravex"):
+            backend = get_backend(config)
+
+        assert type(backend).__name__ == "MoonclipBackend", (
+            "checkpointing must survive a setting this Moonclip cannot honour"
+        )
+        assert any(
+            "save_dtype needs Moonclip >= 0.0.9" in r.message for r in caplog.records
+        ), [r.message for r in caplog.records]
+
+    @pytest.mark.skipif(not HAVE_MOONCLIP, reason="moonclip not installed")
+    def test_it_does_not_then_suggest_the_setting_they_just_used(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """Two lines about the same setting, the second implying they never
+        set it, reads as if the first were a shrug."""
+        from ravex._backends import get_backend
+
+        self._with_version(monkeypatch, "0.0.8", strict=True)
+        config = make_config(
+            tmp_path, backend="moonclip", save_dtype={"optimizer": "bf16"}
+        )
+
+        with caplog.at_level("INFO", logger="ravex"):
+            get_backend(config)
+
+        assert not any("save_dtype is unset" in r.message for r in caplog.records)
+
+    @pytest.mark.skipif(not HAVE_MOONCLIP, reason="moonclip not installed")
+    def test_a_new_enough_moonclip_is_handed_the_setting(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        from ravex._backends import get_backend
+
+        self._with_version(monkeypatch, "0.0.9", strict=False)
+        config = make_config(
+            tmp_path, backend="moonclip", save_dtype={"optimizer": "bf16"}
+        )
+
+        with caplog.at_level("INFO", logger="ravex"):
+            backend = get_backend(config)
+
+        assert type(backend).__name__ == "MoonclipBackend"
+        assert not any("needs Moonclip" in r.message for r in caplog.records)
+
+    @pytest.mark.skipif(not HAVE_MOONCLIP, reason="moonclip not installed")
+    def test_an_unreadable_version_is_taken_as_new_enough(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """The floor is declared in `pyproject.toml`, so an unparseable
+        version is a packaging oddity rather than an old install. Guessing
+        "too old" would drop a setting that works — the very failure this
+        check exists to prevent."""
+        from ravex._backends import get_backend
+
+        self._with_version(monkeypatch, "0.0.9.dev0+local", strict=False)
+        config = make_config(
+            tmp_path, backend="moonclip", save_dtype={"optimizer": "bf16"}
+        )
+
+        with caplog.at_level("INFO", logger="ravex"):
+            get_backend(config)
+
+        assert not any("needs Moonclip" in r.message for r in caplog.records)
