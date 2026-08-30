@@ -6,7 +6,8 @@ name: CI
 # instead.
 #
 # The cost, stated plainly: a branch is not proven against every interpreter
-# before merging, so a 3.9-only or integration-only failure lands on main.
+# before merging, so a single-interpreter or integration-only failure lands
+# on main.
 on:
   push:
     branches: [main]
@@ -22,11 +23,24 @@ jobs:
   # backend across the whole matrix without paying for a Rust build six times.
   unit:
     runs-on: codeberg-medium
+    # The release candidate reports and does not block. A prerelease
+    # interpreter going red is news worth having early and never a reason
+    # to hold a tag — and a permanent red parked in the matrix is worse
+    # than no coverage, because it is what a real red hides behind on the
+    # day someone checks the matrix before tagging.
+    continue-on-error: ${{ matrix.python == '3.15-rc' }}
     strategy:
       fail-fast: false
       matrix:
-        # Keep this list and the classifiers in pyproject.toml in step.
-        python: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+        # Keep in step with the classifiers in pyproject.toml and with
+        # https://devguide.python.org/versions/ — this list is that list,
+        # not a judgement of our own about who is still out there.
+        #
+        # 3.15 is a release candidate and is watched rather than required:
+        # see `continue-on-error` below. A red from a prerelease must not
+        # hold a tag, and — worse — must not be sitting in the matrix
+        # looking like noise on the day a real red needs to be seen.
+        python: ["3.11", "3.12", "3.13", "3.14", "3.15-rc"]
     container:
       image: python:${{ matrix.python }}-bookworm
     steps:

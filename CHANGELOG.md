@@ -108,6 +108,32 @@
 
 ### Changed
 
+- **Python 3.9 and 3.10 are no longer supported.** The floor is 3.11, and the
+  CI matrix runs 3.11 through 3.14, plus 3.15-rc watched without blocking.
+
+  The list is [the Python devguide's](https://devguide.python.org/versions/)
+  rather than a judgement of our own about who is still out there. 3.9 reached
+  end-of-life on 31 October 2025, ten months before this release. 3.10 is
+  still in security-only maintenance, but it reaches end-of-life in **October
+  2026** — two months from now — so stopping there would have meant doing this
+  again almost immediately. 3.11 runs to October 2027.
+
+  Dropping 3.9 also removes a real cost rather than a nominal one. On 3.9 a
+  clean `pip install torch` cannot `import torch.distributed.checkpoint` at
+  all: `torch.distributed.elastic.rendezvous.registry` does `from
+  importlib_metadata import entry_points` under a `sys.version_info < (3, 10)`
+  guard, and the wheel's metadata declares only filelock, fsspec, jinja2,
+  networkx, sympy and typing-extensions. Verified against the CPU wheel on
+  `python:3.9-bookworm`: the import fails, and installing that one backport
+  fixes it. The sharded-resume tests died there and on no other interpreter.
+  Every line of it is gated on being below 3.10, so raising the floor deletes
+  the problem instead of carrying a workaround for it.
+
+  3.15 is a release candidate, so it reports and does not block. A prerelease
+  going red is worth knowing early and is never a reason to hold a tag — and a
+  permanent red parked in the matrix is worse than no coverage, because it is
+  what a real red hides behind on the day someone checks before tagging.
+
 - **Shard placements are stored as data, not as `str(placement)`.** What went
   into a checkpoint was torch's own short repr — `S(0)`, `R`, `P(sum)` — and
   the only way back from it is a parser for a string nobody promised to keep.
