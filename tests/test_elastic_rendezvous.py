@@ -24,16 +24,24 @@ implementer would reasonably try - see below.
 after the fact: reusing the same raw ``TCPStore`` directly, for both the
 world_size=2 call and the later world_size=3 call, was the first thing tried
 because it looked like it should just work - a store is a store. It mostly
-does not. On Windows it raised, deterministically, from gloo's own transport
-layer (``sizeof(impl_) == bytes.size(). 136 vs 68``, in
-``gloo/transport/uv/address.cc``). Cross-checked in a Linux container (this
-box has no Linux any other way) to rule out a Windows-only artifact: it still
-fails there, differently and non-deterministically - "Connection reset by
-peer" from ``gloo/transport/tcp/pair.cc``, or an outright hang with every
-process still alive past a 10 s timeout. Both platforms need the same fix:
-wrap the shared store in a fresh ``PrefixStore`` per rendezvous "generation"
-(``gen0`` for the world_size=2 call, ``gen1`` for world_size=3), so the two
-calls never read each other's leftover handshake keys off the same store.
+does not, but "mostly" is the finding, not a hedge: this failure is
+**intermittent, on both platforms**, which is worse than a clean break
+because a run can pass by luck and look fixed. On Windows, 5 repeated runs
+failed 5/5 with a deterministic error from gloo's own transport layer
+(``sizeof(impl_) == bytes.size(). 136 vs 68``, in
+``gloo/transport/uv/address.cc``) - but a 6th run, later, succeeded cleanly
+on every rank with no code change at all. Cross-checked in a Linux container
+(this box has no Linux any other way) to rule out a Windows-only artifact:
+it fails there too, differently - "Connection reset by peer" from
+``gloo/transport/tcp/pair.cc``, or an outright hang with every process still
+alive past a 10 s timeout - and also not on every run. Both platforms need
+the same fix: wrap the shared store in a fresh ``PrefixStore`` per
+rendezvous "generation" (``gen0`` for the world_size=2 call, ``gen1`` for
+world_size=3), so the two calls never read each other's leftover handshake
+keys off the same store. Because the failure is intermittent, the negative
+test below repeats the naive attempt several times and requires at least one
+failure, rather than asserting it fails outright - a single clean pass does
+not mean the bug is gone, only that this particular run got lucky.
 """
 
 import datetime
@@ -162,7 +170,7 @@ class TestARankThatNeverExistedCanJoin:
         # and its only result is the phase-2 collective it joined fresh.
         assert messages[2] == [("phase2", 3.0)]
 
-    def test_reusing_the_bare_store_across_generations_does_not_work(self):
+    def test_reusing_the_bare_store_across_generations_is_not_reliable(self):
         """The negative case, kept rather than deleted once the fix was
         found - the same discipline as GPU-98's rule 5: this is what proves
         the ``PrefixStore`` above is load-bearing and not decoration.
@@ -173,29 +181,39 @@ class TestARankThatNeverExistedCanJoin:
         the two original ranks agree on world_size=2 with a store they are
         both new to. Phase 2 is where it breaks, because the store still
         holds handshake keys from phase 1 that a fresh rendezvous at a
-        different world_size was never meant to see. On this box (Windows)
-        that surfaces as a deterministic ``RuntimeError`` from gloo's own
-        transport layer. Cross-checked in a Linux container it is not even
-        the same failure - "Connection reset by peer", or every process
-        still alive past the 10 s phase-2 timeout, i.e. a hang. Constant
-        across both: phase 2 does not complete correctly. The test only
-        pins the part that reproduces on every platform tried - that phase 2
-        never delivers three correct results - not the platform-specific
-        shape of the failure.
+        different world_size was never meant to see - but it does not break
+        *every* time (see the module docstring), which is why this repeats
+        the attempt several times rather than asserting failure on a single
+        run: on this box (Windows) 5 repeats failed 5/5 with a deterministic
+        ``RuntimeError`` from gloo's own transport layer before a later,
+        unrelated run passed cleanly with no code change. Cross-checked in a
+        Linux container the failure shape is different again - "Connection
+        reset by peer", or every process still alive past the 10 s phase-2
+        timeout - and also not on every run there either. What is pinned
+        here is the one thing constant across both platforms and both
+        failure shapes: over several repeats, at least one must fail to
+        deliver three correct results. A test that required failure on
+        every single run would itself be wrong about what was actually
+        observed.
         """
-        messages, killed = _run_three_rank_rejoin(use_generations=False)
+        attempts = 5
+        any_failure = False
+        for _ in range(attempts):
+            messages, killed = _run_three_rank_rejoin(use_generations=False)
+            phase2_by_rank = {
+                rank: [v for phase, v in msgs if phase == "phase2"]
+                for rank, msgs in messages.items()
+            }
+            all_correct = all(values == [3.0] for values in phase2_by_rank.values())
+            if killed or not all_correct:
+                any_failure = True
+                break
 
-        phase2_by_rank = {
-            rank: [v for phase, v in msgs if phase == "phase2"]
-            for rank, msgs in messages.items()
-        }
-        all_correct = all(
-            values == [3.0] for values in phase2_by_rank.values()
-        )
-        assert not all_correct or killed, (
+        assert any_failure, (
             "reusing the bare store across generations succeeded cleanly on "
-            "every rank - if torch has started tolerating this, the "
-            "PrefixStore-per-generation workaround in the test above (and "
-            "in the design notes for GPU-94) is no longer needed and should "
-            "be revisited, not left in out of caution"
+            "every rank across %d repeats - if torch has started tolerating "
+            "this reliably, the PrefixStore-per-generation workaround (in "
+            "ravex._elastic.generation_store and in this test) is no longer "
+            "needed and should be revisited, not left in out of caution"
+            % attempts
         )

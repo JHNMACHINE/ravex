@@ -939,19 +939,26 @@ def storage_is_shared(path: str) -> bool:
             pass
 
 
-def gather_objects(value):
-    """One small picklable value from every rank, in rank order. **Collective.**
+def gather_objects(value, group=None):
+    """One small picklable value from every rank of ``group``, in rank order. **Collective.**
 
     For facts the ranks must agree on before pairing up point-to-point sends:
     who lost a store, who holds a whole copy of whose. Both ends deciding from
     the same list is what keeps a send from being posted with no receive
     waiting for it.
+
+    ``group`` defaults to ``None`` — the main training group, as before every
+    existing caller here was written. Passed explicitly, it gathers on an
+    isolated subgroup instead: ``ravex._elastic.topology_decision`` uses this
+    to carry a topology decision over the same isolated-gloo-subgroup channel
+    GPU-92's ``emergency_group`` builds, the way ``emergency_signalled``
+    carries its single bit.
     """
     dist = _dist()
     if dist is None or not dist.is_available() or not dist.is_initialized():
         return [value]
 
-    return _all_gather_object(dist, value)
+    return _all_gather_object(dist, value, group=group)
 
 
 def all_ranks_agree(ok: bool) -> bool:
