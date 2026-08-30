@@ -109,7 +109,7 @@
 ### Changed
 
 - **Python 3.9 and 3.10 are no longer supported.** The floor is 3.11, and the
-  CI matrix runs 3.11 through 3.14, plus 3.15-rc watched without blocking.
+  CI matrix runs 3.11 through 3.14.
 
   The list is [the Python devguide's](https://devguide.python.org/versions/)
   rather than a judgement of our own about who is still out there. 3.9 reached
@@ -129,10 +129,15 @@
   Every line of it is gated on being below 3.10, so raising the floor deletes
   the problem instead of carrying a workaround for it.
 
-  3.15 is a release candidate, so it reports and does not block. A prerelease
-  going red is worth knowing early and is never a reason to hold a tag — and a
-  permanent red parked in the matrix is worse than no coverage, because it is
-  what a real red hides behind on the day someone checks before tagging.
+  3.15 is **not** in the matrix, and was for exactly one day. It went in as a
+  release candidate marked `continue-on-error`, on the theory that a prerelease
+  is worth watching early and never worth holding a tag for. The theory did not
+  survive contact: torch on 3.15.0rc1 segfaults in its own C++ —
+  `TensorImpl::incref_pyobject`, reached through `torch.save` — and takes the
+  whole pytest process down on the *first* test. So there was no partial signal
+  to watch: 246 collected, nothing run. What was left was a permanently red
+  square, which is the thing a real red hides behind on the day someone checks
+  the matrix before tagging. It comes back when torch survives 3.15.
 
 - **Shard placements are stored as data, not as `str(placement)`.** What went
   into a checkpoint was torch's own short repr — `S(0)`, `R`, `P(sum)` — and

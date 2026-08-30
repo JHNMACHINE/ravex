@@ -23,12 +23,6 @@ jobs:
   # backend across the whole matrix without paying for a Rust build six times.
   unit:
     runs-on: codeberg-medium
-    # The release candidate reports and does not block. A prerelease
-    # interpreter going red is news worth having early and never a reason
-    # to hold a tag — and a permanent red parked in the matrix is worse
-    # than no coverage, because it is what a real red hides behind on the
-    # day someone checks the matrix before tagging.
-    continue-on-error: ${{ matrix.python == '3.15-rc' }}
     strategy:
       fail-fast: false
       matrix:
@@ -36,11 +30,22 @@ jobs:
         # https://devguide.python.org/versions/ — this list is that list,
         # not a judgement of our own about who is still out there.
         #
-        # 3.15 is a release candidate and is watched rather than required:
-        # see `continue-on-error` below. A red from a prerelease must not
-        # hold a tag, and — worse — must not be sitting in the matrix
-        # looking like noise on the day a real red needs to be seen.
-        python: ["3.11", "3.12", "3.13", "3.14", "3.15-rc"]
+        # 3.15 was here for one day, as a release candidate marked
+        # `continue-on-error`, on the theory that a prerelease is worth
+        # watching early and never worth holding a tag for. The theory did
+        # not survive contact: torch on 3.15.0rc1 **segfaults**, in its own
+        # C++ (`TensorImpl::incref_pyobject`, reached through `torch.save`),
+        # and it takes the whole pytest process down on the *first* test.
+        #
+        # So the job produced no partial signal to watch — not "244 pass and
+        # one fails", but 246 collected and nothing run. All it left was a
+        # permanently red square, which is exactly the thing a real red hides
+        # behind on the day someone checks this matrix before tagging.
+        #
+        # It comes back when torch ships a build that survives 3.15, which is
+        # torch's problem and not ours to work around. 3.15 is due final in
+        # October 2026; check then.
+        python: ["3.11", "3.12", "3.13", "3.14"]
     container:
       image: python:${{ matrix.python }}-bookworm
     steps:
