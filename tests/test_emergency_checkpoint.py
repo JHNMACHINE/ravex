@@ -56,7 +56,7 @@ class TestTheDetectionRoundDegradesCleanly:
         runtime.checkpoint = lambda *a, **k: calls.append((a, k)) or True
 
         monkeypatch.setattr(
-            "ravex._distributed.emergency_group", lambda timeout: (False, None)
+            "ravex._dist.collectives.emergency_group", lambda timeout: (False, None)
         )
 
         runtime._check_emergency_signal()
@@ -81,7 +81,7 @@ class TestTheDetectionRoundDegradesCleanly:
         def boom(local_flag, group):
             raise TimeoutError("simulated: the group's own short timeout fired")
 
-        monkeypatch.setattr("ravex._distributed.emergency_signalled", boom)
+        monkeypatch.setattr("ravex._dist.collectives.emergency_signalled", boom)
 
         runtime._check_emergency_signal()  # must return, not raise
 
@@ -100,7 +100,7 @@ class TestTheDetectionRoundDegradesCleanly:
         runtime.checkpoint = lambda *a, **k: calls.append((a, k)) or True
 
         monkeypatch.setattr(
-            "ravex._distributed.emergency_signalled", lambda local, group: False
+            "ravex._dist.collectives.emergency_signalled", lambda local, group: False
         )
 
         runtime._check_emergency_signal()
@@ -115,7 +115,7 @@ class TestTheDetectionRoundDegradesCleanly:
         runtime.checkpoint = lambda *a, **k: calls.append((a, k)) or True
 
         monkeypatch.setattr(
-            "ravex._distributed.emergency_signalled", lambda local, group: True
+            "ravex._dist.collectives.emergency_signalled", lambda local, group: True
         )
         killed = []
         monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append((pid, sig)))
@@ -155,7 +155,7 @@ class TestTheDetectionRoundDegradesCleanly:
         runtime._backend = RecordingBackend()
 
         monkeypatch.setattr(
-            "ravex._distributed.emergency_signalled", lambda local, group: True
+            "ravex._dist.collectives.emergency_signalled", lambda local, group: True
         )
         monkeypatch.setattr(os, "kill", lambda pid, sig: order.append("kill"))
         monkeypatch.setattr(signal, "signal", lambda sig, handler: None)
@@ -185,7 +185,7 @@ class TestTheDetectionRoundDegradesCleanly:
         runtime._backend = ExplodingBackend()
 
         monkeypatch.setattr(
-            "ravex._distributed.emergency_signalled", lambda local, group: True
+            "ravex._dist.collectives.emergency_signalled", lambda local, group: True
         )
         killed = []
         monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append((pid, sig)))
@@ -205,7 +205,7 @@ class TestTheDetectionRoundDegradesCleanly:
         runtime.checkpoint = lambda *a, **k: True
 
         monkeypatch.setattr(
-            "ravex._distributed.emergency_signalled", lambda local, group: True
+            "ravex._dist.collectives.emergency_signalled", lambda local, group: True
         )
         killed = []
         monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append((pid, sig)))
@@ -237,7 +237,7 @@ class TestEmergencyCoordinationIsDecidedOnce:
         runtime.registry = type("R", (), {"has_sharded_models": lambda self: True})()
 
         monkeypatch.setattr(
-            "ravex._distributed.spans_several_machines", lambda: False
+            "ravex._dist.collectives.spans_several_machines", lambda: False
         )
 
         assert runtime._emergency_coordination_active() is False
@@ -265,7 +265,7 @@ class TestEmergencyCoordinationIsDecidedOnce:
             return True
 
         runtime.registry = type("R", (), {"has_sharded_models": lambda self: has_sharded()})()
-        monkeypatch.setattr("ravex._distributed.spans_several_machines", lambda: True)
+        monkeypatch.setattr("ravex._dist.collectives.spans_several_machines", lambda: True)
 
         first = runtime._emergency_coordination_active()
         second = runtime._emergency_coordination_active()
@@ -388,7 +388,7 @@ def _emergency_worker(rank, world_size, port, local_flag, timeout_seconds, out):
     try:
         import torch.distributed as dist
 
-        from ravex._distributed import emergency_group, emergency_signalled
+        from ravex._dist.collectives import emergency_group, emergency_signalled
 
         dist.init_process_group("gloo", rank=rank, world_size=world_size)
         try:
@@ -480,7 +480,7 @@ def _emergency_partial_worker(rank, world_size, port, timeout_seconds, out):
     try:
         import torch.distributed as dist
 
-        from ravex._distributed import emergency_group, emergency_signalled
+        from ravex._dist.collectives import emergency_group, emergency_signalled
 
         dist.init_process_group("gloo", rank=rank, world_size=world_size)
         usable, group = emergency_group(timeout_seconds)

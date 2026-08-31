@@ -71,7 +71,11 @@ Changelog = "https://codeberg.org/JHNMACHINE/ravex/src/branch/main/CHANGELOG.md"
 ravex = "ravex._cli:main"
 
 [tool.setuptools]
-packages = ["ravex"]
+# Listed explicitly rather than discovered: `find` would also sweep up `tests`,
+# `bench` and `integration`, which are in the repository and not in the wheel.
+# The cost is that a new subpackage has to be added here or it silently does not
+# ship — the import works in a checkout and fails after `pip install`.
+packages = ["ravex", "ravex._dist", "ravex._interop"]
 
 [tool.setuptools.dynamic]
 version = { attr = "ravex.__version__" }

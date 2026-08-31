@@ -1,14 +1,14 @@
 """Turning a foreign checkpoint into a restorable state — GPU-90.
 
 Most of what could go wrong in a conversion is not arithmetic — that lives in
-:mod:`ravex._zero`, is checked against DeepSpeed's own reader, and is covered
+:mod:`ravex._interop.zero`, is checked against DeepSpeed's own reader, and is covered
 next door. What goes wrong here is **names**: a wrapper prefix, a buffer the
 model does not have, a head added since the checkpoint was written. Those
 produce a state dict that loads *partially*, and a partially loaded model is
 the failure this whole package is written against — it runs, it trains, and
 the loss curve looks like a bad learning rate.
 
-So these tests are mostly about :func:`ravex._convert.align`, and specifically
+So these tests are mostly about :func:`ravex._interop.convert.align`, and specifically
 about it refusing to be clever.
 """
 
@@ -17,7 +17,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from ravex._convert import (
+from ravex._interop.convert import (
     Alignment,
     CannotConvert,
     align,
@@ -26,7 +26,7 @@ from ravex._convert import (
     rename,
     unify,
 )
-from ravex._foreign import Foreign
+from ravex._interop.foreign import Foreign
 
 dcp = pytest.importorskip("torch.distributed.checkpoint")
 

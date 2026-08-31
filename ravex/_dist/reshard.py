@@ -16,7 +16,7 @@ Two ideas carry the whole file.
 
 **Offsets are measured, not derived.** The obvious approach is to reproduce
 torch's chunking rule and work out where each shard begins. Don't: the rule
-has an uneven-tail case that :func:`ravex._distributed._rebuild_dtensor`
+has an uneven-tail case that :func:`ravex._dist.collectives._rebuild_dtensor`
 already carries a comment about, and a second implementation of it would drift
 from the first in silence. Both sides can be *observed* instead — the old
 lengths are the shapes of the tensors that were saved, the new lengths are the

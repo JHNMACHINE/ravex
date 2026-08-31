@@ -29,8 +29,8 @@ def main() -> int:
     rank = dist.get_rank()
     world = dist.get_world_size()
 
-    from ravex import _distributed as D
-    from ravex._identity import FROM_STORE
+    from ravex._dist import collectives as D
+    from ravex._dist.identity import FROM_STORE
 
     D._torch_numpy = None
     numpy_free = not D._torch_can_reach_numpy()

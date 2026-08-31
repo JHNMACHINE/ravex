@@ -419,18 +419,18 @@ def _encode_shards(value: Any) -> Any:
     What comes back is plain tensors and plain data, which is all the storage
     backends can take. The global shape and the placements ride along so a
     resume onto a different layout can *say so* instead of failing with a shape
-    error from inside ``set_state_dict`` — and, since :mod:`ravex._reshard`,
+    error from inside ``set_state_dict`` — and, since :mod:`ravex._dist.reshard`,
     so it can do something about it.
 
     The placements are stored as data rather than as ``str(placement)``. The
-    old form is still read (see :func:`ravex._reshard.decode_placements`); it
+    old form is still read (see :func:`ravex._dist.reshard.decode_placements`); it
     is not still written, because the reshard planner has to ask which
     dimension a tensor was split along and parsing torch's ``repr`` for the
     answer is a dependency on a string nobody promised to keep.
     """
     DTensor = _dtensor_class()
     if DTensor is not None and isinstance(value, DTensor):
-        from ravex._reshard import encode_placement
+        from ravex._dist.reshard import encode_placement
 
         return {
             _SHARD_TAG: 1,
@@ -638,7 +638,7 @@ def shard_extents(tree: Any) -> Dict[ShardPath, int]:
     compares an old measurement against a new one, and neither side is allowed
     to be a guess about how torch chunks tensors.
     """
-    from ravex._reshard import decode_placements, shard_dim
+    from ravex._dist.reshard import decode_placements, shard_dim
 
     extents: Dict[ShardPath, int] = {}
     for path, node in walk_shards(tree):
@@ -667,7 +667,7 @@ def take_shard_slices(
     — a view would pin the entire tensor it was taken from, and pinning the
     whole old checkpoint is the thing this function exists to avoid.
     """
-    from ravex._reshard import decode_placements, shard_dim
+    from ravex._dist.reshard import decode_placements, shard_dim
 
     taken: Dict[ShardPath, List[Any]] = {}
     for path, intervals in wanted.items():
@@ -706,7 +706,7 @@ def build_resharded_tree(
     """
     import torch
 
-    from ravex._reshard import decode_placements, shard_dim
+    from ravex._dist.reshard import decode_placements, shard_dim
 
     def rebuild(node: Any, path: ShardPath) -> Any:
         if isinstance(node, dict) and node.get(_SHARD_TAG):
@@ -860,7 +860,7 @@ def agree_on_run_id(provenance: int, candidate: str) -> str:
     is naming the history this job is continuing; a rank that had to invent one
     is naming nothing. So the best-sourced candidate wins, and ties go to the
     lowest rank for determinism — see the provenance constants in
-    :mod:`ravex._identity`.
+    :mod:`ravex._dist.identity`.
 
     The case that makes this worth the care: rank 0's machine was replaced, so
     it generates, while ranks 1..n read the id of the run they are resuming. If
@@ -949,7 +949,7 @@ def gather_objects(value, group=None):
 
     ``group`` defaults to ``None`` — the main training group, as before every
     existing caller here was written. Passed explicitly, it gathers on an
-    isolated subgroup instead: ``ravex._elastic.topology_decision`` uses this
+    isolated subgroup instead: ``ravex._dist.elastic.topology_decision`` uses this
     to carry a topology decision over the same isolated-gloo-subgroup channel
     GPU-92's ``emergency_group`` builds, the way ``emergency_signalled``
     carries its single bit.

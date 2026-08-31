@@ -18,8 +18,8 @@ import os
 import pytest
 
 from ravex._backends import visible_rank_stores
-from ravex._distributed import agree_on_run_id, storage_is_shared
-from ravex._identity import (
+from ravex._dist.collectives import agree_on_run_id, storage_is_shared
+from ravex._dist.identity import (
     FROM_CONFIG,
     FROM_SCHEDULER,
     FROM_STORE,
@@ -283,12 +283,12 @@ class TestTheSharedStorageProbe:
     """
 
     def test_a_lone_process_sees_what_it_wrote(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("ravex._distributed._dist", lambda: None)
+        monkeypatch.setattr("ravex._dist.collectives._dist", lambda: None)
 
         assert storage_is_shared(str(tmp_path / "checkpoints")) is True
 
     def test_it_leaves_no_marker_behind(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("ravex._distributed._dist", lambda: None)
+        monkeypatch.setattr("ravex._dist.collectives._dist", lambda: None)
         path = tmp_path / "checkpoints"
 
         storage_is_shared(str(path))
@@ -301,7 +301,7 @@ class TestTheSharedStorageProbe:
         An unwritable checkpoint directory is a larger problem, and the backend
         reports it. This must not raise on the way to finding that out.
         """
-        monkeypatch.setattr("ravex._distributed._dist", lambda: None)
+        monkeypatch.setattr("ravex._dist.collectives._dist", lambda: None)
 
         def refuse(*args, **kwargs):
             raise OSError("read-only file system")
@@ -333,7 +333,7 @@ class TestWhatItSaysBeforeTheFirstCheckpoint:
         monkeypatch.setenv("WORLD_SIZE", str(world))
         monkeypatch.setenv("LOCAL_WORLD_SIZE", str(local))
         monkeypatch.setenv("LOCAL_RANK", str(local_rank))
-        monkeypatch.setattr("ravex._distributed._dist", lambda: None)
+        monkeypatch.setattr("ravex._dist.collectives._dist", lambda: None)
 
         probed = []
 
@@ -341,12 +341,12 @@ class TestWhatItSaysBeforeTheFirstCheckpoint:
             probed.append(path)
             return shared
 
-        monkeypatch.setattr("ravex._distributed.storage_is_shared", probe)
+        monkeypatch.setattr("ravex._dist.collectives.storage_is_shared", probe)
         # These tests have no process group at all, so the real probe would
         # answer "no transport" and the announcement would be about that
         # instead of about the topology, which is what they are here for.
         monkeypatch.setattr(
-            "ravex._distributed.byte_transport_group", lambda: transport
+            "ravex._dist.collectives.byte_transport_group", lambda: transport
         )
 
         runtime = RavexRuntime.__new__(RavexRuntime)
@@ -485,8 +485,8 @@ class TestWhatItSaysBeforeTheFirstCheckpoint:
         monkeypatch.setenv("WORLD_SIZE", "32")
         monkeypatch.setenv("LOCAL_WORLD_SIZE", "8")
         monkeypatch.setenv("LOCAL_RANK", "0")
-        monkeypatch.setattr("ravex._distributed._dist", lambda: None)
-        monkeypatch.setattr("ravex._distributed.storage_is_shared", lambda p: False)
+        monkeypatch.setattr("ravex._dist.collectives._dist", lambda: None)
+        monkeypatch.setattr("ravex._dist.collectives.storage_is_shared", lambda p: False)
 
         runtime = RavexRuntime.__new__(RavexRuntime)
         runtime.config = local_config(tmp_path)
@@ -513,9 +513,9 @@ def _install(monkeypatch, seen, world):
     one into the other here would quietly drop the records the messages read.
     """
     monkeypatch.setattr(
-        "ravex._distributed.gather_visible_stores", lambda mine: list(seen)
+        "ravex._dist.collectives.gather_visible_stores", lambda mine: list(seen)
     )
-    monkeypatch.setattr("ravex._distributed.get_world_size", lambda: world)
+    monkeypatch.setattr("ravex._dist.collectives.get_world_size", lambda: world)
 
 
 @pytest.fixture(autouse=True)
@@ -525,7 +525,7 @@ def _no_process_group(monkeypatch):
     The collectives are replaced per test; this only guarantees that a stray
     real one cannot be reached and block.
     """
-    monkeypatch.setattr("ravex._distributed._dist", lambda: None)
+    monkeypatch.setattr("ravex._dist.collectives._dist", lambda: None)
 
 
 # ─── the old-torch from_local fallback ──────────────────────────────
@@ -561,7 +561,7 @@ class TestInferredGlobalShape:
     """
 
     def test_an_even_split_infers_the_real_shape(self):
-        from ravex._distributed import _inferred_global_shape
+        from ravex._dist.collectives import _inferred_global_shape
 
         # 12 rows over 4 ranks: every rank holds 3, and 3 x 4 is the truth.
         assert _inferred_global_shape(
@@ -569,7 +569,7 @@ class TestInferredGlobalShape:
         ) == (12, 512)
 
     def test_an_uneven_split_is_caught_from_every_rank(self):
-        from ravex._distributed import _inferred_global_shape
+        from ravex._dist.collectives import _inferred_global_shape
 
         # 10 rows over 4 ranks: torch gives 3, 3, 3, 1. No rank infers 10, and
         # that is what keeps some ranks from raising while others proceed —
@@ -582,14 +582,14 @@ class TestInferredGlobalShape:
             )
 
     def test_replicated_placements_multiply_nothing(self):
-        from ravex._distributed import _inferred_global_shape
+        from ravex._dist.collectives import _inferred_global_shape
 
         assert _inferred_global_shape(
             (12, 512), [_Replicate()], _Mesh(4)
         ) == (12, 512)
 
     def test_a_two_dimensional_mesh_multiplies_each_axis_once(self):
-        from ravex._distributed import _inferred_global_shape
+        from ravex._dist.collectives import _inferred_global_shape
 
         # Sharded on dim 0 over a mesh axis of 2, and on dim 1 over one of 3.
         assert _inferred_global_shape(
@@ -597,7 +597,7 @@ class TestInferredGlobalShape:
         ) == (8, 15)
 
     def test_the_same_dimension_sharded_twice_compounds(self):
-        from ravex._distributed import _inferred_global_shape
+        from ravex._dist.collectives import _inferred_global_shape
 
         # Both mesh axes cut dim 0, so the local rows stand for 2 x 3 of them.
         assert _inferred_global_shape(
@@ -649,7 +649,7 @@ class TestTheOldSignatureFallback:
                     raise TypeError("from_local() got an unexpected keyword argument")
                 return ("rebuilt", tuple(local.shape))
 
-        import ravex._distributed as distributed
+        import ravex._dist.collectives as distributed
 
         monkeypatch.setattr(distributed, "_dtensor_class", lambda: OldDTensor)
 
@@ -658,7 +658,7 @@ class TestTheOldSignatureFallback:
         older signature loses nothing and the fallback is taken."""
         import torch
 
-        from ravex._distributed import _rebuild_dtensor
+        from ravex._dist.collectives import _rebuild_dtensor
 
         self._old_torch(monkeypatch)
         rebuilt = _rebuild_dtensor(
@@ -671,7 +671,7 @@ class TestTheOldSignatureFallback:
         and every shard would look fine on its own."""
         import torch
 
-        from ravex._distributed import _rebuild_dtensor
+        from ravex._dist.collectives import _rebuild_dtensor
 
         self._old_torch(monkeypatch)
         with pytest.raises(ValueError) as caught:
@@ -721,7 +721,7 @@ class TestWhenTorchCannotReachNumpy:
         """
         import torch
 
-        from ravex import _distributed as distributed
+        from ravex._dist import collectives as distributed
 
         def refuse(self, *args, **kwargs):
             raise RuntimeError("Numpy is not available")
@@ -733,7 +733,7 @@ class TestWhenTorchCannotReachNumpy:
 
     def test_objects_survive_the_round_trip(self, one_rank_group, monkeypatch):
         """The encode, the padding and the NumPy-free decode, end to end."""
-        from ravex import _distributed as distributed
+        from ravex._dist import collectives as distributed
 
         monkeypatch.setattr(distributed, "_torch_numpy", False)
 
@@ -746,8 +746,8 @@ class TestWhenTorchCannotReachNumpy:
     ):
         """The three callers a resume cannot get past: the step every rank
         holds, whether every rank restored, and the run id."""
-        from ravex import _distributed as distributed
-        from ravex._identity import FROM_STORE
+        from ravex._dist import collectives as distributed
+        from ravex._dist.identity import FROM_STORE
 
         monkeypatch.setattr(distributed, "_torch_numpy", False)
 
@@ -810,7 +810,7 @@ def _object_gather_worker(rank, world_size, port, no_numpy, payload, out):
     try:
         import torch.distributed as dist
 
-        from ravex import _distributed as distributed
+        from ravex._dist import collectives as distributed
 
         # The module-level cache is per process, and this process is fresh;
         # clearing it makes the env variable the only thing deciding.
@@ -907,7 +907,7 @@ class TestTheObjectGatherOnTwoRanks:
         all: every image worth renting ships NumPy, so without it the code that
         replaces torch's object collectives would reach a release having never
         run on a network."""
-        from ravex import _distributed as distributed
+        from ravex._dist import collectives as distributed
 
         monkeypatch.setattr(distributed, "_torch_numpy", None)
         monkeypatch.setenv("RAVEX_ASSUME_NO_NUMPY", "1")
@@ -917,7 +917,7 @@ class TestTheObjectGatherOnTwoRanks:
     def test_without_the_override_the_probe_decides(self, monkeypatch):
         """Turned off, the answer comes from asking torch rather than from the
         variable — which is only observable where the answer is yes."""
-        from ravex import _distributed as distributed
+        from ravex._dist import collectives as distributed
 
         monkeypatch.setattr(distributed, "_torch_numpy", None)
         monkeypatch.setenv("RAVEX_ASSUME_NO_NUMPY", "0")
@@ -934,7 +934,7 @@ def _drain_split_worker(rank, world_size, port, sharded, out):
     try:
         import torch.distributed as dist
 
-        from ravex._distributed import all_ranks_agree, barrier, get_world_size
+        from ravex._dist.collectives import all_ranks_agree, barrier, get_world_size
 
         dist.init_process_group("gloo", rank=rank, world_size=world_size)
         try:

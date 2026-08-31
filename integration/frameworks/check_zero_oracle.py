@@ -1,6 +1,6 @@
 """Check Ravex's ZeRO reader against DeepSpeed's own — GPU-90.
 
-``ravex._zero.unshard`` is a reimplementation of somebody else's format, and a
+``ravex._interop.zero.unshard`` is a reimplementation of somebody else's format, and a
 reimplementation is worth having only when something independent can say it is
 right. DeepSpeed writes ``zero_to_fp32.py`` into every checkpoint precisely so
 the reconstruction can be done without it; comparing the two is therefore not
@@ -20,8 +20,8 @@ import sys
 
 import torch
 
-from ravex._foreign import confirm_stage, identify, summary
-from ravex._zero import unshard
+from ravex._interop.foreign import confirm_stage, identify, summary
+from ravex._interop.zero import unshard
 
 
 def load(path):

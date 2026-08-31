@@ -23,7 +23,7 @@ that it still answers.
 **What this does not do is reshape anything.** A DCP checkpoint written by a
 job with tensor or pipeline parallelism records how the pieces of each tensor
 were laid out, and the metadata says so; turning that into a different
-parallelism is the same class of problem as :mod:`ravex._reshard` and is not
+parallelism is the same class of problem as :mod:`ravex._dist.reshard` and is not
 attempted here. What comes back is what the checkpoint holds, in the structure
 it was saved in.
 """

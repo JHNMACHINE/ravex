@@ -10,7 +10,7 @@ is the lesson GPU-83 paid for.
 
 Three legs, and the gap between them is the finding:
 
-  p2p     ``ravex._elastic.prestage_send`` / ``prestage_receive``, which is the
+  p2p     ``ravex._dist.elastic.prestage_send`` / ``prestage_receive``, which is the
           socket a slice mover would inherit. A whole store rather than a
           slice, deliberately: the transport does not exist yet, and a whole
           store is the honest ceiling on what one would achieve.
@@ -24,10 +24,10 @@ Three legs, and the gap between them is the finding:
           leg does — up and then down — so if it still wins, it wins clearly.
 
 What the numbers are divided into is not this store's size. It is the volume
-:func:`ravex._reshard.crossing_bytes` computes for a given reshard, which is
+:func:`ravex._dist.reshard.crossing_bytes` computes for a given reshard, which is
 usually a small fraction of a checkpoint and is sometimes exactly zero. Sizing
 a transport off "a reshard moves everything" would be sizing it off a case
-that mostly does not happen — see ``tests/test_reshard_locality.py``.
+that mostly does not happen — see ``tests/test_dist_reshard_locality.py``.
 """
 
 from __future__ import annotations
@@ -40,8 +40,8 @@ import time
 
 import torch.distributed as dist
 
-from ravex._elastic import prestage_receive, prestage_send
-from ravex._replication import store_files
+from ravex._dist.elastic import prestage_receive, prestage_send
+from ravex._dist.replication import store_files
 
 
 def directory_bytes(path: str) -> int:
@@ -248,7 +248,7 @@ def report(m: dict) -> None:
 
     if "p2p_seconds" in m:
         seconds = m["p2p_seconds"]
-        print("  p2p              %s (%.1f s, socket, ravex._elastic.prestage_*)"
+        print("  p2p              %s (%.1f s, socket, ravex._dist.elastic.prestage_*)"
               % (human(size / seconds if seconds else 0), seconds))
         # `complete` is StoreWriter's own verdict, and it is the one that
         # counts. Comparing the two directories' byte totals looked like a

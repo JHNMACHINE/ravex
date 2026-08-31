@@ -1,6 +1,6 @@
 """Reading a DeepSpeed ZeRO checkpoint back into whole tensors — GPU-90.
 
-:mod:`ravex._foreign` decides *what* a directory is without opening anything.
+:mod:`ravex._interop.foreign` decides *what* a directory is without opening anything.
 This opens it.
 
 **Stages 1 and 2 share an assembly; stage 3 does not.** That distinction was
@@ -81,7 +81,7 @@ class ZeroUnsupported(Exception):
     """A ZeRO checkpoint this reader will not attempt.
 
     Separate from ``ValueError`` for the same reason
-    :class:`ravex._reshard.ReshardUnsupported` is: "I refuse, and here is why"
+    :class:`ravex._dist.reshard.ReshardUnsupported` is: "I refuse, and here is why"
     is a different thing from "something went wrong", and only the first is
     something a user can act on.
     """
@@ -90,7 +90,7 @@ class ZeroUnsupported(Exception):
 def unshard(found, loader) -> Dict[str, Any]:
     """Every fp32 parameter of a ZeRO checkpoint, whole, keyed by its name.
 
-    ``found`` is a :class:`ravex._foreign.Foreign` describing a ``deepspeed``
+    ``found`` is a :class:`ravex._interop.foreign.Foreign` describing a ``deepspeed``
     checkpoint; ``loader`` opens one ``.pt`` path and returns what is in it, so
     this module names no torch API for I/O and the caller keeps control of how
     files are read.
@@ -423,7 +423,7 @@ def _optim_files(found) -> List[tuple]:
     from the names rather than inherited from whatever order the directory
     listing came back in. A filesystem is under no obligation to sort.
     """
-    from ravex._foreign import _ZERO_OPTIM
+    from ravex._interop.foreign import _ZERO_OPTIM
 
     found_ranks = []
     for name in found.files:
@@ -448,7 +448,7 @@ def _shapes_and_step(found, loader, os):
     Any one of them will do at stage 3 — every rank writes the same shapes,
     only the tensors differ, and at stage 3 the tensors are empty anyway.
     """
-    from ravex._foreign import _ZERO_MODEL_PER_RANK, _ZERO_MODEL_SHARED
+    from ravex._interop.foreign import _ZERO_MODEL_PER_RANK, _ZERO_MODEL_SHARED
 
     for name in found.files:
         if not (_ZERO_MODEL_SHARED.match(name) or _ZERO_MODEL_PER_RANK.match(name)):

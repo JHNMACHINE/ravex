@@ -169,7 +169,7 @@ def main():
             result["gen0_destroy_seconds"], result["vram_after_destroy"]))
 
     # Ranks that sat out generation 0 need the values from somewhere, and
-    # that is `ravex._elastic.prestage_send`/`prestage_receive` over a plain
+    # that is `ravex._dist.elastic.prestage_send`/`prestage_receive` over a plain
     # socket - the real production path from GPU-94 step 4, exercised here on
     # real hardware and (in the cross-box shape) over the real network.
     #
@@ -178,7 +178,7 @@ def main():
     # failed exactly there ("Invalid payload size. size: 16829701, max:
     # 8388608"), which is a decent argument on its own for why the transport
     # is a socket rather than the store everything else coordinates on.
-    from ravex._elastic import prestage_receive, prestage_send
+    from ravex._dist.elastic import prestage_receive, prestage_send
 
     joiners = max(0, target - start)
     handoff_port = int(os.environ.get("HANDOFF_PORT", str(store_port + 1)))

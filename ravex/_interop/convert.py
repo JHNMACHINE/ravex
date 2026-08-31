@@ -1,7 +1,7 @@
 """Turning a foreign checkpoint into something Ravex can restore — GPU-90.
 
-:mod:`ravex._foreign` says what a directory is, :mod:`ravex._zero` and
-:mod:`ravex._dcp` read it. This is the last step: putting what they read into
+:mod:`ravex._interop.foreign` says what a directory is, :mod:`ravex._interop.zero` and
+:mod:`ravex._interop.dcp` read it. This is the last step: putting what they read into
 the shape Ravex's own resume path already consumes.
 
 **There is less here than the issue implies, and that is the finding.** The
@@ -65,7 +65,7 @@ def unify(found, loader) -> Dict[str, Any]:
     discovers three steps later.
     """
     if found.format == "deepspeed":
-        from ravex._zero import unshard
+        from ravex._interop.zero import unshard
 
         got = unshard(found, loader)
         return {
@@ -78,7 +78,7 @@ def unify(found, loader) -> Dict[str, Any]:
         }
 
     if found.format == "dcp":
-        from ravex._dcp import read
+        from ravex._interop.dcp import read
 
         return _unify_dcp(read(found.root))
 

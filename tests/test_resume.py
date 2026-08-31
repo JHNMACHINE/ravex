@@ -6,7 +6,7 @@ step to read — the one place where a wrong answer produces a model that trains
 happily and means nothing.
 """
 
-import ravex._distributed as distributed
+import ravex._dist.collectives as distributed
 from ravex._resume import ResumeManager
 
 
@@ -114,7 +114,7 @@ def test_a_copy_cut_off_part_way_is_named_rather_than_called_absent(tmp_path):
     killing both ranks mid-copy on a 100 Mbps link, where that window is 42% of
     the cycle rather than a millisecond.
     """
-    from ravex._replication import COMPLETE_MARKER, REPLICA_DIR
+    from ravex._dist.replication import COMPLETE_MARKER, REPLICA_DIR
     from ravex._resume import _torn_copy_here
 
     config = _config_at(tmp_path)

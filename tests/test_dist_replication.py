@@ -14,7 +14,7 @@ import os
 
 from ravex._backends import replica_store_path, visible_replica_stores
 from ravex._config import RavexConfig
-from ravex._replication import (
+from ravex._dist.replication import (
     COMPLETE_MARKER,
     REPLICA_DIR,
     StoreWriter,
@@ -839,7 +839,7 @@ class TestPromotingACopy:
     def test_the_owner_record_comes_across(self, tmp_path):
         """It is what lets the resume know which history it is continuing -
         and dropping it would undo the check that allowed the promotion."""
-        from ravex._identity import run_id_at
+        from ravex._dist.identity import run_id_at
 
         copy = a_complete_copy(tmp_path, 0, "run-a")
         store = os.path.join(str(tmp_path), "rank_0")
@@ -934,10 +934,10 @@ class TestBothRoadsHomeLeaveTheSameThing:
         `StoreWriter`, which is the code that writes the marker. Patching the
         marker away here instead would test the mock.
         """
-        import ravex._distributed as distributed
-        import ravex._replication as replication
+        import ravex._dist.collectives as distributed
+        import ravex._dist.replication as replication
         import ravex._runtime as runtime_module
-        from ravex._replication import StoreWriter, encode_store
+        from ravex._dist.replication import StoreWriter, encode_store
 
         source = a_store(tmp_path / "elsewhere", rank, "run-a")
 
@@ -1005,10 +1005,10 @@ class TestBothRoadsHomeLeaveTheSameThing:
         early: while the bytes are still arriving, its absence is the only
         thing separating a half-built store from a finished one. A transfer
         that fails leaves the directory unmarked, which is what says so."""
-        import ravex._distributed as distributed
-        import ravex._replication as replication
+        import ravex._dist.collectives as distributed
+        import ravex._dist.replication as replication
         import ravex._runtime as runtime_module
-        from ravex._replication import StoreWriter, encode_store
+        from ravex._dist.replication import StoreWriter, encode_store
 
         source = a_store(tmp_path / "elsewhere", 0, "run-a")
         seen = []
@@ -1070,8 +1070,8 @@ class TestTheRuntimeRebuildsFromItsOwnDisk:
     def run(self, monkeypatch, runtime, rank=0, world=6, gather=None):
         import logging
 
-        import ravex._distributed as distributed
-        import ravex._replication as replication
+        import ravex._dist.collectives as distributed
+        import ravex._dist.replication as replication
         import ravex._runtime as runtime_module
 
         monkeypatch.setattr(runtime_module, "get_rank", lambda: rank)

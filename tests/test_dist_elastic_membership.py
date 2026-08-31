@@ -1,5 +1,5 @@
 """GPU-94 step 3: discovery and decision, the two pieces above the
-rendezvous mechanics proven in test_elastic_rendezvous.py.
+rendezvous mechanics proven in test_dist_elastic_rendezvous.py.
 
 Discovery needs no process group at all - a candidate rank announces itself
 on the raw persistent store before it has ever called
@@ -8,8 +8,8 @@ its own step loop. Decision generalises GPU-92's emergency channel from a
 single bit to a small object, over the same isolated gloo subgroup.
 
 Regroup itself (destroy + reinit at a new world_size via a fresh
-``PrefixStore`` generation) is exercised in test_elastic_rendezvous.py and
-test_elastic_remesh.py - not repeated here.
+``PrefixStore`` generation) is exercised in test_dist_elastic_rendezvous.py and
+test_dist_elastic_remesh.py - not repeated here.
 """
 
 import multiprocessing as mp
@@ -32,7 +32,7 @@ def _discovery_worker(is_master, port, ready_evt, announced_evt, out):
     try:
         import torch.distributed as dist
 
-        from ravex._elastic import announce_join, pending_join
+        from ravex._dist.elastic import announce_join, pending_join
 
         if is_master:
             store = dist.TCPStore(
@@ -114,7 +114,7 @@ def _decision_worker(rank, world_size, port, local_view, timeout_seconds, out):
     try:
         import torch.distributed as dist
 
-        from ravex._elastic import topology_decision
+        from ravex._dist.elastic import topology_decision
 
         dist.init_process_group("gloo", rank=rank, world_size=world_size)
         try:
@@ -177,10 +177,10 @@ class TestTopologyDecisionCarriesMoreThanABit:
         no real distributed needed since the whole point is that no group
         gets built.
         """
-        import ravex._elastic as elastic
+        import ravex._dist.elastic as elastic
 
         monkeypatch.setattr(
-            "ravex._distributed.emergency_group", lambda timeout: (False, None)
+            "ravex._dist.collectives.emergency_group", lambda timeout: (False, None)
         )
         result = elastic.topology_decision({"wants_join": True}, timeout_seconds=5)
         assert result == [{"wants_join": True}]

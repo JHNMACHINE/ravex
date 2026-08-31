@@ -73,7 +73,7 @@ def local_run_id(config, store_path: Optional[str] = None) -> Tuple[int, str]:
 
     The provenance matters more than the id: it is what lets the ranks agree
     on the best answer among them rather than on an arbitrary one. See
-    :func:`ravex._distributed.agree_on_run_id`.
+    :func:`ravex._dist.collectives.agree_on_run_id`.
     """
     if getattr(config, "run_id", None):
         return FROM_CONFIG, str(config.run_id)

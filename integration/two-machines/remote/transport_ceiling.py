@@ -23,7 +23,7 @@ import time
 import torch
 import torch.distributed as dist
 
-from ravex._replication import StoreWriter, encode_store, encoded_size, fixed_chunks
+from ravex._dist.replication import StoreWriter, encode_store, encoded_size, fixed_chunks
 
 
 def human(n):
@@ -95,7 +95,7 @@ def main():
     report("encode only @4M", time.perf_counter() - started)
 
     # 3. The real path, at each chunk size.
-    from ravex import _replication
+    from ravex._dist import replication as _replication
 
     for chunk_mib in [int(c) for c in args.chunks_mib.split(",")]:
         destination = os.path.join(root, f"copy{chunk_mib}")

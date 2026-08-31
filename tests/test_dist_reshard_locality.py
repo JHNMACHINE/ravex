@@ -1,6 +1,6 @@
 """Which of a reshard's bytes actually have to cross a network — GPU-96.
 
-The planner in :mod:`ravex._reshard` says how a new shard is stitched out of
+The planner in :mod:`ravex._dist.reshard` says how a new shard is stitched out of
 old ones. These tests are about the fact it does not carry on its own: *where*
 each old shard can be read from. Same discipline as the tests above them —
 pure arithmetic, so exhaustive rather than illustrative — because the number
@@ -18,7 +18,7 @@ import math
 
 import pytest
 
-from ravex._reshard import (
+from ravex._dist.reshard import (
     contiguous_homes,
     crossing_bytes,
     crossing_pieces,

@@ -2,7 +2,7 @@
 
     python integration/scripts/verify_replication_transfer.py
 
-`tests/test_replication.py` drives `StoreWriter` in one process, which covers
+`tests/test_dist_replication.py` drives `StoreWriter` in one process, which covers
 the framing. This covers the thing that unit test cannot: `exchange_stores`
 between two processes, with sizes agreed on the wire, chunks arriving in the
 order the sender posted them, and the completeness marker written at the end.
@@ -39,7 +39,7 @@ import tempfile
 
 import torch.distributed as dist
 
-from ravex._replication import COMPLETE_MARKER, encoded_size, exchange_stores
+from ravex._dist.replication import COMPLETE_MARKER, encoded_size, exchange_stores
 
 CHUNK = 64 * 1024
 

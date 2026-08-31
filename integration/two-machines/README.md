@@ -156,7 +156,7 @@ ranks — and exporting it on **one** machine is how the mixed case is reached:
 
 The third is not hypothetical: two boxes from one provider can come up from
 different images. Its wire format is checked by
-`TestTheObjectGatherOnTwoRanks` in `tests/test_multinode.py`, which runs two
+`TestTheObjectGatherOnTwoRanks` in `tests/test_dist_multinode.py`, which runs two
 real gloo processes locally — so what is left for two machines is latency,
 ordering and a peer that disappears, not the encoding.
 

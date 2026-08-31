@@ -557,7 +557,7 @@ def _per_rank_config(config, per_rank: bool):
     The cost is N manifests, and a resume that has to agree on a step (see
     ``agree_on_step``).
     """
-    from ravex._distributed import get_rank
+    from ravex._dist.collectives import get_rank
 
     if not per_rank:
         return config
@@ -654,7 +654,7 @@ def replica_store_path(config, rank: int) -> str:
     scans for ``rank_<n>`` is asking "what does this machine own", and a copy
     answering that question would be read as an original.
     """
-    from ravex._replication import REPLICA_DIR
+    from ravex._dist.replication import REPLICA_DIR
 
     return os.path.join(config.storage.path, REPLICA_DIR, rank_suffix(rank))
 
@@ -667,7 +667,7 @@ def visible_replica_stores(config) -> "set[int]":
     its copy is" lead to opposite conclusions — the first is a checkpoint that
     cannot be reached, the second is one that can.
     """
-    from ravex._replication import REPLICA_DIR
+    from ravex._dist.replication import REPLICA_DIR
 
     if config.storage.is_remote:
         return set()
@@ -704,7 +704,7 @@ def visible_store_owners(config) -> "dict[int, dict]":
     unreadable records map to an empty dict: the store is still present, and
     saying so with less detail beats not mentioning it.
     """
-    from ravex._identity import read_owner
+    from ravex._dist.identity import read_owner
 
     return {
         rank: (read_owner(per_rank_store_path(config, rank)) or {})
@@ -737,7 +737,7 @@ def open_rank_store(config, rank: int) -> Optional[CheckpointBackend]:
         # open — `get_backend` on the ordinary per-rank path reaches it.
         return None
 
-    from ravex._replication import REPLICA_DIR, replica_is_complete
+    from ravex._dist.replication import REPLICA_DIR, replica_is_complete
 
     direct = per_rank_store_path(config, rank)
     if os.path.isdir(direct) and os.listdir(direct):
@@ -757,7 +757,7 @@ def reachable_rank_stores(config, ranks: Iterable[int]) -> "set[int]":
     whether it is possible before it starts reading tensors. Deciding late is
     the expensive kind of failure here: half the shards are in memory by then.
     """
-    from ravex._replication import replica_is_complete
+    from ravex._dist.replication import replica_is_complete
 
     if config.storage.is_remote:
         return set(ranks)

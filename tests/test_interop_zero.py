@@ -1,6 +1,6 @@
 """Rebuilding whole tensors out of a ZeRO checkpoint — GPU-90.
 
-The authoritative check on :mod:`ravex._zero` is not here. It is
+The authoritative check on :mod:`ravex._interop.zero` is not here. It is
 ``integration/frameworks/check_zero_oracle.py``, which compares the
 reconstruction against ``zero_to_fp32.py`` — DeepSpeed's own reader, shipped
 inside every checkpoint — over real artefacts. On 2026-08-31 that agreed
@@ -26,8 +26,8 @@ import pytest
 
 import torch
 
-from ravex._foreign import Foreign
-from ravex._zero import ZeroUnsupported, unshard
+from ravex._interop.foreign import Foreign
+from ravex._interop.zero import ZeroUnsupported, unshard
 
 
 HIDDEN = 5

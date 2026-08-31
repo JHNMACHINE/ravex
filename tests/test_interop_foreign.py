@@ -1,6 +1,6 @@
 """Recognising a checkpoint written by something else — GPU-90.
 
-:mod:`ravex._foreign` reads directory names and never opens a file, so these
+:mod:`ravex._interop.foreign` reads directory names and never opens a file, so these
 tests build their fixtures out of empty ones. That is not a shortcut: the cases
 worth covering are the malformed ones — a shard missing, a `latest` pointing
 nowhere, two layouts mixed — and producing those out of real frameworks means
@@ -17,7 +17,7 @@ import os
 
 import pytest
 
-from ravex._foreign import Foreign, confirm_stage, identify, summary
+from ravex._interop.foreign import Foreign, confirm_stage, identify, summary
 
 
 def tree(root, *names):

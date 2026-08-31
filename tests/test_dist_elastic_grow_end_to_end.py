@@ -55,13 +55,13 @@ explicitly rather than fixed silently:
    regroup - not a fresh call on a dead mesh.
 3. **Store file names have to be unique per snapshot, never reused.**
    The first draft overwrote one ``state.pt`` path on every round.
-   ``ravex._replication``'s incremental skip (GPU-97) matches files by
+   ``ravex._dist.replication``'s incremental skip (GPU-97) matches files by
    name and size alone, deliberately, on the assumption that store files
    are immutable once written - overwriting one with same-shape,
    different-value tensors produces the same size, so the skip silently
    treated genuinely new data as unchanged and rank 2 kept a stale copy
    with no error anywhere. Exactly the "a hole is worse than a failure"
-   case ``ravex._reshard`` already argues for elsewhere - reached here
+   case ``ravex._dist.reshard`` already argues for elsewhere - reached here
    from the opposite direction, by a test violating an invariant real
    ravex checkpoints already respect (every step gets its own path).
    Fixed by giving each round its own file name, the way a real store
@@ -96,7 +96,7 @@ def _grow_worker(rank, store_port, socket_port, source_dir, dest_dir, out):
         import torch.distributed as dist
         from torch.distributed.fsdp import fully_shard
 
-        from ravex._elastic import (
+        from ravex._dist.elastic import (
             announce_join,
             generation_store,
             pending_join,

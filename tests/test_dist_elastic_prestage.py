@@ -2,7 +2,7 @@
 the old ranks keep training - over a plain socket, not torch.distributed.
 
 **Why not torch.distributed for this.** The first design tried was reusing
-``ravex._replication.exchange_stores`` on a small, independent
+``ravex._dist.replication.exchange_stores`` on a small, independent
 ``ProcessGroupGloo`` built by hand between one old rank and the candidate,
 so the real training group would never be touched. The independent group
 works fine for a *collective* - see
@@ -15,9 +15,9 @@ those refuse a group that was never registered through
 ``ProcessGroupGloo`` instance with a pybind11 type-mismatch. And the public
 ``new_group()`` needs every rank of the *current* default group to call it,
 which a not-yet-member candidate cannot do. Full account in
-``ravex._elastic``'s module docstring. So :func:`ravex._elastic.prestage_send`
-/ :func:`ravex._elastic.prestage_receive` move bytes over a plain, connected
-TCP socket instead, reusing ``ravex._replication``'s manifest/skip/
+``ravex._dist.elastic``'s module docstring. So :func:`ravex._dist.elastic.prestage_send`
+/ :func:`ravex._dist.elastic.prestage_receive` move bytes over a plain, connected
+TCP socket instead, reusing ``ravex._dist.replication``'s manifest/skip/
 ``StoreWriter`` machinery directly - none of that depends on a process group,
 only the transport ``exchange_stores`` wires it to does.
 
@@ -148,8 +148,8 @@ def _prestage_worker(rank, main_port, socket_port, source_dir, dest_dir, out):
         import torch
         import torch.distributed as dist
 
-        import ravex._replication as replication
-        from ravex._elastic import prestage_send, prestage_receive
+        import ravex._dist.replication as replication
+        from ravex._dist.elastic import prestage_send, prestage_receive
 
         sent_bytes = {"round1": 0, "round2": 0}
         current_round = {"n": 1}
@@ -171,7 +171,7 @@ def _prestage_worker(rank, main_port, socket_port, source_dir, dest_dir, out):
         sock = None
         if rank == 2:
             # The candidate listens - in a real join this address is exactly
-            # what `ravex._elastic.announce_join` would have advertised.
+            # what `ravex._dist.elastic.announce_join` would have advertised.
             server = socket_module.socket(socket_module.AF_INET, socket_module.SOCK_STREAM)
             server.bind(("127.0.0.1", socket_port))
             server.listen(1)

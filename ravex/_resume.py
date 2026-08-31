@@ -48,7 +48,7 @@ def _torn_copy_here(config, missing) -> str:
         return ""
     try:
         from ravex._backends import replica_store_path, visible_replica_stores
-        from ravex._replication import replica_is_complete
+        from ravex._dist.replication import replica_is_complete
 
         here = visible_replica_stores(config)
         torn = sorted(
@@ -275,7 +275,7 @@ class ResumeManager:
         so "nothing here" is a value (-1) that travels through the agreement
         like any other and makes the answer -1 for everybody.
         """
-        from ravex._distributed import agree_on_step, all_ranks_agree
+        from ravex._dist.collectives import agree_on_step, all_ranks_agree
 
         # Before anything else, because at a different world size "this rank's
         # own store" is not this rank's own history: after a shrink `rank_5`
@@ -379,7 +379,7 @@ class ResumeManager:
         ``all_ranks_agree`` turns any disagreement into "everybody takes the
         ordinary path", which is the branch that is safe to take alone.
         """
-        from ravex._distributed import all_ranks_agree, get_world_size
+        from ravex._dist.collectives import all_ranks_agree, get_world_size
 
         world = get_world_size()
         old = self._old_world_size()
@@ -446,7 +446,7 @@ class ResumeManager:
         materialised anywhere, which is the entire point of per-rank
         checkpointing and survives this feature intact.
         """
-        from ravex._distributed import all_ranks_agree
+        from ravex._dist.collectives import all_ranks_agree
 
         resumed = False
         try:
@@ -483,14 +483,14 @@ class ResumeManager:
         two ranks not resuming.
         """
         from ravex._backends import reachable_rank_stores
-        from ravex._distributed import (
+        from ravex._dist.collectives import (
             gather_objects,
             get_rank,
             get_world_size,
             local_sharded_state,
             shard_extents,
         )
-        from ravex._reshard import ReshardUnsupported
+        from ravex._dist.reshard import ReshardUnsupported
 
         old_world = self._old_world
         if old_world is None:  # pragma: no cover - guarded by `_reshard_wanted`
@@ -641,12 +641,12 @@ class ResumeManager:
         length before it, so a single pass would mean holding every old
         snapshot at once, which is the whole checkpoint per rank.
         """
-        from ravex._distributed import (
+        from ravex._dist.collectives import (
             build_resharded_tree,
             shard_extents,
             take_shard_slices,
         )
-        from ravex._reshard import check_covered, plan_reshard
+        from ravex._dist.reshard import check_covered, plan_reshard
 
         old_ranks = list(range(old_world))
         base = old_ranks[0]
@@ -767,8 +767,8 @@ class ResumeManager:
         written costs a future diagnosis, not this run.
         """
         from ravex._backends import per_rank_store_path
-        from ravex._distributed import agree_on_run_id, get_rank, get_world_size
-        from ravex._identity import local_run_id, write_owner
+        from ravex._dist.collectives import agree_on_run_id, get_rank, get_world_size
+        from ravex._dist.identity import local_run_id, write_owner
 
         if self.config is None:
             return
@@ -813,7 +813,7 @@ class ResumeManager:
         checkpoints themselves.
         """
         from ravex._backends import visible_store_owners
-        from ravex._distributed import gather_visible_stores, get_world_size
+        from ravex._dist.collectives import gather_visible_stores, get_world_size
 
         try:
             mine = visible_store_owners(self.config) if self.config is not None else {}

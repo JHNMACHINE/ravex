@@ -8,7 +8,7 @@ switched off by the world size alone, looked in ``checkpoints/`` instead of
 scratch* with the shards sitting beside it. Everything about it looked healthy:
 training resumed, the loss curve started over, and nothing said why.
 
-The reshard planner had handled ``N -> 1`` the whole time — ``test_reshard.py``
+The reshard planner had handled ``N -> 1`` the whole time — ``test_dist_reshard.py``
 calls it "the shrink taken to its limit" — but every test of it passes
 ``per_rank=True`` by hand, so the machinery was proven and the decision to use
 it was not. These tests cover the decision.

@@ -17,7 +17,7 @@ import time
 import torch
 import torch.distributed as dist
 
-CHUNK = 4 * 1024 * 1024  # ravex._replication.CHUNK
+CHUNK = 4 * 1024 * 1024  # ravex._dist.replication.CHUNK
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--size-mb", type=int, default=2048)

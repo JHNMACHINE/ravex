@@ -1,6 +1,6 @@
 """Resuming a per-rank checkpoint onto a different number of ranks.
 
-The planner in :mod:`ravex._reshard` is pure arithmetic, so the tests for it
+The planner in :mod:`ravex._dist.reshard` is pure arithmetic, so the tests for it
 are exhaustive rather than illustrative. That is deliberate: the only shapes
 where an old shard boundary lines up with a new one are exact halvings and
 doublings, so a suite that tested 8 -> 4 and 4 -> 8 would pass with the general
@@ -19,7 +19,7 @@ import pytest
 
 import torch
 
-from ravex._reshard import (
+from ravex._dist.reshard import (
     ReshardUnsupported,
     check_covered,
     decode_placements,
@@ -197,7 +197,7 @@ class TestShardDim:
 
 def shard_node(local, dim=0, global_shape=None):
     """A shard as `_encode_shards` writes one, without needing a process group."""
-    from ravex._distributed import _SHARD_TAG
+    from ravex._dist.collectives import _SHARD_TAG
 
     return {
         _SHARD_TAG: 1,
@@ -210,13 +210,13 @@ def shard_node(local, dim=0, global_shape=None):
 
 class TestTreeWalking:
     def test_extents_measure_the_sharded_dimension(self):
-        from ravex._distributed import shard_extents
+        from ravex._dist.collectives import shard_extents
 
         tree = {"a": shard_node(torch.zeros(3, 8)), "b": {"c": shard_node(torch.zeros(5, 2))}}
         assert shard_extents(tree) == {("a",): 3, ("b", "c"): 5}
 
     def test_replicated_tensors_are_left_out_of_the_plan(self):
-        from ravex._distributed import _SHARD_TAG, shard_extents
+        from ravex._dist.collectives import _SHARD_TAG, shard_extents
 
         tree = {
             "a": shard_node(torch.zeros(3, 8)),
@@ -231,7 +231,7 @@ class TestTreeWalking:
 
     def test_slices_are_copies_not_views(self):
         """A view would pin the whole old snapshot this pass exists to drop."""
-        from ravex._distributed import take_shard_slices
+        from ravex._dist.collectives import take_shard_slices
 
         source = torch.arange(24.0).reshape(6, 4)
         taken = take_shard_slices({"a": shard_node(source)}, {("a",): [(1, 3)]})
@@ -241,7 +241,7 @@ class TestTreeWalking:
         assert source[1, 0] == 4.0
 
     def test_non_shard_leaves_come_through_untouched(self):
-        from ravex._distributed import build_resharded_tree
+        from ravex._dist.collectives import build_resharded_tree
 
         base = {"lr": 0.001, "steps": [1, 2], "w": shard_node(torch.zeros(2, 3))}
         live = {"lr": 0.9, "steps": [9], "w": shard_node(torch.zeros(4, 3))}
@@ -253,7 +253,7 @@ class TestTreeWalking:
         assert tuple(built["w"]["local"].shape) == (4, 3)
 
     def test_the_pieces_are_concatenated_in_order(self):
-        from ravex._distributed import build_resharded_tree
+        from ravex._dist.collectives import build_resharded_tree
 
         base = {"w": shard_node(torch.zeros(2, 2))}
         live = {"w": shard_node(torch.zeros(4, 2))}
@@ -263,7 +263,7 @@ class TestTreeWalking:
         assert built["w"]["local"][1, 0] == 8.0
 
     def test_a_tensor_with_no_pieces_is_an_error_not_an_empty_shard(self):
-        from ravex._distributed import build_resharded_tree
+        from ravex._dist.collectives import build_resharded_tree
 
         base = {"w": shard_node(torch.zeros(2, 2))}
         live = {"w": shard_node(torch.zeros(4, 2))}
@@ -280,7 +280,7 @@ class Captured(logging.Handler):
     Not ``caplog``: the runtime sets ``propagate = False`` so the user's root
     logger stays untouched, and once any test in the session has activated
     Ravex the records never reach the root handler caplog installs. The twin of
-    this class in ``test_multinode.py`` is here for the same reason, and the
+    this class in ``test_dist_multinode.py`` is here for the same reason, and the
     duplication is cheaper than a shared import between test modules.
     """
 
@@ -354,14 +354,14 @@ def split_tree(tree, parts):
     a wider run would have written. Splitting with ``chunked`` rather than with
     ``torch.chunk`` keeps the fixture honest about uneven tails.
     """
-    from ravex._distributed import _SHARD_TAG, walk_shards
+    from ravex._dist.collectives import _SHARD_TAG, walk_shards
 
     import copy
 
     out = [copy.deepcopy(tree) for _ in range(parts)]
     for path, node in walk_shards(tree):
-        from ravex._distributed import node_at
-        from ravex._reshard import decode_placements, shard_dim
+        from ravex._dist.collectives import node_at
+        from ravex._dist.reshard import decode_placements, shard_dim
 
         dim = shard_dim(decode_placements(node["placements"]), "x")
         local = node["local"]
@@ -380,8 +380,8 @@ class TestEndToEnd:
         """The whole feature: 4 stores in, one correct model out."""
         from ravex._backends import get_backend, per_rank_store_path, store_config_at
         from ravex._config import RavexConfig, StorageConfig
-        from ravex._distributed import local_sharded_state
-        from ravex._identity import write_owner
+        from ravex._dist.collectives import local_sharded_state
+        from ravex._dist.identity import write_owner
         from ravex._registry import ObjectRegistry
         from ravex._resume import ResumeManager
 
@@ -472,8 +472,8 @@ class TestEndToEnd:
 
         from ravex._backends import get_backend, per_rank_store_path, store_config_at
         from ravex._config import RavexConfig, StorageConfig
-        from ravex._distributed import local_sharded_state
-        from ravex._identity import write_owner
+        from ravex._dist.collectives import local_sharded_state
+        from ravex._dist.identity import write_owner
         from ravex._registry import ObjectRegistry
         from ravex._resume import ResumeManager
 
@@ -543,7 +543,7 @@ class TestEndToEnd:
         """
         from ravex._backends import get_backend, per_rank_store_path, store_config_at
         from ravex._config import RavexConfig, StorageConfig
-        from ravex._identity import write_owner
+        from ravex._dist.identity import write_owner
         from ravex._registry import ObjectRegistry
         from ravex._resume import ResumeManager
 

@@ -16,7 +16,7 @@
 # generation 0 on node 0 and every joiner on node 1, so both the handoff and
 # the regroup cross the real network rather than loopback.
 #
-# The values the joiners need travel over ravex._elastic.prestage_send /
+# The values the joiners need travel over ravex._dist.elastic.prestage_send /
 # prestage_receive — the production path from GPU-94 step 4, not a stand-in.
 # Not the rendezvous store: a TCPStore payload is capped at 8 MiB and a real
 # checkpoint is orders of magnitude past that (tried, and it failed exactly
@@ -40,7 +40,7 @@ mkdir -p "$OUT"
 LOG="$OUT/$TAG.node$NODE_RANK.log"
 
 # Each run gets its own handoff directories: the incremental skip in
-# ravex._replication matches files by name and size alone (GPU-97), on the
+# ravex._dist.replication matches files by name and size alone (GPU-97), on the
 # assumption that store files are immutable once written. Leaving a previous
 # run's file in place is how a stale copy passes for a fresh one.
 rm -rf "$KIT_ROOT"/gpu94_handoff_*

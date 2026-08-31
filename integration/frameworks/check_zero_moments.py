@@ -27,8 +27,8 @@ import sys
 
 import torch
 
-from ravex._foreign import confirm_stage, identify
-from ravex._zero import unshard
+from ravex._interop.foreign import confirm_stage, identify
+from ravex._interop.zero import unshard
 
 
 def load(path):

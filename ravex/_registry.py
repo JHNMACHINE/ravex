@@ -24,7 +24,7 @@ import weakref
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Set
 
-from ravex._distributed import (
+from ravex._dist.collectives import (
     apply_local_sharded_state,
     apply_sharded_state,
     gather_sharded_state,
@@ -471,7 +471,7 @@ class ObjectRegistry:
 
         ``sharded_layout`` picks how FSDP state is taken — ``gather`` collects
         it all on rank 0, ``per_rank`` leaves each rank holding its own shard.
-        See :mod:`ravex._distributed`.
+        See :mod:`ravex._dist.collectives`.
         """
         import torch
 
@@ -580,7 +580,7 @@ class ObjectRegistry:
         if requested != "per_rank" or not groups:
             return "gather"
 
-        from ravex._distributed import _dtensor_class
+        from ravex._dist.collectives import _dtensor_class
 
         DTensor = _dtensor_class()
         if DTensor is None:

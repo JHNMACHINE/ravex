@@ -239,6 +239,63 @@ The GPU paths — AMP with real fp16 overflow, the CUDA RNG, FSDP1, NCCL — are
 covered by `integration/test_cuda.py`, which skips without a GPU. They were
 last verified on 8× RTX 5060 Ti with torch 2.12/cu130.
 
+## Project layout
+
+Everything under `ravex` is private except `ravex` itself: the public surface
+is `activate()`, `__version__` and the `ravex` command, and every name below
+that starts with an underscore is free to move.
+
+```
+ravex/
+├── __init__.py       Public surface, and nothing else
+├── _bootstrap.py     The .pth entry point
+├── _cli.py           ravex enable / disable / status
+├── _config.py        Defaults < ravex.yaml < RAVEX_*
+├── _patches.py       The five monkey patches on PyTorch
+├── _registry.py      What is being trained, held by weakref
+├── _runtime.py       One per process; what the patches call into
+├── _resume.py        Best-effort restore
+├── _backends.py      moonclip | torch_save
+├── _sampler.py       Dataset position
+├── _frameworks.py    HF Trainer / Lightning / Accelerate detection
+├── _dist/            More than one GPU, more than one machine
+│   ├── collectives.py    gather vs per_rank; the SIGTERM channel
+│   ├── reshard.py        8 shards onto 4 ranks — pure integer arithmetic
+│   ├── identity.py       Who wrote this store, as part of which run
+│   ├── replication.py    Each rank copies its store to a peer
+│   └── elastic.py        Membership changes without a restart
+└── _interop/         Checkpoints somebody else wrote
+    ├── foreign.py        What is this directory? Layout first, fields second
+    ├── zero.py           DeepSpeed ZeRO stages 1–3
+    ├── dcp.py            torch.distributed.checkpoint — FSDP, Megatron-core
+    ├── convert.py        Into the shape the resume path already consumes
+    └── resume.py         When to act on all that, and when to decline
+```
+
+The two subpackages are groups, not layers: neither re-exports anything, and
+callers import the submodule they want inside the function that wants it. That
+is not style. `_bootstrap` runs in **every** Python interpreter on the machine
+once the `.pth` is installed, so the cost of an import that did not have to
+happen is paid by every `python -c` on the box — and `_dist.collectives` pulls
+in `torch.distributed`. A single-process run loads neither subpackage.
+
+The import graph is a DAG with `_runtime` as its only hub; there are no cycles,
+and nothing in `_interop` is imported by anything outside it except `_runtime`.
+
+**And around them**
+
+| Path | |
+|---|---|
+| `tests/` | 812 unit tests, in-process, no GPU and no container. Named for what they cover: `test_dist_*`, `test_interop_*` |
+| `integration/` | What only exists across a real process boundary — the `.pth`, a resume from an empty interpreter, `torchrun`. Linux, in Docker |
+| `integration/scripts/` | The training scripts those tests kill and restart |
+| `integration/multinode/` | One container per rank, for questions `--nproc_per_node` cannot ask ([README](integration/multinode/README.md)) |
+| `integration/two-machines/` | The rented-box harness: two real hosts, real network |
+| `docs/` | [configuration.md](docs/configuration.md), [how-it-works.md](docs/how-it-works.md) |
+| `.forgejo/workflows/` | `checks.yml` on branches; `ci.yml` on main adds the moonclip backend and both integration jobs |
+
+As of 0.0.5 that is about 10.5k lines across 23 modules.
+
 ## Development
 
 ```bash

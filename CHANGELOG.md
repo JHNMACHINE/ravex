@@ -24,7 +24,7 @@
   isolated from the one carrying gradient synchronization, so a stuck
   detection round fails in seconds rather than however long the training
   job's own process group is configured to wait. See
-  `ravex._distributed.emergency_group` / `emergency_signalled`, and
+  `ravex._dist.collectives.emergency_group` / `emergency_signalled`, and
   `RavexRuntime._check_emergency_signal`.
 
   **Read this before relying on it.** The local handoff alone — no network,

@@ -3,8 +3,8 @@
 A bandwidth number on its own does not decide anything here. What decides it is
 that number divided into *the bytes a particular reshard actually moves*, and
 that quantity is far smaller than a checkpoint and is often exactly zero. The
-arithmetic comes from :mod:`ravex._reshard`, tested exhaustively and offline in
-``tests/test_reshard_locality.py``; this file only pairs it with what the link
+arithmetic comes from :mod:`ravex._dist.reshard`, tested exhaustively and offline in
+``tests/test_dist_reshard_locality.py``; this file only pairs it with what the link
 between two real machines was measured to carry.
 
 One simplification, stated rather than hidden: every tensor is treated as
@@ -12,7 +12,7 @@ having the same row width, so a scenario's cost is a *fraction* of the
 checkpoint. That is close to exact for what is in scope — a 1-D FSDP mesh
 sharded on dim 0, where the fraction depends on where the machine boundaries
 fall and not on how wide a row is — and it would stop being true for a 2-D
-mesh, which :func:`ravex._reshard.shard_dim` refuses by name anyway.
+mesh, which :func:`ravex._dist.reshard.shard_dim` refuses by name anyway.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 
-from ravex._reshard import contiguous_homes, crossing_rows, plan_reshard
+from ravex._dist.reshard import contiguous_homes, crossing_rows, plan_reshard
 
 
 #: The reshards worth pricing, as ``(label, old_world, new_world, old_home,

@@ -235,7 +235,7 @@ def main():
 
     import sys
     sys.path.insert(0, args.ravex_path)
-    from ravex._distributed import gather_sharded_state, local_sharded_state
+    from ravex._dist.collectives import gather_sharded_state, local_sharded_state
 
     def tree_bytes(tree):
         """Bytes a collected state tree holds, shard records included."""

@@ -62,7 +62,7 @@ def _toy_module():
 class TestFullyShardCannotBeReapplied:
     """No multi-rank machinery here on purpose - this is a single-process
     question about the FSDP2 API surface, orthogonal to the rendezvous work
-    in test_elastic_rendezvous.py.
+    in test_dist_elastic_rendezvous.py.
     """
 
     def test_fully_shard_refuses_a_second_wrap_of_the_same_module(

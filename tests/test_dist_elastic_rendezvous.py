@@ -65,7 +65,7 @@ def _rejoin_worker(rank, is_rank0, port, join_evt, out, use_generations):
     """One rank of: world_size 2 -> destroy -> world_size 3, rank 2 is new.
 
     Top-level and argument-driven because ``spawn`` has to pickle it - the
-    same constraint ``test_multinode.py``'s own worker functions document.
+    same constraint ``test_dist_multinode.py``'s own worker functions document.
     """
     try:
         import torch
@@ -213,7 +213,7 @@ class TestARankThatNeverExistedCanJoin:
             "reusing the bare store across generations succeeded cleanly on "
             "every rank across %d repeats - if torch has started tolerating "
             "this reliably, the PrefixStore-per-generation workaround (in "
-            "ravex._elastic.generation_store and in this test) is no longer "
+            "ravex._dist.elastic.generation_store and in this test) is no longer "
             "needed and should be revisited, not left in out of caution"
             % attempts
         )

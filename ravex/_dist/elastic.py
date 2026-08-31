@@ -7,7 +7,7 @@ because each fails a different way and needs a different fix.
 itself known. No process group can help here: a process that has never
 called ``init_process_group`` cannot be reached by any collective, isolated
 or not. This is the one piece with no equivalent in GPU-92 — that channel
-(``ravex._distributed.emergency_group``) only ever coordinates ranks that are
+(``ravex._dist.collectives.emergency_group``) only ever coordinates ranks that are
 already inside a live group. Discovery has to live one layer below that, on
 the raw store rank 0 holds open across every membership change.
 
@@ -25,14 +25,14 @@ joining the same rendezvous the original ranks re-enter. See
 below — rebuilding the *group* is the easy half of this.
 
 **Pre-staging — why it does not use torch.distributed at all.** The obvious
-design was to reuse ``ravex._replication.exchange_stores`` on a small,
+design was to reuse ``ravex._dist.replication.exchange_stores`` on a small,
 independent ``ProcessGroupGloo`` built by hand (without
 ``init_process_group``/``new_group``) between one old rank and a joining
 candidate, so the old ranks' real training group is never touched while
 bytes move in the background. The independent group itself works fine for a
 collective — ``all_reduce`` on it returns the right answer without
 disturbing the live default group at all, verified in
-``tests/test_elastic_prestage.py``. It does not work for
+``tests/test_dist_elastic_prestage.py``. It does not work for
 ``exchange_stores``, because that function moves bytes with
 ``dist.isend``/``dist.recv``, and those refuse a group that was never
 registered through ``new_group``: ``RuntimeError: ... is not registered,
@@ -46,7 +46,7 @@ it collectively - which a not-yet-member candidate cannot do, since it has
 no default group to be a member of. So pre-staging here is a plain,
 length-prefixed TCP socket, not a torch collective of any kind - see
 :func:`prestage_send` and :func:`prestage_receive`. It reuses
-``ravex._replication``'s manifest/skip/``StoreWriter`` machinery directly
+``ravex._dist.replication``'s manifest/skip/``StoreWriter`` machinery directly
 (all of it is already plain bytes and files, with no torch dependency of its
 own — only ``exchange_stores`` itself, the one function this module does
 not call, wires that machinery to a process group).
@@ -66,14 +66,14 @@ fresh under the new mesh. That is still real: it skips the OS process exit,
 the CUDA context re-init, and re-importing torch/moonclip that a genuine
 restart pays for. It is not a live reshape of a running module, and nothing
 downstream should be built on the assumption that it is. Verified bit-exact
-across an actual world_size change in ``tests/test_elastic_remesh.py``; ravex
+across an actual world_size change in ``tests/test_dist_elastic_remesh.py``; ravex
 itself does not perform the rebuild, because ravex is only ever handed an
 already-constructed model — it has no factory to rebuild one from, which is
 why this module stops at the group/rendezvous layer and leaves the module
 rebuild to whoever owns the model's construction.
 
 **Two rules for whoever calls ``full_tensor()`` around a regroup, found the
-hard way in ``tests/test_elastic_grow_end_to_end.py`` while composing all
+hard way in ``tests/test_dist_elastic_grow_end_to_end.py`` while composing all
 of the above into one scenario** — neither is specific to that test, both
 apply to any real caller:
 
@@ -131,7 +131,7 @@ def generation_store(base_store, generation: int):
     namespace, and that is enough — no platform-specific handling needed on
     top of it.
 
-    See ``tests/test_elastic_rendezvous.py`` for the reproduction of both
+    See ``tests/test_dist_elastic_rendezvous.py`` for the reproduction of both
     failures and the negative test that keeps this from silently stopping
     being necessary if a future torch release changes the underlying
     behaviour.
@@ -173,7 +173,7 @@ def topology_decision(local_view: Any, timeout_seconds: int = 10) -> List[Any]:
     Generalises GPU-92's ``emergency_signalled`` from a single bit ("does
     anyone want to checkpoint") to a small picklable object ("what does
     everyone see about the topology right now") — same isolated gloo
-    subgroup (:func:`ravex._distributed.emergency_group`), same independent
+    subgroup (:func:`ravex._dist.collectives.emergency_group`), same independent
     short timeout, same degrade-to-local-only contract when the channel
     cannot be built. ``emergency_group`` itself needed no change to support
     this: it was already general enough. What was missing was the ability to
@@ -191,7 +191,7 @@ def topology_decision(local_view: Any, timeout_seconds: int = 10) -> List[Any]:
     already the shape a caller of ``emergency_group`` has to handle for a
     bare bool, generalised to whatever picklable object ``local_view`` is.
     """
-    from ravex._distributed import emergency_group, gather_objects
+    from ravex._dist.collectives import emergency_group, gather_objects
 
     usable, group = emergency_group(timeout_seconds)
     if not usable:
@@ -217,7 +217,7 @@ def prestage_send(sock, source: str, chunk: int = 1 << 20) -> None:
 
     See the module docstring for why this is a plain socket rather than
     ``exchange_stores``. The manifest/skip/encode logic is exactly
-    ``ravex._replication``'s own - reused, not reimplemented, because none
+    ``ravex._dist.replication``'s own - reused, not reimplemented, because none
     of it depends on a process group; only the transport underneath it does.
 
     Reads the peer's manifest first (length-prefixed), computes what it
@@ -232,7 +232,7 @@ def prestage_send(sock, source: str, chunk: int = 1 << 20) -> None:
     ``replicate_every``-style periodic re-syncs bring the candidate closer,
     without paying a new TCP handshake for every round.
     """
-    from ravex._replication import _parse_manifest, encode_store, store_files
+    from ravex._dist.replication import _parse_manifest, encode_store, store_files
 
     manifest_len = _LENGTH_PREFIX.unpack(_recv_exact(sock, _LENGTH_PREFIX.size))[0]
     peer_existing = (
@@ -252,7 +252,7 @@ def prestage_receive(sock, destination: str) -> bool:
     """The other end of :func:`prestage_send`. **Not a collective.**
 
     Sends what ``destination`` already holds before reading anything, then
-    feeds whatever arrives to the same :class:`~ravex._replication.StoreWriter`
+    feeds whatever arrives to the same :class:`~ravex._dist.replication.StoreWriter`
     ``exchange_stores`` uses - the destination ends up in exactly the same
     shape a torch-transported round would have left it in. Stops reading on
     ``writer.complete`` alone - the embedded header already says how much to
@@ -263,7 +263,7 @@ def prestage_receive(sock, destination: str) -> bool:
     does not close its end after a round precisely so the same connection
     can carry the next one.
     """
-    from ravex._replication import StoreWriter, _encode_manifest, store_files
+    from ravex._dist.replication import StoreWriter, _encode_manifest, store_files
 
     existing_blob = _encode_manifest(store_files(destination))
     sock.sendall(_LENGTH_PREFIX.pack(len(existing_blob)) + existing_blob)

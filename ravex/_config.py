@@ -382,7 +382,7 @@ class RavexConfig:
 
     #: Timeout, in seconds, for the dedicated group the detection collective
     #: runs on. Deliberately its own group with its own short timeout — see
-    #: `ravex._distributed.emergency_group` — so a stuck detection round fails
+    #: `ravex._dist.collectives.emergency_group` — so a stuck detection round fails
     #: fast without ever touching the timeout the main process group uses for
     #: ordinary gradient synchronization, which this project's own two-machine
     #: kit has already shown to be flaky enough that shortening it globally

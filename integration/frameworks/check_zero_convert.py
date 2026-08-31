@@ -25,8 +25,8 @@ import torch
 import torch.nn as nn
 from torch.distributed.checkpoint.state_dict import StateDictOptions, set_state_dict
 
-from ravex._convert import align, fit_param_groups, rename, unify
-from ravex._foreign import confirm_stage, identify
+from ravex._interop.convert import align, fit_param_groups, rename, unify
+from ravex._interop.foreign import confirm_stage, identify
 
 
 def load(path):

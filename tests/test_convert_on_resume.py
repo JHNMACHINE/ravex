@@ -1,6 +1,6 @@
 """Converting a foreign checkpoint at resume time — GPU-90.
 
-The conversion itself is covered in ``test_convert.py`` and, against real
+The conversion itself is covered in ``test_interop_convert.py`` and, against real
 DeepSpeed artefacts, in ``integration/frameworks/check_zero_convert.py``. What
 is here is the decision *around* it: when Ravex converts, when it declines, and
 what it says either way.

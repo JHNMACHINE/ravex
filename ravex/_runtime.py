@@ -30,7 +30,7 @@ from typing import Any, Optional
 
 from ravex._backends import get_backend
 from ravex._config import RavexConfig
-from ravex._distributed import (
+from ravex._dist.collectives import (
     all_ranks_agree,
     get_rank,
     get_world_size,
@@ -208,7 +208,7 @@ class RavexRuntime:
         local rank would leave the others waiting inside a collective the
         speaker alone entered.
         """
-        from ravex._distributed import (
+        from ravex._dist.collectives import (
             byte_transport_group,
             is_local_main_process,
             local_world_size,
@@ -251,7 +251,7 @@ class RavexRuntime:
             )
             return
 
-        from ravex._replication import replication_ring
+        from ravex._dist.replication import replication_ring
 
         ring = replication_ring(get_rank(), get_world_size(), local_world_size())
         replicating = (
@@ -348,7 +348,7 @@ class RavexRuntime:
         the world size alone, looks in ``checkpoints/`` instead of in
         ``checkpoints/rank_<n>/``, and reports *No checkpoint found - starting
         from scratch* while the shards sit right there beside it. The reshard
-        planner has always handled ``N -> 1`` — ``tests/test_reshard.py`` calls
+        planner has always handled ``N -> 1`` — ``tests/test_dist_reshard.py`` calls
         it "the shrink taken to its limit" — but the resume path never asked it
         to, because this method answered before the question was reached.
         Reproduced end to end in ``integration/elastic/probe.sh``: at
@@ -534,218 +534,17 @@ class RavexRuntime:
             self._restoring = False
 
     def _convert_foreign(self, defer_rng: bool) -> bool:
-        """Restore from a checkpoint another framework wrote. **Collective when it acts.**
+        """Restore from a checkpoint another framework wrote, if there is one
+        and the config allows it. **Collective when it acts.**
 
-        Returns True when the live objects were loaded from it, so the caller
-        skips the ordinary resume.
-
-        **Detection is unconditional, acting on it is not** — the same shape as
-        ``reshard_on_resume``, for a stronger version of the same reason. A
-        DeepSpeed directory sitting where Ravex's own store belongs usually
-        means a path points somewhere unintended, and converting it silently
-        would turn that into a run training on someone else's weights with
-        nothing in the log to say so. So this always says what it found, and
-        only ``convert_foreign`` turns that into a load.
-
-        **The active framework is a guard, not a hint.** A DeepSpeed run
-        resuming a DeepSpeed checkpoint needs no help: its engine loads that
-        checkpoint itself, and Ravex converting it as well would restore the
-        same weights twice by two different routes and disagree with the
-        engine about the optimizer. So that pair is declined by name.
+        The work is in :mod:`ravex._interop.resume`, next to the readers whose
+        output it consumes; what stays here is the call, so that the attempt
+        reads in order alongside the ordinary resume above.
         """
-        from ravex._distributed import all_ranks_agree
-        from ravex._foreign import identify, summary
+        from ravex._interop.resume import convert_on_resume
 
-        if self.config.storage.is_remote:
-            # `identify` reads a local directory. A bucket is not one, and
-            # answering "unknown" for every remote store would be a message
-            # about this function rather than about the checkpoint.
-            return False
+        return convert_on_resume(self.config, self.registry, defer_rng)
 
-        found = identify(self.config.storage.path)
-        if found.format not in ("deepspeed", "dcp"):
-            return False
-
-        from ravex._frameworks import detect_framework
-
-        active = detect_framework()
-        if active == "deepspeed" and found.format == "deepspeed":
-            logger.info(
-                "There is a DeepSpeed checkpoint at %s and this run is "
-                "DeepSpeed - leaving it to the engine, which loads its own "
-                "checkpoints.",
-                self.config.storage.path,
-            )
-            return False
-
-        logger.warning(
-            "%s holds a checkpoint written by something else (%s), not a Ravex "
-            "store.%s",
-            self.config.storage.path,
-            summary(found),
-            ""
-            if self.config.convert_foreign
-            else " Ravex can convert it on load - set convert_foreign=true "
-            "(RAVEX_CONVERT_FOREIGN=1). It is off by default so that a "
-            "storage path pointing somewhere unintended fails visibly "
-            "instead of training on someone else's weights.",
-        )
-        if not self.config.convert_foreign:
-            return False
-
-        # Every rank reaches this, because the flag is configuration and is the
-        # same everywhere; what can differ is what each machine's disk holds.
-        # Ranks that disagree all take the ordinary path together rather than
-        # some of them entering the collective inside `restore_state`.
-        target = self._conversion_target()
-        wanted = target is not None
-        if not all_ranks_agree(wanted):
-            logger.warning(
-                "Not every rank can see a convertible checkpoint from where it "
-                "is, so none of them converts - half a run restored from a "
-                "foreign checkpoint and half from nothing is worse than "
-                "neither."
-            )
-            return False
-
-        assert target is not None  # `all_ranks_agree` said so on every rank
-        kind, key, model, optimizers = target
-        try:
-            return self._apply_conversion(found, kind, key, model, optimizers, defer_rng)
-        except Exception as exc:
-            logger.warning(
-                "Could not convert the checkpoint at %s (%s) - starting from "
-                "scratch.",
-                self.config.storage.path,
-                exc,
-            )
-            return False
-
-    def _conversion_target(self):
-        """The one live group a converted checkpoint would go into, or None.
-
-        One. Several sharded groups is not an obstacle to converting, it is an
-        obstacle to knowing *which* of them the foreign checkpoint is of — and
-        a converter that picks the first would be right about half the time on
-        the runs where it matters.
-        """
-        groups = self.registry.sharded_groups()
-        if len(groups) == 1:
-            key, model, optimizers = groups[0]
-            return ("sharded", key, model, optimizers)
-
-        plain = self.registry.keyed_models()
-        if not groups and len(plain) == 1:
-            key, model = plain[0]
-            # The optimizer comes along when there is exactly one, so that a
-            # converted resume restores Adam's moments rather than quietly
-            # dropping them. Several optimizers is the same ambiguity as
-            # several models and gets the same answer: the weights are
-            # restored and the moments are not, said out loud below.
-            owners = self.registry.optimizers
-            return ("plain", key, model, list(owners) if len(owners) == 1 else [])
-
-        logger.warning(
-            "Converting a foreign checkpoint needs one model to convert it "
-            "into, and this run has %d sharded group(s) and %d plain model(s). "
-            "Which one the checkpoint is of is not something to guess at.",
-            len(groups),
-            len(plain),
-        )
-        return None
-
-    def _apply_conversion(
-        self, found, kind, key, model, optimizers, defer_rng: bool
-    ) -> bool:
-        from ravex._convert import align, fit_param_groups, into_snapshot, rename, unify
-        from ravex._distributed import unwrap_model
-
-        import torch
-
-        loader = lambda path: torch.load(  # noqa: E731 - one expression, one use
-            path, map_location="cpu", weights_only=False
-        )
-
-        unified = unify(found, loader)
-        live = list(unwrap_model(model).state_dict())
-        alignment = align(list(unified["model"]), live)
-
-        logger.info("Converting from %s: %s", unified["source"], alignment.report())
-        for note in unified.get("notes", []):
-            logger.info("Conversion note: %s", note)
-
-        if not alignment.mapping:
-            logger.warning(
-                "Not one parameter name in that checkpoint matches this model, "
-                "so there is nothing to convert into it."
-            )
-            return False
-
-        moved = rename(unified, alignment)
-        if optimizers:
-            moved = fit_param_groups(moved, optimizers[0].state_dict()["param_groups"])
-            for note in moved.get("notes", [])[len(unified.get("notes", [])) :]:
-                logger.info("Conversion note: %s", note)
-
-        if kind == "sharded":
-            if moved.get("optimizer_keyed_by") == "position":
-                # `set_state_dict(full_state_dict=True)` identifies a group's
-                # members by name. A positional state cannot be handed to it,
-                # and matching those positions against a sharded model's
-                # parameter order is a guess this will not make: the weights
-                # come across, the moments do not, and that is said.
-                logger.warning(
-                    "That checkpoint's optimizer state is keyed by position "
-                    "rather than by parameter name, and a sharded restore "
-                    "matches by name. The weights are converted; the moments "
-                    "are not."
-                )
-                moved = dict(moved)
-                moved["optimizer"] = {"state": {}, "param_groups": []}
-            snapshot = into_snapshot(moved, key)
-        else:
-            # A plain model takes its state dict directly; `restore_state`
-            # loads it with `load_state_dict` and never reaches the sharded
-            # branch, so wrapping it as a sharded group would send it through
-            # a collective this run has no need of.
-            from ravex._convert import to_positional
-
-            optimizers_state = {}
-            if optimizers:
-                names = [n for n, _ in unwrap_model(model).named_parameters()]
-                positional = to_positional(moved, names)
-                if positional is None:
-                    logger.warning(
-                        "The converted optimizer state does not cover every "
-                        "parameter of this model, so the moments are not "
-                        "restored - only the weights. Training continues; the "
-                        "first steps after this will behave as if the "
-                        "optimizer had just been created."
-                    )
-                else:
-                    keys = [k for k, _ in self.registry.keyed_optimizers()]
-                    if keys:
-                        optimizers_state[keys[0]] = positional
-
-            snapshot = {
-                "ravex_version": 1,
-                "step": int(moved.get("step") or 0),
-                "models": {key: moved["model"]},
-                "optimizers": optimizers_state,
-                "schedulers": {},
-                "scalers": {},
-                "sharded": {},
-            }
-
-        self.registry.restore_state(snapshot, defer_rng=defer_rng)
-        logger.info(
-            "Resumed from a converted %s checkpoint at step %s. The data order "
-            "and the RNG are not restored - a foreign checkpoint carries "
-            "neither.",
-            found.format,
-            snapshot["step"],
-        )
-        return True
 
     # ─── checkpointing ──────────────────────────────────────────────
 
@@ -821,7 +620,7 @@ class RavexRuntime:
         # from and nothing to measure, so the guard also just skips the cost
         # of a no-op barrier there.
         if sharded and get_world_size() > 1:
-            from ravex._distributed import barrier
+            from ravex._dist.collectives import barrier
 
             barrier()
             skew_done = time.perf_counter()
@@ -1032,9 +831,9 @@ class RavexRuntime:
             replica_store_path,
             visible_rank_stores,
         )
-        from ravex._distributed import gather_objects, local_world_size
-        from ravex._identity import run_id_at
-        from ravex._replication import (
+        from ravex._dist.collectives import gather_objects, local_world_size
+        from ravex._dist.identity import run_id_at
+        from ravex._dist.replication import (
             exchange_stores,
             local_recoveries,
             promote_copy,
@@ -1165,8 +964,8 @@ class RavexRuntime:
         set that cannot be assembled and no sign that anything was wrong.
         """
         from ravex._backends import per_rank_store_path, replica_store_path
-        from ravex._distributed import all_ranks_agree, local_world_size
-        from ravex._replication import exchange_stores, replication_ring
+        from ravex._dist.collectives import all_ranks_agree, local_world_size
+        from ravex._dist.replication import exchange_stores, replication_ring
 
         if not self._replication_due(step):
             return
@@ -1220,7 +1019,7 @@ class RavexRuntime:
         actually found to be split: with a shared filesystem or a bucket, a
         copy protects nothing and costs bandwidth.
         """
-        from ravex._distributed import local_world_size
+        from ravex._dist.collectives import local_world_size
 
         if self.config.replicate_every <= 0 or not self._storage_split:
             return False
@@ -1373,7 +1172,7 @@ class RavexRuntime:
         case `_final_checkpoint_is_safe` otherwise skips outright.
         """
         if self._emergency_active is None:
-            from ravex._distributed import spans_several_machines
+            from ravex._dist.collectives import spans_several_machines
 
             self._emergency_active = bool(
                 self.config.handle_sigterm
@@ -1407,7 +1206,7 @@ class RavexRuntime:
         its own, before this channel's own cost.
         """
         if self._emergency_group is None:
-            from ravex._distributed import emergency_group
+            from ravex._dist.collectives import emergency_group
 
             usable, self._emergency_group = emergency_group(
                 self.config.emergency_timeout
@@ -1420,7 +1219,7 @@ class RavexRuntime:
                 return
 
         try:
-            from ravex._distributed import emergency_signalled
+            from ravex._dist.collectives import emergency_signalled
 
             signalled = emergency_signalled(
                 self._emergency_requested, self._emergency_group

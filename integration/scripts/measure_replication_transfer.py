@@ -26,7 +26,7 @@ Nothing here needs a GPU, and it runs on Windows as well as Linux.
 
 **`phases` mirrors the body of `exchange_stores` on purpose**, because a timer
 wrapped around the function cannot see inside it. It has to be updated when
-that loop changes; if the two disagree, the loop in `ravex/_replication.py` is
+that loop changes; if the two disagree, the loop in `ravex/_dist/replication.py` is
 the truth and this is stale.
 
 Its own rate is always lower than `exchange`'s — a stopwatch on every chunk is
@@ -46,8 +46,8 @@ import time
 import torch
 import torch.distributed as dist
 
-from ravex import _replication
-from ravex._replication import (
+from ravex._dist import replication as _replication
+from ravex._dist.replication import (
     StoreWriter,
     encode_store,
     encoded_size,

@@ -259,7 +259,7 @@ def test_a_sharded_multirank_checkpoint_splits_skew_from_drain_by_default(
     runtime = get_runtime()
     _as_one_rank_of_eight(monkeypatch, runtime, main=True)
 
-    from ravex import _distributed as distributed_module
+    from ravex._dist import collectives as distributed_module
 
     barriers = []
     monkeypatch.setattr(distributed_module, "barrier", lambda: barriers.append(1))
@@ -316,7 +316,7 @@ def test_a_replicated_job_posts_no_collective_from_rank_zero_alone(
     monkeypatch.setattr(
         runtime_module, "all_ranks_agree", lambda ok: (asked.append(ok), ok)[1]
     )
-    from ravex import _distributed as distributed_module
+    from ravex._dist import collectives as distributed_module
 
     barriers = []
     monkeypatch.setattr(distributed_module, "barrier", lambda: barriers.append(1))

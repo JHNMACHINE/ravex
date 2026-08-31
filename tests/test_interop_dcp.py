@@ -18,8 +18,8 @@ import torch.nn as nn
 
 dcp = pytest.importorskip("torch.distributed.checkpoint")
 
-from ravex._dcp import describe, missing_from, read, tensors  # noqa: E402
-from ravex._foreign import identify  # noqa: E402
+from ravex._interop.dcp import describe, missing_from, read, tensors  # noqa: E402
+from ravex._interop.foreign import identify  # noqa: E402
 
 
 @pytest.fixture

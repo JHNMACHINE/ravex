@@ -62,7 +62,7 @@ def main():
     dist.init_process_group("nccl")
 
     import ravex
-    from ravex._distributed import spans_several_machines
+    from ravex._dist.collectives import spans_several_machines
 
     torch.manual_seed(0)
     blocks = []
