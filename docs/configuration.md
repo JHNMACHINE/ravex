@@ -152,6 +152,61 @@ run, and the two differences are worth knowing before you rely on it:
   there is no correct mapping. The saved states are not restored, and random
   draws continue from whatever seeding your script did. A log line says so.
 
+### Elastic training: a cluster that changes size while it runs
+
+A job whose nodes come and go needs no Ravex API of its own. `torchrun` already
+has one — its elastic agent negotiates membership between the nodes and
+restarts the workers at the new world size — and what Ravex has to do on the
+other side of that restart is exactly what it does after any restart: resume.
+The resharding above is what makes the resumed world size allowed to differ.
+
+Five things have to be true together, and four of them are the launcher's:
+
+```sh
+torchrun --nnodes=1:8 --nproc-per-node=8 \
+         --rdzv-backend=c10d --rdzv-endpoint="$HEAD:29500" --rdzv-id=myjob \
+         --max-restarts=3 \
+         train.py
+```
+
+```yaml
+sharded_checkpoints: per_rank
+reshard_on_resume: true      # the world changing is the point here
+storage:
+  type: s3                   # or any path every node can see
+  bucket: my-checkpoints
+```
+
+And in your script, a collective timeout you chose:
+
+```python
+dist.init_process_group("nccl", timeout=timedelta(minutes=2))
+```
+
+**That last line is not a detail.** The default is **1800 seconds**. When a node
+disappears, the survivors do not fail — they block in the collective they were
+in, and `torchrun`'s agent restarts a worker group on *failure*, so until that
+timeout expires there is nothing for it to react to. A cluster that lost a node
+looks perfectly healthy for half an hour. With a timeout in the low minutes the
+survivors fail fast, the agent re-rendezvouses, and the run continues.
+
+**The storage has to be shared or remote.** With a local path per machine, each
+survivor can see only the shard it wrote itself, and the resharding refuses —
+correctly, since rebuilding from the shards that happen to be present is the
+uninitialised-rows failure above. Measured on two rented machines on
+2026-08-31: moving shards between machines runs at the speed of the link
+between them, while the same bytes to object storage went up 5x and came back
+down 13x faster. Shared storage is not the fallback here, it is the answer.
+
+Verified end to end in `integration/elastic/probe.sh`, which runs several
+`torchrun` agents in one container, kills one, and checks what the survivors
+do. On a 3-node job losing a node, the agents re-rendezvoused in about 40
+seconds and the run resumed from the last checkpoint at world size 2.
+
+What you give up is what any resharded resume gives up — the data order and the
+per-rank RNG, both described above. What you do not give up is the model, the
+optimizer moments, or the step count.
+
 ### The write path
 
 Two options change what a checkpoint costs, and both default to the fast side.

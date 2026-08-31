@@ -301,3 +301,172 @@ def check_covered(pieces: Sequence[Piece], length: int, where: str) -> None:
         raise ValueError(
             "%s: the pieces cover %d of %d rows" % (where, covered, length)
         )
+
+
+# ── where the shards are, not just what they are ────────────────────────────
+#
+# Everything above this line is about a tensor's shape and nothing else, which
+# is what let it be tested exhaustively. The functions below add exactly one
+# fact — *which machine can read which old store* — and stay pure for the same
+# reason: the question "is moving these bytes affordable" has an arithmetic
+# answer, and it should be available before any transport exists to answer it
+# empirically.
+#
+# The map is deliberately "where a readable copy is" rather than "who wrote
+# it". Those differ precisely in the case GPU-96 exists for: when the machine
+# that wrote a store is gone, the shard survives as the copy a neighbour holds
+# (GPU-76), and the neighbour is where it has to be fetched from. Feeding that
+# neighbour's identity in as the home makes replica promotion the same problem
+# as an ordinary cross-machine fetch, with no second code path to keep honest.
+
+#: Which machine holds a readable copy of each old rank's store, and which
+#: machine each new rank runs on. The identities are opaque and only ever
+#: compared for equality — a hostname, an owner record, a node rank. Nothing
+#: here assumes they are integers or that they are ordered.
+Homes = Dict[int, Any]
+
+
+def crossing_pieces(
+    plan: Sequence[Sequence[Piece]], old_home: Homes, new_home: Homes
+) -> List[List[Piece]]:
+    """The subset of ``plan`` a transport would have to move, per new rank.
+
+    Same indexing as :func:`plan_reshard`'s output, so the two can be zipped:
+    entry *r* is the pieces new rank *r* cannot read from where it is standing.
+    A rank with nothing to fetch gets an empty list rather than being dropped,
+    because "this rank needs no help" and "this rank was not considered" are
+    different answers and a caller iterating the result should not have to tell
+    them apart by absence.
+
+    An old rank with no entry in ``old_home`` raises rather than defaulting to
+    remote or to local. Both defaults are wrong in a way that hides: assuming
+    remote invents traffic that may not exist, and assuming local invents a
+    store that is not there, which is the same family of silent-wrong-model
+    failure the whole module is written against.
+    """
+    crossing: List[List[Piece]] = []
+    for r, pieces in enumerate(plan):
+        if r not in new_home:
+            raise KeyError("no machine is recorded for new rank %d" % r)
+        here = new_home[r]
+        mine: List[Piece] = []
+        for piece in pieces:
+            q = piece[0]
+            if q not in old_home:
+                raise KeyError(
+                    "no machine is recorded as holding old rank %d's store" % q
+                )
+            if old_home[q] != here:
+                mine.append(piece)
+        crossing.append(mine)
+    return crossing
+
+
+def crossing_rows(
+    plan: Sequence[Sequence[Piece]], old_home: Homes, new_home: Homes
+) -> Dict[Tuple[Any, Any], int]:
+    """Rows that cross, keyed by ``(from machine, to machine)``. One tensor.
+
+    Rows rather than bytes because this half is shape arithmetic and a row's
+    width belongs to the caller — see :func:`crossing_bytes`, which is this
+    function with the multiplication done.
+
+    Directional on purpose. A shrink is not symmetric: the machines that keep
+    running pull, the ones being emptied push, and a single total would hide a
+    plan that asks one link to carry everything while another carries nothing.
+    That imbalance is the measured finding of GPU-94's pre-staging — one sender
+    serving joiners in sequence — and it is the shape of cost most likely to
+    decide this question, so it is not summed away here.
+    """
+    volume: Dict[Tuple[Any, Any], int] = {}
+    for r, pieces in enumerate(crossing_pieces(plan, old_home, new_home)):
+        there = new_home[r]
+        for q, (start, stop), _ in pieces:
+            link = (old_home[q], there)
+            volume[link] = volume.get(link, 0) + (stop - start)
+    return volume
+
+
+def crossing_bytes(
+    tensors: Iterable[Tuple[Sequence[Sequence[Piece]], int]],
+    old_home: Homes,
+    new_home: Homes,
+) -> Dict[Tuple[Any, Any], int]:
+    """:func:`crossing_rows` summed over many tensors, in bytes.
+
+    ``tensors`` yields ``(plan, row_bytes)`` — one plan per tensor, paired with
+    what one row along *that* tensor's sharded dimension costs. The pairing is
+    per tensor because it varies per tensor: a checkpoint's rows are a hidden
+    dimension wide for one weight and a vocabulary wide for another, and a
+    single average over the model is the kind of number that looks like a
+    measurement and is not one.
+
+    This is the numerator of the only question worth asking before writing the
+    transport: at the rate the link between two machines actually carries
+    bytes, how long does a given reshard take? A whole-store rate is easy to
+    measure and easy to misread — most of a store may never need to move at
+    all. What has to move is this.
+    """
+    total: Dict[Tuple[Any, Any], int] = {}
+    for plan, row_bytes in tensors:
+        for link, rows in crossing_rows(plan, old_home, new_home).items():
+            total[link] = total.get(link, 0) + rows * int(row_bytes)
+    return total
+
+
+def contiguous_homes(world: int, machines: int) -> Homes:
+    """Ranks dealt to machines in contiguous blocks: the usual ``torchrun`` shape.
+
+    ``torchrun`` numbers ranks by node — node 0 takes the first
+    ``LOCAL_WORLD_SIZE``, node 1 the next — so the old stores on one machine
+    cover one contiguous interval of the global tensor, and so do the new
+    shards of the ranks that run there.
+
+    That is worth stating as its own function because of what it implies, which
+    is not obvious and is easy to get backwards: **when both topologies are
+    dealt this way and the machine boundaries land on the same rows, nothing
+    crosses at all.** A shrink from eight ranks to four across two machines
+    moves zero bytes if each machine keeps its own half. Traffic appears when
+    the boundaries fail to line up — an odd split, machines with different GPU
+    counts — or when a machine is gone and its half has to be read from the
+    copies elsewhere. Sizing the transport off "a reshard moves the whole
+    checkpoint" would be sizing it off a case that mostly does not happen.
+
+    A remainder is spread over the first machines, one extra rank each, which
+    is the same rule ``torchrun`` follows and is only reached on a job whose
+    machines are not identical.
+    """
+    if machines <= 0:
+        raise ValueError("a job runs on at least one machine, not %d" % machines)
+    if world < machines:
+        raise ValueError(
+            "%d ranks cannot be dealt over %d machines: some machine would hold "
+            "no rank, and a machine with no rank is not part of this job"
+            % (world, machines)
+        )
+
+    base, extra = divmod(world, machines)
+    homes: Homes = {}
+    rank = 0
+    for machine in range(machines):
+        count = base + (1 if machine < extra else 0)
+        for _ in range(count):
+            homes[rank] = machine
+            rank += 1
+    return homes
+
+
+def most_sources_held(plan: Sequence[Sequence[Piece]]) -> int:
+    """The largest number of old shards any single new rank reads from.
+
+    The memory ceiling of a reshard, expressed as a count: a rank holds the old
+    shards it is stitching from, so this is what bounds its peak footprint. For
+    a shrink from *N* ranks to *M* it should not exceed ``ceil(N / M) + 1``, and
+    that bound is the reason the global tensor never materialises anywhere.
+
+    Reported rather than asserted. The bound is a property of even splits, and
+    a checkpoint whose shards are lopsided enough could exceed it honestly; a
+    gate here would refuse a resume that is merely unusual, while a number lets
+    the caller decide whether what it is looking at is unusual or wrong.
+    """
+    return max((len(pieces) for pieces in plan), default=0)

@@ -341,10 +341,43 @@ class RavexRuntime:
         only writer. Store layout and write path have to agree — a rank writing
         into ``rank_3/`` that never writes leaves a store the resume will find
         empty — so both ask the registry the same structural question.
+
+        **World size one is not automatically "not per rank".** It used to be,
+        and that cost an elastic job everything it had done: a cluster that
+        shrinks to a single node comes back, finds ``per_rank`` switched off by
+        the world size alone, looks in ``checkpoints/`` instead of in
+        ``checkpoints/rank_<n>/``, and reports *No checkpoint found - starting
+        from scratch* while the shards sit right there beside it. The reshard
+        planner has always handled ``N -> 1`` — ``tests/test_reshard.py`` calls
+        it "the shrink taken to its limit" — but the resume path never asked it
+        to, because this method answered before the question was reached.
+        Reproduced end to end in ``integration/elastic/probe.sh``: at
+        ``AGENTS=3`` the survivors resume, at ``AGENTS=2`` they silently do not.
+
+        So a lone rank still takes the per-rank path when per-rank stores are
+        already on disk — meaning this run is continuing a wider one. That
+        keeps reading and writing on the same layout, which matters as much as
+        the read itself: resuming from ``rank_<n>/`` and then writing to
+        ``checkpoints/`` would leave the next resume choosing between two
+        histories, and it would choose the stale one.
+
+        A lone rank with no such stores is an ordinary single-rank run and
+        writes an ordinary store, exactly as before. Remote storage answers
+        False for the same reason :func:`~ravex._backends.visible_rank_stores`
+        returns nothing there — every node sees the same bucket, so the
+        question carries no information — and resharding refuses remote storage
+        one layer down in any case.
         """
-        if self.config.sharded_checkpoints != "per_rank" or get_world_size() <= 1:
+        if self.config.sharded_checkpoints != "per_rank":
             return False
-        return self.registry.sharded_layout("per_rank") == "per_rank"
+        if self.registry.sharded_layout("per_rank") != "per_rank":
+            return False
+        if get_world_size() > 1:
+            return True
+
+        from ravex._backends import visible_rank_stores
+
+        return bool(visible_rank_stores(self.config))
 
     def _disable(self, reason: str) -> None:
         if not self._enabled:

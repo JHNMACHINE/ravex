@@ -22,7 +22,10 @@ import json
 import os
 import time
 
-_OUT = os.environ.get("RAVEX_TIMING_OUT", "/root/out/timing.jsonl")
+_OUT = os.environ.get(
+    "RAVEX_TIMING_OUT",
+    os.path.join(os.environ.get("KIT_ROOT", "/root"), "out/timing.jsonl"),
+)
 
 
 class _Sink:

@@ -3,3 +3,4 @@ results/
 id_throwaway
 id_throwaway.pub
 __pycache__/
+*.log
