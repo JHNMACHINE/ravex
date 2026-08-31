@@ -49,6 +49,35 @@
   `emergency_timeout`. See
   [Emergency checkpoint on preemption](docs/configuration.md#emergency-checkpoint-on-preemption-sharded-models).
 
+### Changed
+
+- **A reshard no longer reads every old checkpoint twice (GPU-101).**
+
+  Resuming onto a different number of ranks is two passes over the old stores:
+  one to measure how long each old shard is, one to cut out the slices the
+  plan asked for. Two passes is not the waste — it is what holds the memory
+  bound, since knowing where a shard starts needs every length before it, and
+  a single pass would mean every old snapshot resident at once.
+
+  The waste was that the *measuring* pass loaded them. It only ever wanted
+  lengths, and there was no way to ask a store for a shape: `load_step` was
+  the only reader, and it materializes every tensor. So a reshard from N ranks
+  read N complete checkpoints it needed and N it discarded — tens of gigabytes
+  on a real model, and between machines it would have been that over the
+  network, which would also have undone the `ceil(N/M)+1` bound the reshard is
+  built to hold.
+
+  `CheckpointBackend.describe_step` is the question that was missing: the same
+  tree, with each tensor replaced by its shape and dtype and everything that
+  was never a tensor — placements included — left as it is. On Moonclip that
+  is two small reads of one template entry and no tensors at all.
+
+  Nothing depends on it being available. A backend that cannot describe itself
+  returns `None` and gets loaded, which is exactly what happened before; the
+  `torch_save` backend does precisely that, having one pickle and no way to
+  read a shape out of it short of unpickling the lot. Needs Moonclip >= 0.0.10
+  for the fast path.
+
 ## 0.0.5 — 2026-08-30
 
 ### Added

@@ -640,6 +640,14 @@ class ResumeManager:
         twice buys the memory bound: knowing where a shard starts needs every
         length before it, so a single pass would mean holding every old
         snapshot at once, which is the whole checkpoint per rank.
+
+        Only the second pass reads tensors. The first asks each store to
+        *describe* itself — a few kilobytes of template carrying the structure,
+        the shapes and the placements — because measuring never needed the
+        bytes and loading them was the larger half of a reshard's cost: N
+        complete reads of N checkpoints, every one of them discarded. A backend
+        that cannot describe still gets loaded, so nothing depends on the
+        optimisation being available.
         """
         from ravex._dist.collectives import (
             build_resharded_tree,
@@ -654,7 +662,7 @@ class ResumeManager:
         # ── pass one: lengths ───────────────────────────────────────
         old_extents: Dict[int, Any] = {}
         for q in old_ranks:
-            snapshot = self._load_old(q, step)
+            snapshot = self._describe_old(q, step)
             old_extents[q] = {
                 (key, half): shard_extents(tree)
                 for key, halves in _per_rank_groups(snapshot).items()
@@ -739,6 +747,37 @@ class ResumeManager:
         if store is None:  # pragma: no cover - reachability already checked
             raise ValueError("rank %d's store is no longer readable" % q)
         try:
+            snapshot = store.load_step(step)
+        finally:
+            store.close()
+        if not snapshot:
+            raise ValueError("rank %d's store holds nothing at step %s" % (q, step))
+        return snapshot
+
+    def _describe_old(self, q: int, step: int) -> Dict[str, Any]:
+        """One old store's snapshot at ``step``, measured rather than read.
+
+        The same tree :meth:`_load_old` returns with something carrying a
+        ``shape`` where each tensor would be, which is all the measuring pass
+        of :meth:`_stitch` looks at. A backend that cannot answer that way is
+        loaded instead — the answer is the same, it costs the checkpoint.
+        """
+        from ravex._backends import open_rank_store
+
+        store = open_rank_store(self.config, q)
+        if store is None:  # pragma: no cover - reachability already checked
+            raise ValueError("rank %d's store is no longer readable" % q)
+        try:
+            described = store.describe_step(step)
+            if described:
+                return described
+            # Not an error and not worth a warning: `torch_save` stores have no
+            # way to describe themselves, and this is their ordinary path.
+            logger.debug(
+                "Rank %d's store cannot describe step %s; reading it to measure it",
+                q,
+                step,
+            )
             snapshot = store.load_step(step)
         finally:
             store.close()

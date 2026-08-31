@@ -458,6 +458,151 @@ class TestEndToEnd:
         # The two things a resharded resume does not carry, said out loud.
         assert "are not restored" in ravex_log.text
 
+
+    def test_the_measuring_pass_does_not_read_the_old_checkpoints(
+        self, one_rank_group, tmp_path, ravex_log, monkeypatch
+    ):
+        """Same reshard, on Moonclip, counting what it reads.
+
+        A reshard is two passes over the old stores: one to measure the shards,
+        one to cut the slices out of them. The measuring pass only ever wanted
+        the lengths, and until `describe_step` existed the only way to get them
+        was to load each old checkpoint whole and throw it away — so a reshard
+        from N ranks read N checkpoints it needed and N it did not.
+
+        The assertion is the count, not the answer. Measuring off a described
+        tree gives the same numbers as measuring off a loaded one, so a test
+        that only checked the tensors would pass with the second read still
+        there.
+        """
+        from ravex import _backends
+        from ravex._backends import (
+            MoonclipBackend,
+            get_backend,
+            per_rank_store_path,
+            store_config_at,
+        )
+        from ravex._config import RavexConfig, StorageConfig
+        from ravex._dist.collectives import local_sharded_state
+        from ravex._dist.identity import write_owner
+        from ravex._registry import ObjectRegistry
+        from ravex._resume import ResumeManager
+
+        pytest.importorskip("moonclip")
+
+        model, optimizer = sharded_model()
+        take_a_step(model, optimizer)
+        model_tree, optimizer_tree = local_sharded_state(model, [optimizer])
+        wanted = {
+            name: param.to_local().detach().clone()
+            for name, param in model.named_parameters()
+        }
+
+        config = RavexConfig(
+            backend="moonclip",
+            sharded_checkpoints="per_rank",
+            reshard_on_resume=True,
+            storage=StorageConfig(path=str(tmp_path / "checkpoints")),
+        )
+
+        old_world = 4
+        model_parts = split_tree(model_tree, old_world)
+        optimizer_parts = split_tree(optimizer_tree, old_world)
+        for q in range(old_world):
+            snapshot = {
+                "ravex_version": 1,
+                "step": 7,
+                "models": {},
+                "optimizers": {},
+                "schedulers": {},
+                "scalers": {},
+                "dataloaders": {},
+                "rng": {"torch": torch.zeros(8, dtype=torch.uint8)},
+                "sharded": {
+                    "sharded_0": {
+                        "model": model_parts[q],
+                        "optimizer": optimizer_parts[q],
+                        "parameters": sorted(model_tree.keys()),
+                        "layout": "per_rank",
+                        "world_size": old_world,
+                        "rank": q,
+                    }
+                },
+            }
+            store = get_backend(store_config_at(config, "rank_%d" % q))
+            assert isinstance(store, MoonclipBackend), (
+                "the Moonclip backend fell back to torch.save, so this test is "
+                "measuring the wrong thing: %s" % ravex_log.text
+            )
+            store.save(7, snapshot, {})
+            store.close()
+            write_owner(per_rank_store_path(config, q), "run-abc", q, old_world)
+
+        counts = {"load": 0, "describe": 0}
+        real_load = MoonclipBackend.load_step
+        real_describe = MoonclipBackend.describe_step
+
+        def counted_load(self, step):
+            counts["load"] += 1
+            return real_load(self, step)
+
+        def counted_describe(self, step):
+            counts["describe"] += 1
+            return real_describe(self, step)
+
+        monkeypatch.setattr(MoonclipBackend, "load_step", counted_load)
+        monkeypatch.setattr(MoonclipBackend, "describe_step", counted_describe)
+
+        fresh_model, fresh_optimizer = sharded_model()
+        take_a_step(fresh_model, fresh_optimizer)
+        for param in fresh_model.parameters():
+            with torch.no_grad():
+                param.to_local().fill_(0.0)
+
+        registry = ObjectRegistry()
+        registry.register_model(fresh_model)
+        registry.register_optimizer(fresh_optimizer)
+
+        own = get_backend(config, per_rank=True)
+        resume = ResumeManager(own, registry, config=config)
+        restored = resume.try_resume(per_rank=True)
+        own.close()
+
+        assert restored, ravex_log.text
+        for name, param in fresh_model.named_parameters():
+            assert torch.allclose(param.to_local(), wanted[name], atol=1e-6), name
+
+        assert counts["describe"] == old_world, (
+            "the measuring pass did not describe every old store: %r" % counts
+        )
+        assert counts["load"] == old_world, (
+            "%d full loads for %d old stores — the measuring pass is still "
+            "reading them" % (counts["load"], old_world)
+        )
+
+    def test_a_backend_that_cannot_describe_is_loaded_instead(
+        self, one_rank_group, tmp_path, ravex_log
+    ):
+        """`torch_save` has one pickle and no way to read a shape out of it.
+
+        Covered by the end-to-end test above, which runs on that backend — this
+        states the contract directly so it does not depend on which backend
+        that test happens to use.
+        """
+        from ravex._backends import TorchSaveBackend, get_backend
+        from ravex._config import RavexConfig, StorageConfig
+
+        config = RavexConfig(
+            backend="torch_save",
+            storage=StorageConfig(path=str(tmp_path / "checkpoints")),
+        )
+        store = get_backend(config)
+        try:
+            assert isinstance(store, TorchSaveBackend)
+            assert store.describe_step(0) is None
+        finally:
+            store.close()
+
     def test_a_missing_store_refuses_rather_than_leaving_a_hole(
         self, one_rank_group, tmp_path, ravex_log
     ):

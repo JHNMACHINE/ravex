@@ -83,6 +83,29 @@ class CheckpointBackend(ABC):
         """
         return None
 
+    def describe_step(self, step: int) -> Optional[Dict[str, Any]]:
+        """The shape of the checkpoint at ``step``, with no tensors in it.
+
+        The same tree :meth:`load_step` returns, except that every tensor is
+        replaced by something carrying only its ``shape`` and ``dtype``.
+        Everything that was never a tensor — placements, layout tags, scalars —
+        is there unchanged, which is what makes the result measurable.
+
+        Resharding is why this exists. Planning how N old shards map onto M new
+        ones needs every old length before the first slice can be cut, so the
+        measuring pass read each old checkpoint in full and threw it away.
+        Whether that is affordable is not a matter of degree: it is the entire
+        old checkpoint per rank, and between machines it would be that over the
+        network, which would also undo the ``ceil(N/M)+1`` memory bound the
+        reshard is built to hold.
+
+        ``None`` means this backend cannot answer without loading, and the
+        caller falls back to :meth:`load_step`. Not abstract for that reason —
+        a backend built on ``torch.save`` has one pickle and no way to read a
+        shape out of it short of unpickling the lot.
+        """
+        return None
+
     @abstractmethod
     def has_checkpoint(self) -> bool:
         """Whether a resumable checkpoint exists. Cheap; no tensor loading."""
@@ -362,6 +385,46 @@ class MoonclipBackend(CheckpointBackend):
                 continue
             loaded = self._manager.load(snapshot["id"])
             return self._rebuild(loaded)
+        return None
+
+    def describe_step(self, step: int) -> Optional[Dict[str, Any]]:
+        """The tree at ``step`` with stubs where its tensors are.
+
+        Two small reads and no tensors: the ``<prefix>._metadata`` entry is a
+        few kilobytes holding the whole template — the structure, every shape
+        and dtype, and everything that was never a tensor — and Moonclip reads
+        only the byte range it occupies rather than the rank's pack.
+
+        Needs Moonclip >= 0.0.10 for ``load_tensors``/``describe_state_dict``.
+        On anything older this returns None and the caller loads, which is what
+        it did before this existed: slower, never wrong.
+        """
+        if not hasattr(self._manager, "load_tensors") or not hasattr(
+            self._moonclip, "describe_state_dict"
+        ):
+            return None
+        try:
+            snapshots = self._manager.list_snapshots()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Could not list snapshots: %s", exc)
+            return None
+        # Newest first, exactly as `load_step` chooses: a step can appear more
+        # than once if a run was restarted and rewrote it.
+        for snapshot in reversed(snapshots):
+            if int(snapshot.get("step", -1)) != step:
+                continue
+            try:
+                raw = self._manager.load_tensors(
+                    snapshot["id"], ["%s._metadata" % _PREFIX]
+                )
+            except Exception as exc:
+                # A snapshot written by something other than Ravex has no
+                # payload under this prefix. Falling back to a full load will
+                # not conjure one either, but it is the caller's existing path
+                # and it reports the absence in its own words.
+                logger.debug("No %s template at step %s: %s", _PREFIX, step, exc)
+                return None
+            return self._moonclip.describe_state_dict(raw).get(_PREFIX)
         return None
 
     def has_checkpoint(self) -> bool:
