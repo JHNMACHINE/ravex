@@ -28,7 +28,10 @@ KIT_ROOT="${KIT_ROOT:-/root}"
 TAG="${1:-regroup}"
 START="${START:-2}"
 TARGET="${TARGET:-4}"
-HIDDEN="${HIDDEN:-2048}"
+# HIDDEN and LAYERS come from lib.sh, which every phase here shares — setting
+# a different default in this file would be a no-op that reads like a choice,
+# since lib.sh has already exported one by the time this line runs.
+HIDDEN="${HIDDEN:?lib.sh should have set this}"
 LAYERS="${LAYERS:-6}"
 PORT="${MASTER_PORT:-29501}"
 

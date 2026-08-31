@@ -194,21 +194,43 @@ def main():
             # different values is how a stale copy passes for a fresh one.
             torch.save(recorded, os.path.join(source_dir, "gen0_values.pt"))
 
+            payload_bytes = sum(
+                os.path.getsize(os.path.join(source_dir, f))
+                for f in os.listdir(source_dir)
+            )
+            result["payload_bytes"] = payload_bytes
+
             server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             server.bind(("0.0.0.0", handoff_port))
             server.listen(joiners)
             base_store.set("gpu94/handoff_ready", b"1")
-            log("serving the handoff to %d joiner(s) on :%d" % (joiners, handoff_port))
+            log("serving the handoff to %d joiner(s) on :%d (%.1f MiB)"
+                % (joiners, handoff_port, payload_bytes / 2**20))
+            served = []
             for _ in range(joiners):
                 conn, peer = server.accept()
                 t0 = time.time()
                 prestage_send(conn, source_dir)
-                log("prestaged to %s in %.2fs" % (peer[0], time.time() - t0))
+                seconds = time.time() - t0
+                served.append({
+                    "peer": peer[0],
+                    "seconds": round(seconds, 3),
+                    "mib_per_s": round((payload_bytes / 2**20) / seconds, 2) if seconds else None,
+                })
+                log("prestaged to %s in %.2fs (%.1f MiB/s)" % (
+                    peer[0], seconds, (payload_bytes / 2**20) / seconds if seconds else 0))
                 conn.close()
             server.close()
+            result["served"] = served
 
-        elif rank < target:
+        # Only the ranks that sat out generation 0. Getting this wrong is not
+        # abstract: an earlier version said `elif rank < target`, which also
+        # caught the gen0 ranks other than rank 0 - they queued up for a
+        # handoff they did not need, ate the joiners' slots, and the real
+        # joiner that never got served died on a connection reset while the
+        # log cheerfully reported two successful transfers.
+        elif start <= rank < target:
             base_store.get("gpu94/handoff_ready")  # blocks until rank 0 listens
             dest_dir = os.path.join(
                 os.environ.get("KIT_ROOT", "/root"), "gpu94_handoff_dst_%d" % rank
