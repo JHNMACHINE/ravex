@@ -5,6 +5,14 @@ are: HuggingFace, Lightning, Accelerate and DeepSpeed all end up calling
 `torch.optim.Optimizer.step` and iterating a `torch.utils.data.DataLoader`. That
 is a good argument. It is not evidence.
 
+It is also, for one of those four, wrong — and the gap between the list in that
+sentence and the two scripts below is where it hid. DeepSpeed was named in the
+argument and never put under test, and when it finally was, on 2026-08-31, the
+checkpoints it produced had no weights in them: ZeRO gives the base optimizer
+flat partition buffers, so hooking `Optimizer.step` sees an optimizer that owns
+nothing of the model. Fixed, and the evidence now lives in
+`test_deepspeed.py` rather than in this docstring.
+
 What these tests establish, and it is worth being precise about the difference:
 
 *State restoration is exact.* Strip the per-step randomness and a killed run

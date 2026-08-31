@@ -6,6 +6,23 @@ optimizer and dataloader hooks. Detection exists so that checkpoints record
 what produced them, and so the runtime can warn when a framework's own
 checkpointing would duplicate the work.
 
+**DeepSpeed was on that list and should not have been.** Intercepting
+``Optimizer.step`` is enough only while the optimizer holds the model's
+parameters, and ZeRO hands the base optimizer flat partition buffers instead.
+Measured on 2026-08-31: a four-parameter module under ZeRO stage 1, one
+parameter owned by ``FusedAdam``, none of them the module's. Both of the
+registry's tests for "is this a model" then answered no — the user's model
+because it is contained in DeepSpeed's engine, the engine because nothing owns
+its parameters — and Ravex wrote checkpoints holding an optimizer, a dataloader
+and no weights, reporting a successful handoff each time.
+
+It works now, and it works by :meth:`~ravex._registry.ObjectRegistry._root_models`
+noticing that the ownership question has no answer for this run rather than
+reading it as a no. The lesson is narrower than "DeepSpeed is special": *a
+framework that replaces the optimizer's parameters is outside what hooking
+``Optimizer.step`` can see*, and the argument from where the hooks are is an
+argument. ``integration/test_deepspeed.py`` is the evidence.
+
 Framework-specific state (``Trainer.state``, Lightning's loop counters) is a
 Sprint 2 concern; the adapters below are the seam it will plug into.
 """

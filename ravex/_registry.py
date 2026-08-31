@@ -220,12 +220,61 @@ class ObjectRegistry:
                 continue
 
         owned = self._optimized_parameter_ids()
+        candidates = [
+            module
+            for module in live
+            if id(module) not in contained and self._has_parameters(module)
+        ]
+
+        # **The ownership test is evidence only when it could have succeeded
+        # for somebody.** It asks "does an optimizer own one of this module's
+        # parameters", and answers no in two very different situations: this
+        # module is not part of the training, or *no* module is — because the
+        # optimizer's parameters are not any module's.
+        #
+        # The second is what DeepSpeed does. ZeRO hands the base optimizer its
+        # own flat partition buffers, so a run with a live model, a live
+        # optimizer and every step working reports zero owned parameters
+        # against every candidate. Measured on 2026-08-31 with ZeRO stage 1: a
+        # 4-parameter module, one parameter owned by `FusedAdam`, none of them
+        # the module's. Both filters then miss — the user's model is dropped as
+        # contained in the engine, and the engine is dropped as unowned — and
+        # Ravex wrote checkpoints containing an optimizer, a dataloader and no
+        # weights at all, logging a successful handoff each time.
+        #
+        # So when nothing owns anything, the question was not answered and must
+        # not be read as a no. Having parameters and being outermost is what is
+        # left to go on. This cannot fire on an ordinary run: there, the
+        # optimizer was built from a model's parameters and that model owns
+        # them.
+        # Keyed on *there being optimizers*, not on their holding parameters.
+        # At ZeRO stage 3 the base optimizer's param_groups come back empty
+        # altogether, so a condition written as "owned and not informative"
+        # misses exactly the stage that needs it most - measured, after the
+        # first version of this fix left stage 3 with no roots and the old
+        # symptom intact.
+        informative = any(self._owns_any(module, owned) for module in candidates)
+        uninformative = bool(self.optimizers) and not informative
+        if uninformative:
+            self._warn_once(
+                "opaque-optimizer",
+                "No module owns any parameter this run's optimizer(s) hold, "
+                "which is what DeepSpeed's ZeRO looks like from here - the "
+                "optimizer is given flat partition buffers rather than the "
+                "model's parameters, and at stage 3 it holds none at all. "
+                "Falling back to checkpointing the "
+                "outermost module that has parameters, because the ownership "
+                "test cannot answer here and reading it as a no would leave "
+                "the model out of the checkpoint entirely.",
+            )
 
         roots = []
-        for module in live:
-            if id(module) in contained or not self._has_parameters(module):
-                continue
-            if module in self._trained_modules or self._owns_any(module, owned):
+        for module in candidates:
+            if (
+                module in self._trained_modules
+                or self._owns_any(module, owned)
+                or uninformative
+            ):
                 roots.append(module)
 
         self._roots_cache = [weakref.ref(module) for module in roots]
@@ -254,6 +303,37 @@ class ObjectRegistry:
         except Exception:  # pragma: no cover - defensive
             return False
         return False
+
+    def parameters_are_partitioned_away(self) -> bool:
+        """Whether the models are here but their weights are not.
+
+        DeepSpeed's ZeRO stage 3 partitions the *parameters* as well as the
+        optimizer state, and what it leaves on the module is an empty shell:
+        measured on 2026-08-31, a four-parameter module under stage 3 reports
+        four parameters, every one of them ``numel() == 0``, while stages 1 and
+        2 report the same four at full size.
+
+        That distinction decides whether Ravex can checkpoint the run at all.
+        A state dict taken here would be the right keys, the right dtypes, and
+        no data — a checkpoint that restores nothing and says nothing, which is
+        the one outcome this project is built to avoid. Reaching the real
+        values needs a gather through DeepSpeed's own machinery, which Ravex
+        does not drive.
+
+        True only when there is something to be wrong about: models exist, they
+        have parameters, and every one of those is empty. A model that has no
+        parameters at all is a different situation and is not this one.
+        """
+        found = False
+        for module in self._root_models():
+            try:
+                for param in module.parameters():
+                    found = True
+                    if param.numel() != 0:
+                        return False
+            except Exception:  # pragma: no cover - defensive
+                return False
+        return found
 
     @staticmethod
     def _has_parameters(module: Any) -> bool:
@@ -410,7 +490,31 @@ class ObjectRegistry:
             state["models"][key] = unwrap_model(model).state_dict()
 
         for key, optimizer in self.keyed_optimizers():
-            state["optimizers"][key] = optimizer.state_dict()
+            # One optimizer refusing to describe itself must not cost the
+            # checkpoint the model. Measured on 2026-08-31: under DeepSpeed
+            # ZeRO stage 3 the base `FusedAdam`'s `state_dict()` raises a bare
+            # `KeyError` on a parameter id, because ZeRO has taken over the
+            # mapping it reads. That killed the whole collection every
+            # interval, so a run that could have had its weights saved had
+            # nothing saved at all, reported as `Checkpoint at step 4 failed:
+            # 133268936989168` — a number, and no clue what it belonged to.
+            #
+            # Skipped and named, once. The weights are the part a resume
+            # cannot do without; moments it can, at the cost of a few steps of
+            # warm-up.
+            try:
+                state["optimizers"][key] = optimizer.state_dict()
+            except Exception as exc:
+                self._warn_once(
+                    "optimizer-state-%s" % key,
+                    "Optimizer %s (%s) could not produce a state dict (%s: %s), "
+                    "so its moments are left out of the checkpoint. Everything "
+                    "else is still saved. This is what DeepSpeed's ZeRO looks "
+                    "like from here - its engine owns the optimizer's "
+                    "bookkeeping and the base optimizer alone cannot describe "
+                    "it."
+                    % (key, type(optimizer).__name__, type(exc).__name__, exc),
+                )
 
         # Sharded models go through a collective either way, so this must run
         # on every rank — under `gather` even though only rank 0 will write the

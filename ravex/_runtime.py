@@ -768,6 +768,24 @@ class RavexRuntime:
         if not self._enabled:
             return False
 
+        # Checked here rather than at activation because at activation there is
+        # no model yet to look at. Safe to act on unilaterally despite the rule
+        # about one rank switching itself off: this is a property of the
+        # DeepSpeed configuration, identical on every rank, so they all reach
+        # the same verdict at the same checkpoint and none is left waiting.
+        if self.registry.parameters_are_partitioned_away():
+            self._disable(
+                "the model's parameters are partitioned away from the module - "
+                "DeepSpeed ZeRO stage 3 does this, and what is left here is the "
+                "right keys with no data behind them. Reaching the real values "
+                "needs a gather through DeepSpeed's own machinery, which Ravex "
+                "does not drive, so a checkpoint taken from here would restore "
+                "nothing while looking like it had worked. Use DeepSpeed's "
+                "`engine.save_checkpoint()` for this run; Ravex can read what "
+                "it writes (convert_foreign)"
+            )
+            return False
+
         # With a sharded model, collecting is a collective: every rank has to
         # call it or the ones that do will block forever waiting for the ones
         # that did not. So the rank gate moves *after* collection — every rank
