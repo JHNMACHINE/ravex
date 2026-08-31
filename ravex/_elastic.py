@@ -71,6 +71,32 @@ itself does not perform the rebuild, because ravex is only ever handed an
 already-constructed model — it has no factory to rebuild one from, which is
 why this module stops at the group/rendezvous layer and leaves the module
 rebuild to whoever owns the model's construction.
+
+**Two rules for whoever calls ``full_tensor()`` around a regroup, found the
+hard way in ``tests/test_elastic_grow_end_to_end.py`` while composing all
+of the above into one scenario** — neither is specific to that test, both
+apply to any real caller:
+
+1. ``full_tensor()`` redistributes a sharded ``DTensor`` and is a
+   **collective**: every rank of the group must call it together, even the
+   ranks that discard the result. Calling it on one rank alone does not
+   raise anywhere near the mistake — it desynchronises
+   ``torch.distributed``'s internal per-process group-naming counter
+   between ranks, and that surfaces later, far from the real cause, as an
+   unrelated-looking timeout the next time *any* rank builds a new group
+   (``topology_decision`` included). Same discipline
+   ``emergency_signalled`` and ``_drain_split_agreed`` already document for
+   themselves, extended to a collective neither of those functions happens
+   to call.
+2. Never call ``full_tensor()`` — or anything else that reads a
+   ``DTensor``'s mesh — on a module whose process group has already been
+   torn down. After a regroup's ``destroy_process_group()``, the *old*
+   module's parameters are still meshed against the world_size that no
+   longer exists. Reading them then does not fail cleanly; it corrupts,
+   surfacing as a baffling ``RuntimeError: narrow unexpectedly changed
+   concrete size`` with no obvious connection to the real cause. Whatever
+   values are needed from the old module have to be captured *before* the
+   destroy, not reconstructed after it.
 """
 
 from __future__ import annotations
