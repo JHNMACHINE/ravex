@@ -17,9 +17,35 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 CONFIG_FILENAMES = ("ravex.yaml", "ravex.yml")
+
+#: Every spelling ``moonclip``'s ``DType::parse`` accepts. Mirrored rather
+#: than imported because the config loads before any backend does — a
+#: ``save_dtype`` typo has to be caught and reported here, where the rest of
+#: the bad-config handling lives, not raised out of ``MoonclipManager`` half a
+#: second into the run.
+SAVE_DTYPES = frozenset(
+    {
+        "none",
+        "bf16",
+        "bfloat16",
+        "fp16",
+        "float16",
+        "fp32",
+        "float32",
+        "fp64",
+        "float64",
+        "double",
+        "fp8",
+        "float8",
+        "fp8_e4m3",
+        "float8_e4m3fn",
+        "fp8_e5m2",
+        "float8_e5m2",
+    }
+)
 
 _TRUE = {"1", "true", "yes", "on"}
 _FALSE = {"0", "false", "no", "off"}
@@ -148,6 +174,36 @@ class RavexConfig:
     compression: str = "zstd"
     compression_level: int = 3
     keep_last: int = 5
+
+    # What float tensors are cast to on the way out, and back from on the way
+    # in. ``None`` — the default — casts nothing: every tensor is stored at the
+    # dtype it arrived at.
+    #
+    # Either one name for everything (``"bf16"``) or an ordered mapping of glob
+    # pattern to dtype, **first match wins**. Patterns are matched against the
+    # flattened tensor name, which is what Ravex hands Moonclip and therefore
+    # begins with ``ravex/``:
+    #
+    #     save_dtype: {"ravex/optimizers/*": "bf16"}
+    #
+    # That one line is the setting worth knowing about. On a 1.5B model under
+    # FSDP2 the optimizer moments are ~85% of the bytes written and barely
+    # delta at all — two consecutive Adam moments differ across nearly every
+    # mantissa bit — so casting only them halves 85% of the volume while the
+    # weights, which are the part that deltas well, are stored untouched. The
+    # moments are also what tolerates it: ``exp_avg_sq`` reaches the update
+    # through ``sqrt(v)``, which halves the relative error going in.
+    #
+    # It defaults to casting nothing all the same, for the reason
+    # ``sharded_checkpoints`` defaults to ``gather``: this changes the numbers
+    # a resumed run gets back, and that is not something to acquire by
+    # upgrading Ravex under a job already running. The Moonclip backend logs
+    # the option once per run so it is discoverable without being imposed.
+    #
+    # ``fp8`` is reachable and is a bad idea for moments specifically — four
+    # significant bits, ~20x the error of bf16 — but it is Moonclip's
+    # vocabulary and Ravex does not shorten it.
+    save_dtype: Optional[Union[str, Dict[str, str]]] = None
 
     # How often each rank sends a copy of its store to a peer on another
     # machine, counted in checkpoints. Only ever used when the storage turns
@@ -303,6 +359,8 @@ class RavexConfig:
             self.compression_level = _as_int(value, self.compression_level)
         if (value := get("KEEP_LAST")) is not None:
             self.keep_last = _as_int(value, self.keep_last)
+        if (value := get("SAVE_DTYPE")) is not None:
+            self.save_dtype = _save_dtype_from_env(value)
         if (value := get("REPLICATE_EVERY")) is not None:
             self.replicate_every = _as_int(value, self.replicate_every)
         if (value := get("KEEP_BASE_IN_MEMORY")) is not None:
