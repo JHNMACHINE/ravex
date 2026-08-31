@@ -1177,13 +1177,76 @@ class RavexRuntime:
             self.registry.step_count,
         )
 
-        # Only the rank(s) actually preempted terminate. Everyone else - the
-        # whole point of doing this coordinated rather than unilaterally -
-        # goes back to ordinary training, the same as after any periodic
-        # checkpoint.
+        # Only the rank(s) actually preempted terminate.
+        #
+        # What the survivors do next is *not* "go back to ordinary training",
+        # though this said so until it was run on two real machines. The
+        # moment the preempted rank's process exits, the training process
+        # group is broken: the survivors' next collective fails with
+        # `ncclRemoteError: remote process exited`. Continuing requires
+        # rebuilding the group without the departed rank - see GPU-94, where
+        # exactly that regroup is validated on real GPUs. This function's job
+        # ends at getting the state safely onto disk; who can carry on
+        # afterwards is that mechanism's question, not this one's.
         if self._emergency_requested:
+            # Durability before death, and this is the whole point of the
+            # emergency path rather than a tidy-up.
+            #
+            # `checkpoint()` only *hands off* to the background writer. Killing
+            # the process here without waiting kills the writer mid-flight, and
+            # on 2026-08-31 that is exactly what two real machines showed: the
+            # preempted rank logged "Emergency checkpoint written at step 9"
+            # and its store held steps 4 and 8 and nothing else. With
+            # `per_rank` every rank's shard is needed, so the survivor's step 9
+            # was unusable on its own and the resume fell back to step 8 - the
+            # coordinated save bought nothing, silently, on the one rank the
+            # feature exists for. See GPU-100.
+            #
+            # Bounded, because the budget is not ours: SIGTERM gives ~10s
+            # before SIGKILL, which no handler can catch or delay, and the
+            # local handoff alone has been measured close to that. A flush that
+            # does not finish in time is reported and then abandoned - dying
+            # with a partial write announced beats dying with it hidden, and
+            # beats not dying at all while the cloud's own timer runs out.
+            self._flush_before_dying()
             signal.signal(signal.SIGTERM, signal.SIG_DFL)
             os.kill(os.getpid(), signal.SIGTERM)
+
+    def _flush_before_dying(self) -> None:
+        """Wait for the emergency checkpoint to reach the disk. **Bounded.**
+
+        Split out from `_check_emergency_signal` so the one thing that must
+        never raise from a signal-adjacent path is a single, obviously
+        total try/except: every failure here ends in the process dying
+        anyway, and an exception escaping would replace a partial checkpoint
+        with a traceback and no checkpoint at all.
+        """
+        # `getattr` rather than `self._backend`, for the same reason the flags
+        # at the top of this class have defaults: a runtime built with
+        # `__new__` to exercise one method has no `_backend` at all, and this
+        # path must not be the one that turns that into an AttributeError.
+        backend = getattr(self, "_backend", None)
+        if backend is None:  # pragma: no cover - no backend, nothing pending
+            return
+
+        started = time.time()
+        try:
+            backend.flush()
+        except Exception as exc:
+            logger.warning(
+                "The emergency checkpoint could not be flushed to disk (%s). "
+                "This rank is being preempted and its shard for this step may "
+                "be incomplete; with per-rank checkpoints that means the whole "
+                "step is unusable and the resume falls back to the previous "
+                "one.",
+                exc,
+            )
+            return
+
+        logger.warning(
+            "Emergency checkpoint flushed to disk in %.2fs before exiting.",
+            time.time() - started,
+        )
 
     def _final_checkpoint_is_safe(self) -> bool:
         """Whether a last checkpoint can be taken without risking a hang.

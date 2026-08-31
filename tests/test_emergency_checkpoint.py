@@ -126,6 +126,75 @@ class TestTheDetectionRoundDegradesCleanly:
         assert calls == [((), {"final": True, "emergency": True})]
         assert killed, "the rank that actually raised the flag must terminate"
 
+    def test_the_preempted_rank_flushes_before_it_dies(self, monkeypatch):
+        """GPU-100. The ordering is the whole feature, not a nicety.
+
+        `checkpoint()` hands off to a background writer; killing the process
+        before that writer finishes destroys the checkpoint it just claimed
+        to have written. Measured on two real machines on 2026-08-31: the
+        preempted rank logged "Emergency checkpoint written at step 9" and
+        its store held steps 4 and 8. With `per_rank` every rank's shard is
+        needed, so the survivor's step 9 was unusable alone and the resume
+        fell back to step 8 - the coordinated save bought nothing, and said
+        nothing.
+
+        Asserting on the *order* rather than merely that flush was called:
+        a flush after the kill is not a flush.
+        """
+        runtime = self._bare_runtime()
+        runtime._emergency_group = "already-built"
+        runtime._emergency_requested = True
+        runtime.checkpoint = lambda *a, **k: True
+
+        order = []
+
+        class RecordingBackend:
+            def flush(self):
+                order.append("flush")
+
+        runtime._backend = RecordingBackend()
+
+        monkeypatch.setattr(
+            "ravex._distributed.emergency_signalled", lambda local, group: True
+        )
+        monkeypatch.setattr(os, "kill", lambda pid, sig: order.append("kill"))
+        monkeypatch.setattr(signal, "signal", lambda sig, handler: None)
+
+        runtime._check_emergency_signal()
+
+        assert order == ["flush", "kill"], (
+            "the preempted rank must wait for the write to land before "
+            "terminating; %r" % (order,)
+        )
+
+    def test_a_flush_that_fails_still_lets_the_rank_die(self, monkeypatch):
+        """The budget is not ours: SIGTERM gives ~10s and then SIGKILL, which
+        no handler can catch. A rank that raised out of the flush - or sat in
+        it forever - would trade a partial checkpoint for a hang, which is
+        worse. It says so and then goes.
+        """
+        runtime = self._bare_runtime()
+        runtime._emergency_group = "already-built"
+        runtime._emergency_requested = True
+        runtime.checkpoint = lambda *a, **k: True
+
+        class ExplodingBackend:
+            def flush(self):
+                raise OSError("disk went away")
+
+        runtime._backend = ExplodingBackend()
+
+        monkeypatch.setattr(
+            "ravex._distributed.emergency_signalled", lambda local, group: True
+        )
+        killed = []
+        monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append((pid, sig)))
+        monkeypatch.setattr(signal, "signal", lambda sig, handler: None)
+
+        runtime._check_emergency_signal()
+
+        assert killed, "a failed flush must not stop the rank from terminating"
+
     def test_a_signal_from_another_rank_does_not_kill_this_one(self, monkeypatch):
         """The other half of the same invariant: this rank enters the save
         because *someone* signalled, but it was not the one preempted, so it
