@@ -339,6 +339,18 @@ class RavexConfig:
     # which is the data order and the per-rank RNG.
     reshard_on_resume: bool = False
 
+    # Restore from a checkpoint another framework wrote — a DeepSpeed ZeRO
+    # directory, or a torch distributed checkpoint (which is also what
+    # Megatron-core writes) — by converting it before the ordinary resume.
+    #
+    # Off by default for the same reason `reshard_on_resume` is, and it is the
+    # stronger case of the two: a foreign checkpoint found where Ravex's own
+    # store belongs usually means a path was pointed somewhere unintended, and
+    # converting it silently would turn that into a run that trains on someone
+    # else's weights without ever saying so. So the detection is unconditional
+    # and always logged, and only acting on it is opt-in.
+    convert_foreign: bool = False
+
     # Interception toggles — each patch can be disabled independently, which
     # makes bisecting an incompatibility trivial.
     track_dataloaders: bool = True
@@ -465,6 +477,8 @@ class RavexConfig:
             self.sharded_checkpoints = value
         if (value := get("RESHARD_ON_RESUME")) is not None:
             self.reshard_on_resume = _as_bool(value, self.reshard_on_resume)
+        if (value := get("CONVERT_FOREIGN")) is not None:
+            self.convert_foreign = _as_bool(value, self.convert_foreign)
         if (value := get("TRACK_DATALOADERS")) is not None:
             self.track_dataloaders = _as_bool(value, self.track_dataloaders)
         if (value := get("TRACK_RNG")) is not None:
@@ -533,6 +547,7 @@ class RavexConfig:
             "keep_base_in_memory",
             "async_save",
             "reshard_on_resume",
+            "convert_foreign",
             "track_dataloaders",
             "track_rng",
             "handle_sigterm",

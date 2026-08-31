@@ -236,6 +236,13 @@ def unshard(found, loader) -> Dict[str, Any]:
         "step": step,
         "world_size": len(ranks),
         "stage": stage,
+        # The recorded shapes, per parameter group and in the order they were
+        # flattened. Carried out rather than kept private because rebuilding a
+        # torch optimizer state dict needs to say which parameters are in
+        # which group, and this is the only record of that grouping - the
+        # moments themselves come back keyed by name with the grouping already
+        # dissolved.
+        "param_shapes": shapes,
         "notes": notes,
     }
 

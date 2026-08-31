@@ -35,6 +35,7 @@ ravex status
 | `keep_last` | `RAVEX_KEEP_LAST` | `5` | Checkpoints to retain. Older ones are deleted. |
 | `sharded_checkpoints` | `RAVEX_SHARDED_CHECKPOINTS` | `gather` | How FSDP state is written: `gather` or `per_rank`. See [Sharded models](#sharded-models). |
 | `reshard_on_resume` | `RAVEX_RESHARD_ON_RESUME` | `false` | Resume a `per_rank` checkpoint at a different world size, rebuilding each shard from the old ones. See [Resuming onto a different number of ranks](#resuming-onto-a-different-number-of-ranks). |
+| `convert_foreign` | `RAVEX_CONVERT_FOREIGN` | `false` | Resume from a checkpoint another framework wrote — DeepSpeed ZeRO, or a torch distributed checkpoint (which is what Megatron-core writes). See [Resuming from another framework's checkpoint](#resuming-from-another-frameworks-checkpoint). |
 | `replicate_every` | `RAVEX_REPLICATE_EVERY` | `10` | Checkpoints between copies of each rank's store to a peer on another machine. Only ever used when the storage turns out to be neither remote nor shared. `0` turns it off. See [More than one machine](#more-than-one-machine). |
 | `track_dataloaders` | `RAVEX_TRACK_DATALOADERS` | `true` | Track and restore the dataset position. |
 | `track_rng` | `RAVEX_TRACK_RNG` | `true` | Save and restore torch / CUDA / Python / NumPy RNG state. |
@@ -151,6 +152,62 @@ run, and the two differences are worth knowing before you rely on it:
 - **Per-rank RNG.** There were N generator states and there are now M ranks;
   there is no correct mapping. The saved states are not restored, and random
   draws continue from whatever seeding your script did. A log line says so.
+
+### Resuming from another framework's checkpoint
+
+`convert_foreign: true` lets a run start from a checkpoint Ravex did not write:
+a DeepSpeed ZeRO directory, or a `torch.distributed.checkpoint` one — which is
+also what `megatron.core.dist_checkpointing` writes, so a Megatron checkpoint
+is one of these.
+
+```yaml
+convert_foreign: true
+storage:
+  type: local
+  path: /checkpoints/from-the-other-team
+```
+
+Nothing else changes, and the training script does not change at all. At resume
+Ravex looks at the storage path, recognises what is in it, rebuilds the whole
+unsharded tensors, matches their names against the live model, and hands the
+result to the same restore path a gathered Ravex checkpoint takes — including
+scattering onto FSDP shards if this run has them.
+
+**Off by default, and this is the stronger of the two opt-ins here.** A foreign
+checkpoint sitting where Ravex's own store belongs usually means a path points
+somewhere unintended. Converting it quietly would turn that into a run trained
+on someone else's weights with nothing in the log to say so. The detection is
+unconditional and always reported; only acting on it is a setting.
+
+**A DeepSpeed run resuming a DeepSpeed checkpoint is declined.** The engine
+loads its own checkpoints; doing it twice by two routes leaves the optimizer
+disagreeing with itself. Ravex says so and stands aside.
+
+What comes across and what does not:
+
+- **Weights and optimizer moments**, matched by parameter name. Verified
+  bit-exact against DeepSpeed's own `zero_to_fp32` across ZeRO stages 1, 2 and
+  3 at several world sizes.
+- **Not the step count's meaning, the data order, or the RNG.** A foreign
+  checkpoint carries no Ravex sampler position and no per-rank generator state.
+  The model continues; the run does not.
+- **Not hyperparameters the receiving optimizer lacks.** DeepSpeed's Adam
+  records `bias_correction` and torch's does not; it is dropped and named in
+  the log rather than translated into something with no correct value.
+- **Not an optimizer state keyed by position** onto a sharded model. A plain
+  `optimizer.state_dict()` inside a distributed checkpoint numbers its entries
+  by the writing run's parameter order; a sharded restore matches by name. The
+  weights convert, the moments do not, and the log says which.
+
+Two things worth knowing before pointing `storage.path` at a checkpoint you
+did not write:
+
+- **Ravex will write its own checkpoints there too.** After converting, the
+  next save lands in the same directory in Ravex's layout, so the directory
+  then holds two formats. Point `storage.path` at a copy, or at a fresh
+  directory once the conversion has happened.
+- **One model.** Converting needs one model to convert into; a run with
+  several sharded groups is refused rather than guessed at.
 
 ### Elastic training: a cluster that changes size while it runs
 
