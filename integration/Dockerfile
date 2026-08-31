@@ -29,6 +29,22 @@ RUN pip install --no-cache-dir \
 # dataloader in a subclass of its own.
 RUN pip install --no-cache-dir "transformers>=4.40" "accelerate>=1.1" "lightning>=2.2"
 
+# DeepSpeed, for GPU-90. Not to run training on it — to *produce* real ZeRO
+# checkpoints and to check Ravex's reader against DeepSpeed's own
+# `zero_to_fp32`, which every checkpoint carries inside it. An adapter written
+# against a format read about rather than held is how you get a parser for a
+# plausible file nobody ever wrote, and this is what makes the artefacts
+# available without a GPU: DeepSpeed selects its CPU accelerator on its own
+# when it finds no device, and ZeRO's partitioning is Python.
+#
+# `g++` is not optional here. The CPU accelerator JIT-builds a shared-memory
+# communication extension on first use, and without a compiler the failure is
+# an ImportError about a `.so` that was never built — which reads like a broken
+# install rather than a missing build tool.
+RUN apt-get update && apt-get install -y --no-install-recommends g++ \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir deepspeed
+
 WORKDIR /app
 COPY pyproject.toml README.md LICENSE NOTICE ./
 COPY ravex ./ravex
