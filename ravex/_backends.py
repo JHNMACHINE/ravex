@@ -395,7 +395,7 @@ class MoonclipBackend(CheckpointBackend):
         and dtype, and everything that was never a tensor — and Moonclip reads
         only the byte range it occupies rather than the rank's pack.
 
-        Needs Moonclip >= 0.0.10 for ``load_tensors``/``describe_state_dict``.
+        Needs Moonclip >= 0.1.0 for ``load_tensors``/``describe_state_dict``.
         On anything older this returns None and the caller loads, which is what
         it did before this existed: slower, never wrong.
         """

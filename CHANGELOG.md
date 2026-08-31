@@ -75,7 +75,7 @@
   Nothing depends on it being available. A backend that cannot describe itself
   returns `None` and gets loaded, which is exactly what happened before; the
   `torch_save` backend does precisely that, having one pickle and no way to
-  read a shape out of it short of unpickling the lot. Needs Moonclip >= 0.0.10
+  read a shape out of it short of unpickling the lot. Needs Moonclip >= 0.1.0
   for the fast path.
 
 ## 0.0.5 — 2026-08-30
