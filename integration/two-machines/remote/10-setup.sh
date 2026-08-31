@@ -10,17 +10,21 @@
 # branch you mean to measure *before* running push.sh.
 #
 # Moonclip comes from PyPI: the storage engine is not what is being tried
-# here, and 0.0.8 is what a user gets today (released 2026-08-21). It is also
-# the floor for the S3 half of the story — `restore_from_remote` exists from
-# 0.0.8, and on 0.0.7 Ravex swallows the AttributeError and quietly does not
-# restore. Override with MOONCLIP_SPEC=... to pin an older one deliberately.
+# here, and 0.0.9 is what a user gets today. Two floors sit underneath that
+# number, both of them failures that hide rather than raise. `restore_from_remote`
+# exists from 0.0.8 — on 0.0.7 Ravex swallows the AttributeError and quietly
+# does not restore. And `save_dtype` is declared as a string before 0.0.9, so
+# the mapping form reaches it as a TypeError that `get_backend` catches along
+# with everything else: one configuration line would cost the run its Moonclip
+# checkpointing entirely, reported only as "Moonclip backend unavailable".
+# Override with MOONCLIP_SPEC=... to pin an older one deliberately.
 set -euo pipefail
 
 # /root on vast.ai, /workspace on RunPod. Exported into every phase by
 # box.env; the default keeps this runnable by hand.
 KIT_ROOT="${KIT_ROOT:-/root}"
 
-MOONCLIP_SPEC="${MOONCLIP_SPEC:-moonclip==0.0.8}"
+MOONCLIP_SPEC="${MOONCLIP_SPEC:-moonclip==0.0.9}"
 
 # vast.ai keeps torch in a venv that only an interactive shell gets on its
 # PATH. Every phase here arrives as `ssh host '...'` — not a login shell — so
