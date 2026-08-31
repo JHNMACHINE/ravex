@@ -24,6 +24,33 @@ joining the same rendezvous the original ranks re-enter. See
 :func:`generation_store`, and the note on ``FSDPParamGroup``/``DeviceMesh``
 below — rebuilding the *group* is the easy half of this.
 
+**Pre-staging — why it does not use torch.distributed at all.** The obvious
+design was to reuse ``ravex._replication.exchange_stores`` on a small,
+independent ``ProcessGroupGloo`` built by hand (without
+``init_process_group``/``new_group``) between one old rank and a joining
+candidate, so the old ranks' real training group is never touched while
+bytes move in the background. The independent group itself works fine for a
+collective — ``all_reduce`` on it returns the right answer without
+disturbing the live default group at all, verified in
+``tests/test_elastic_prestage.py``. It does not work for
+``exchange_stores``, because that function moves bytes with
+``dist.isend``/``dist.recv``, and those refuse a group that was never
+registered through ``new_group``: ``RuntimeError: ... is not registered,
+please create group with torch.distributed.new_group API``. The private
+escape hatch (``torch.distributed.distributed_c10d._register_process_group``)
+does not help either — it rejects the same ``ProcessGroupGloo`` instance
+with a pybind11 type-mismatch ``TypeError``, even though it is exactly the
+type the function's own signature names. And the public path,
+``new_group()``, requires every rank of the *current* default group to call
+it collectively - which a not-yet-member candidate cannot do, since it has
+no default group to be a member of. So pre-staging here is a plain,
+length-prefixed TCP socket, not a torch collective of any kind - see
+:func:`prestage_send` and :func:`prestage_receive`. It reuses
+``ravex._replication``'s manifest/skip/``StoreWriter`` machinery directly
+(all of it is already plain bytes and files, with no torch dependency of its
+own — only ``exchange_stores`` itself, the one function this module does
+not call, wires that machinery to a process group).
+
 **On "elastic without a restart" — what it actually buys.** ``fully_shard()``
 refuses to be applied a second time to a module it has already wrapped
 (torch raises ``AssertionError: Each distinct composable distributed API can
@@ -48,10 +75,13 @@ rebuild to whoever owns the model's construction.
 
 from __future__ import annotations
 
+import socket as _socket
+import struct
 from typing import Any, List, Optional
 
 
 _JOIN_KEY = "gpu94/join/%d"
+_LENGTH_PREFIX = struct.Struct("!Q")
 
 
 def generation_store(base_store, generation: int):
@@ -141,3 +171,85 @@ def topology_decision(local_view: Any, timeout_seconds: int = 10) -> List[Any]:
     if not usable:
         return [local_view]
     return gather_objects(local_view, group=group)
+
+
+def _recv_exact(sock, n: int) -> bytes:
+    buf = bytearray()
+    while len(buf) < n:
+        block = sock.recv(n - len(buf))
+        if not block:
+            raise ConnectionError(
+                "peer closed while %d of %d bytes were still expected" % (n - len(buf), n)
+            )
+        buf += block
+    return bytes(buf)
+
+
+def prestage_send(sock, source: str, chunk: int = 1 << 20) -> None:
+    """Push ``source`` to whatever ``prestage_receive`` holds on the other
+    end of ``sock``, skipping files that already match. **Not a collective.**
+
+    See the module docstring for why this is a plain socket rather than
+    ``exchange_stores``. The manifest/skip/encode logic is exactly
+    ``ravex._replication``'s own - reused, not reimplemented, because none
+    of it depends on a process group; only the transport underneath it does.
+
+    Reads the peer's manifest first (length-prefixed), computes what it
+    already has byte-for-byte, then streams the rest. Does **not** shut the
+    connection down afterwards, on purpose: ``encode_store``'s own header
+    already tells :func:`prestage_receive` exactly how many files of what
+    size to expect, which is what lets ``StoreWriter.complete`` end the read
+    loop without a message boundary from the transport. Leaving the
+    connection open is what makes several rounds over one socket possible -
+    the pre-staging use case this exists for: a coarse pass while the old
+    ranks are still far from the cutover, then smaller and smaller deltas as
+    ``replicate_every``-style periodic re-syncs bring the candidate closer,
+    without paying a new TCP handshake for every round.
+    """
+    from ravex._replication import _parse_manifest, encode_store, store_files
+
+    manifest_len = _LENGTH_PREFIX.unpack(_recv_exact(sock, _LENGTH_PREFIX.size))[0]
+    peer_existing = (
+        dict(_parse_manifest(_recv_exact(sock, manifest_len))) if manifest_len else {}
+    )
+
+    skip_names = {
+        relative
+        for relative, size in store_files(source)
+        if peer_existing.get(relative) == size
+    }
+    for block in encode_store(source, chunk=chunk, skip=skip_names):
+        sock.sendall(block)
+
+
+def prestage_receive(sock, destination: str) -> bool:
+    """The other end of :func:`prestage_send`. **Not a collective.**
+
+    Sends what ``destination`` already holds before reading anything, then
+    feeds whatever arrives to the same :class:`~ravex._replication.StoreWriter`
+    ``exchange_stores`` uses - the destination ends up in exactly the same
+    shape a torch-transported round would have left it in. Stops reading on
+    ``writer.complete`` alone - the embedded header already says how much to
+    expect, so no separate length prefix or connection close is needed for
+    the body, and the connection is left open for whatever round comes next.
+    An empty ``recv`` (the peer actually closed) still ends the loop rather
+    than spinning, but that is the belt, not the buckle: ``prestage_send``
+    does not close its end after a round precisely so the same connection
+    can carry the next one.
+    """
+    from ravex._replication import StoreWriter, _encode_manifest, store_files
+
+    existing_blob = _encode_manifest(store_files(destination))
+    sock.sendall(_LENGTH_PREFIX.pack(len(existing_blob)) + existing_blob)
+
+    writer = StoreWriter(destination)
+    try:
+        while not writer.complete:
+            block = sock.recv(1 << 16)
+            if not block:
+                break
+            writer.feed(block)
+        writer.close()
+        return writer.commit()
+    finally:
+        writer.close()
