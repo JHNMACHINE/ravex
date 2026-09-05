@@ -299,6 +299,26 @@ class RavexConfig:
     #: cannot be built, and says so once.
     replication_transport: str = "auto"
 
+    #: Where the ranks agree about small things: ``"store"``,
+    #: ``"collectives"``, or ``"auto"``.
+    #:
+    #: The questions are tiny — did every rank succeed, what is the newest step
+    #: everyone holds — and the answer is a scalar. ``auto`` asks them on the
+    #: rendezvous store when there is one. Measured at 4 ranks:
+    #: `all_ranks_agree` costs 1544 µs over the collectives and 849 µs here
+    #: (GPU-111, `bench/agreement_cost.py`).
+    #:
+    #: 1.8x, and the reason it is not more is worth knowing: a gather has to
+    #: wait for the slowest rank whatever carries it. The larger part of the
+    #: change is not the microseconds — it is that a rank going silent produces
+    #: an answer here and a group-wide timeout there.
+    #:
+    #: ``"collectives"`` is the road back, and the reason to keep it is not
+    #: performance: a store round decides on its own when a rank goes silent,
+    #: and a job that would rather fail together than proceed without one rank
+    #: wants the collective's behaviour, not this one's.
+    agreement_transport: str = "auto"
+
     # Whether Moonclip keeps the last full snapshot's bytes resident so the
     # next delta can be computed without reading them back from storage.
     #
@@ -489,6 +509,8 @@ class RavexConfig:
             self.replicate_every = _as_int(value, self.replicate_every)
         if (value := get("REPLICATION_TRANSPORT")) is not None:
             self.replication_transport = value
+        if (value := get("AGREEMENT_TRANSPORT")) is not None:
+            self.agreement_transport = value
         if (value := get("KEEP_BASE_IN_MEMORY")) is not None:
             self.keep_base_in_memory = _as_bool(value, self.keep_base_in_memory)
         if (value := get("ASYNC_SAVE")) is not None:
@@ -603,6 +625,7 @@ class RavexConfig:
             "log_level",
             "sharded_checkpoints",
             "replication_transport",
+            "agreement_transport",
         ):
             value = getattr(self, name)
             if not isinstance(value, str):
@@ -646,6 +669,13 @@ class RavexConfig:
                 "'auto', 'sockets' or 'collectives'; using 'auto'"
             )
             self.replication_transport = "auto"
+
+        if self.agreement_transport not in ("auto", "store", "collectives"):
+            self.problems.append(
+                f"agreement_transport={self.agreement_transport!r} is not "
+                "'auto', 'store' or 'collectives'; using 'auto'"
+            )
+            self.agreement_transport = "auto"
 
         if self.checkpoint_every < 1:
             self.checkpoint_every = 1

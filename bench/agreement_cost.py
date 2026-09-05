@@ -12,20 +12,26 @@ Four arms, and the fourth is the one that decides:
 
 **signal** - `emergency_signalled(False, group)`, the real per-step call.
 
-**gather** - `all_ranks_agree(True)`, the other shape of the same family: an
-all-gather of a Python object rather than a reduce of a tensor. Not per-step —
-it gates a resume — but it is what a store round would replace first.
+**gather** - `all_ranks_agree(True)`, the other shape of the same family. Since
+GPU-111 it takes the store road where there is a store, so this arm measures
+whatever the shipped code actually does.
+
+**gather-collectives** - the implementation it replaced, called directly. A
+private function, reached on purpose: without it this bench stops being able to
+answer "and what did it cost before", which is the question the next change will
+ask too.
 
 **store-check** - `store.check([missing])` on the rendezvous store: the whole
 cost of the announced-flag design in the common case, where nobody is asking
 for anything and the answer is the absence of one key.
 
-**skew** - the same two, with one rank arriving late on purpose. This is the
-arm that matters. A collective makes every rank wait for the slowest, so a
-straggler's delay is paid by everybody; a key that is simply not there is
-answered without anyone waiting for anyone. On an idle box the first three arms
-understate the difference to nothing, because there is no skew to absorb — and
-skew is what a training job has.
+**+skew** - the same calls, with one rank arriving late on purpose, and the
+arms that keep the story honest in both directions. A key that is simply *not
+there* is answered without waiting for anyone, so `store-check` does not move.
+A **gather** cannot do that on any medium: it needs everyone's answer, so both
+roads pay the straggler and the skew arms say so. What the store changes for a
+gather is the cost of the mechanism, not the cost of waiting — and conflating
+the two is how a 1.7x becomes a claim of 20x.
 
     python bench/agreement_cost.py --ranks 4 --iterations 2000 --skew-ms 5
 
@@ -44,7 +50,12 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from ravex._dist.collectives import all_ranks_agree, emergency_group, emergency_signalled
+from ravex._dist.collectives import (
+    _all_gather_object,
+    all_ranks_agree,
+    emergency_group,
+    emergency_signalled,
+)
 
 MISSING_KEY = "ravex/bench/agreement/never-written"
 
@@ -118,10 +129,34 @@ def worker(rank, args, results) -> None:
 
     dist.barrier()
     results.append(
+        (
+            rank,
+            "gather-collectives",
+            summarise(timed(lambda: _all_gather_object(dist, True), args.iterations)),
+        )
+    )
+
+    dist.barrier()
+    results.append(
         (rank, "store-check", summarise(timed(lambda: store.check([MISSING_KEY]), args.iterations)))
     )
 
     skew = args.skew_ms / 1000.0
+    for label, call in (
+        ("gather+skew", lambda: all_ranks_agree(True)),
+        ("gather-collectives+skew", lambda: _all_gather_object(dist, True)),
+    ):
+        dist.barrier()
+        results.append(
+            (
+                rank,
+                label,
+                summarise(
+                    timed_with_skew(call, args.skew_iterations, rank, skew)
+                ),
+            )
+        )
+
     dist.barrier()
     results.append(
         (
@@ -178,7 +213,16 @@ def main() -> None:
         print("no emergency group could be built here; nothing to measure")
         return
 
-    order = ["signal", "gather", "store-check", "signal+skew", "store-check+skew"]
+    order = [
+        "signal",
+        "gather",
+        "gather-collectives",
+        "store-check",
+        "signal+skew",
+        "gather+skew",
+        "gather-collectives+skew",
+        "store-check+skew",
+    ]
     print()
     print(
         "%-18s %6s %10s %10s %10s %10s"
