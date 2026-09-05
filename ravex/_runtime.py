@@ -133,6 +133,12 @@ class RavexRuntime:
         self._shutdown_done = False
         self._lock = threading.RLock()
         self._framework = "unknown"
+        #: The adapter for that framework, from activation onward. None before
+        #: it, and on a run whose activation failed.
+        self._adapter: Any = None
+        #: The adapter's answer to `should_intercept_step`, asked once at
+        #: activation. See `on_step` for what a False costs.
+        self._count_steps = True
 
         self._setup_logging()
 
@@ -171,9 +177,11 @@ class RavexRuntime:
             return
 
         try:
-            from ravex._frameworks import detect_framework
+            from ravex._frameworks import detect_framework, get_adapter
 
             self._framework = detect_framework()
+            self._adapter = get_adapter(self._framework)
+            self._resolve_step_interception()
             self._patches = install_all_patches(self.registry, self)
             self._install_signal_handler()
 
@@ -187,6 +195,43 @@ class RavexRuntime:
         except Exception as exc:
             logger.error("Activation failed: %s", exc, exc_info=True)
             self._disable("activation failed")
+
+    def _resolve_step_interception(self) -> None:
+        """Ask the adapter, once, whether ``optimizer.step()`` is the loop's step.
+
+        Once rather than per step. The answer is a property of the framework,
+        the framework is settled here and cannot change under a running loop,
+        and `on_step` is the hottest path Ravex has: a bool test belongs in it,
+        a dispatch through an adapter does not.
+
+        Asking *here* is worth something the autoloader could not have had.
+        Detection reads ``sys.modules``, and the decorator runs when the
+        training function is called — with transformers, or Lightning, or
+        DeepSpeed already imported by the script above it. The autoloader asked
+        at interpreter startup, before the script had imported anything, and
+        the honest answer at that point was always "vanilla".
+        """
+        try:
+            self._count_steps = bool(self._adapter.should_intercept_step())
+        except Exception as exc:
+            logger.warning(
+                "Adapter %s could not say whether to count optimizer steps "
+                "(%s: %s) - counting them, which is what every framework "
+                "Ravex ships an adapter for asks for",
+                self._framework,
+                type(exc).__name__,
+                exc,
+            )
+            self._count_steps = True
+            return
+
+        if not self._count_steps:
+            logger.warning(
+                "Adapter %s has taken over step counting: Ravex will not count "
+                "optimizer.step(), and nothing is checkpointed until something "
+                "else advances the step count",
+                self._framework,
+            )
 
     def _announce_storage_topology(self) -> None:
         """Say which of the three situations this multi-machine job is in.
@@ -432,6 +477,13 @@ class RavexRuntime:
         if not self._resume_attempted:
             self._try_resume()
 
+        # The adapter's veto, settled once at activation. After the resume
+        # above rather than before it: a framework that counts its own steps
+        # still has to be resumed, and for a loop with no DataLoader this is
+        # the last point where that can happen.
+        if not self._count_steps:
+            return
+
         self.registry.step_count += 1
 
         if self._emergency_coordination_active():
@@ -528,6 +580,7 @@ class RavexRuntime:
             resume_manager.try_resume(
                 defer_rng=defer_rng, per_rank=self._per_rank_active()
             )
+            self._restore_extra_state(resume_manager.restored_extra)
         except Exception as exc:
             logger.warning("Resume failed (%s) - starting from scratch", exc)
         finally:
@@ -545,6 +598,80 @@ class RavexRuntime:
 
         return convert_on_resume(self.config, self.registry, defer_rng)
 
+    def _collect_extra_state(self) -> Optional[dict]:
+        """The adapter's own state, or None when there is none to have.
+
+        Runs inside the collective window of `checkpoint`, which is why it does
+        not get to fail loudly: an adapter raising here would take the weights
+        down with it, and on a sharded run it would take them down on one rank
+        while the other seven wrote theirs — a checkpoint that exists in pieces
+        is worse than one that does not exist.
+
+        The framework's name travels with the state because a resume has to be
+        able to tell "nothing extra was saved" from "something was saved by a
+        framework this run is not using".
+        """
+        adapter = self._adapter
+        if adapter is None:
+            return None
+
+        try:
+            collected = adapter.collect_extra_state()
+        except Exception as exc:
+            logger.warning(
+                "Adapter %s could not collect its framework state (%s: %s) - "
+                "the checkpoint is written without it",
+                self._framework,
+                type(exc).__name__,
+                exc,
+            )
+            return None
+
+        if not collected:
+            return None
+        return {"framework": self._framework, "state": collected}
+
+    def _restore_extra_state(self, extra: Optional[dict]) -> None:
+        """Hand back what `_collect_extra_state` saved, if it is this run's.
+
+        Called once the model, the optimizer, the schedulers and the dataset
+        position are back: an adapter restoring loop counters is entitled to
+        assume the run around them exists.
+
+        Three things arrive here and only one of them is state to restore. A
+        checkpoint written before this seam existed — or by an adapter that
+        collects nothing, which is every adapter Ravex ships today — has no
+        `extra` at all, and must resume exactly as it always did. A checkpoint
+        written under another framework holds state this adapter has no way to
+        read, and saying so is more useful than either ignoring it or dying on
+        it. Only the third is ours.
+        """
+        adapter = self._adapter
+        if adapter is None or not extra:
+            return
+
+        written_by = extra.get("framework")
+        if written_by != self._framework:
+            logger.warning(
+                "This checkpoint carries framework state written under %s and "
+                "this run is %s, so it is being skipped. Everything else - "
+                "weights, optimizer, RNG, dataset position - resumed normally",
+                written_by,
+                self._framework,
+            )
+            return
+
+        try:
+            adapter.restore_extra_state(extra.get("state") or {})
+        except Exception as exc:
+            logger.warning(
+                "Adapter %s could not restore its framework state (%s: %s) - "
+                "the run continues from the framework's own defaults, with "
+                "everything else resumed",
+                self._framework,
+                type(exc).__name__,
+                exc,
+            )
 
     # ─── checkpointing ──────────────────────────────────────────────
 
@@ -647,6 +774,15 @@ class RavexRuntime:
                 sharded_layout=self.config.sharded_checkpoints,
             )
             phases["collect"] = time.perf_counter() - collect_started
+
+            # Under its own key on purpose. `models`, `sharded` and `rng` have
+            # formats this run's readers understand; a framework's own state is
+            # opaque to everything except the adapter that produced it, and
+            # mixing it into a tree the reshard walks would make it a shape
+            # error waiting for a topology change.
+            extra = self._collect_extra_state()
+            if extra is not None:
+                state["extra"] = extra
 
             # Under `per_rank` there is nothing on rank 0 to write for the
             # other ranks — each holds its own shard and writes it into its own

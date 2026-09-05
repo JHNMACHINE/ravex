@@ -1,5 +1,2 @@
 # LF in the repository, native in the working tree.
 * text=auto eol=lf
-
-# The autoloader is executed by Python at startup: keep it byte-exact.
-*.pth text eol=lf

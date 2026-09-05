@@ -232,6 +232,12 @@ class ResumeManager:
         self.config = config
         self.attempted = False
         self.restored_step: Optional[int] = None
+        #: Framework state carried by the checkpoint that was applied, exactly
+        #: as it was written: ``{"framework": ..., "state": ...}``, or None.
+        #: Read back out by the runtime, which hands it to the adapter — this
+        #: class has no idea which framework is running and should not grow
+        #: one. See :meth:`RavexRuntime._restore_extra_state`.
+        self.restored_extra: Optional[Dict[str, Any]] = None
         #: World size that wrote the stores, once `_reshard_wanted` has looked.
         self._old_world: Optional[int] = None
         #: Set once the ranks have agreed; see :meth:`_settle_run_identity`.
@@ -965,6 +971,10 @@ class ResumeManager:
         step = state.get("step", 0)
         self.registry.restore_state(state, defer_rng=defer_rng)
         self.restored_step = self.registry.step_count
+        # Read, not applied. A reshard reaches here with a stitched state whose
+        # non-sharded halves come from one old rank's snapshot, so this arrives
+        # on that path too.
+        self.restored_extra = state.get("extra")
 
         sharded = len(state.get("sharded", {}))
         logger.info(
