@@ -87,8 +87,11 @@ def machine_of(rank: int, local_size: int) -> Optional[int]:
 
 # ─── moving a store, without moving it twice ────────────────────────
 
+import hashlib
+import hmac
 import logging
 import os
+import secrets
 import shutil
 import socket as _socket
 import threading
@@ -390,11 +393,48 @@ class RingLink:
     advertises has to be one its neighbour can reach, and on some clusters it
     is not. `connect` returns None then, and the caller falls back to the
     collective path, which needs no rank to be reachable by anyone.
+
+    **Who is on the other end (GPU-112).** A listening port is a surface the
+    process group did not have: gloo and NCCL only ever talk to a member, and
+    membership is the launcher's to decide. Here anything that can reach the
+    port can knock, and the damage from a stray knock is not hypothetical —
+    `StoreWriter` removes the completion marker before the first byte, so a
+    connection that arrives and says nothing is enough to stop a *good* replica
+    from being read as one.
+
+    So both ends prove they belong to this job, with a token rank 0 generates
+    and leaves on the rendezvous store. Not a new trust boundary: whoever can
+    read that store is already inside the job. What it buys is that a stranger
+    who merely reaches the port is refused before any writer exists, and that a
+    rank never pushes its store into a port that cannot answer for itself.
+    Rejections do not break the ring — the listener keeps waiting for the peer
+    it is expecting, which is the point of doing this at the handshake rather
+    than after.
+
+    **What it is not.** It is a shared secret in the clear on a connection
+    nobody has encrypted, so it identifies rather than protects: someone able
+    to read the traffic between two ranks, or to take over an established TCP
+    connection, is not stopped by it. On a network where that is the threat,
+    `replication_transport: collectives` is the answer, and it stays supported
+    for exactly this reason.
     """
 
     #: Where a rank advertises its listener. Stamped with the issue that put it
     #: there, so the next person reading a store dump knows what wrote it.
     ADDRESS_KEY = "ravex/gpu109/replica/addr/%d"
+
+    #: Where rank 0 leaves the token. One per job, not per generation: the
+    #: point is "is this one of us", and that answer does not change when the
+    #: membership does.
+    SECRET_KEY = "ravex/gpu112/replica/secret"
+
+    #: Hex characters of the token on the wire, so the read is exact. 32 hex is
+    #: 16 bytes of `secrets.token_hex`, which is what is guessed against.
+    TOKEN_CHARS = 32
+
+    #: Seconds to spend on one dial. Short on purpose - see the comment where
+    #: it is used.
+    CONNECT_TIMEOUT = 10.0
 
     def __init__(self, rank, send_to, receive_from, outgoing, incoming, listener):
         self.rank = rank
@@ -421,39 +461,94 @@ class RingLink:
         outgoing = None
         accepted = {}
         try:
+            deadline = time.monotonic() + timeout_seconds
+            secret = cls._shared_secret(store, rank, deadline)
+            if secret is None:
+                raise OSError(
+                    "no replication token on the rendezvous store; rank 0 "
+                    "publishes it and nobody dials before reading it"
+                )
+
             listener = _socket.socket()
+            # Every interface, because the ring exists precisely when the ranks
+            # are on different machines - a loopback bind would refuse the only
+            # case this transport is for. Which is why the token is the guard
+            # here and the bind is not.
             listener.bind(("", 0))
             listener.listen(8)
             listener.settimeout(timeout_seconds)
             port = listener.getsockname()[1]
-            store.set(
-                cls.ADDRESS_KEY % rank,
-                ("%s:%d" % (_socket.gethostname(), port)).encode("utf-8"),
-            )
+            store.set(cls.ADDRESS_KEY % rank, cls._advertise(port).encode("utf-8"))
 
             def accept():
-                try:
-                    connection, _ = listener.accept()
-                    connection.settimeout(timeout_seconds)
-                    peer = int.from_bytes(_recv_exactly(connection, 4), "big")
-                    # Blocking from here on: the descriptor goes to the core,
-                    # and a socket with a timeout is non-blocking underneath,
-                    # where every read would come back as "would block".
-                    connection.settimeout(None)
-                    accepted[peer] = connection
-                except OSError:
-                    pass
+                """Wait for the predecessor, refusing anyone who cannot say so.
+
+                A loop rather than one accept: a stray connection - a port
+                scan, a stale peer, a neighbour of a previous generation - must
+                cost that connection and nothing else. Accepting once and
+                trusting it would let anything that reaches the port first take
+                the predecessor's place, and the predecessor would then find a
+                ring that never forms.
+                """
+                while time.monotonic() < deadline and receive_from not in accepted:
+                    try:
+                        connection, peer_address = listener.accept()
+                    except OSError:
+                        return
+                    try:
+                        connection.settimeout(
+                            max(1.0, deadline - time.monotonic())
+                        )
+                        greeting = _recv_exactly(connection, 4 + cls.TOKEN_CHARS)
+                        peer = int.from_bytes(greeting[:4], "big")
+                        if not hmac.compare_digest(greeting[4:], secret):
+                            raise OSError("the token did not match")
+                        # The other half of the proof, so the peer knows it
+                        # reached a rank of this job and not whatever else was
+                        # holding that port.
+                        connection.sendall(cls._acknowledgement(secret, peer))
+                        # Blocking from here on: the descriptor goes to the
+                        # core, and a socket with a timeout is non-blocking
+                        # underneath, where every read would come back as
+                        # "would block".
+                        connection.settimeout(None)
+                        accepted[peer] = connection
+                    except OSError as exc:
+                        logger.warning(
+                            "Refused a connection from %s on the replication "
+                            "port: %s. Still waiting for rank %d",
+                            peer_address,
+                            exc,
+                            receive_from,
+                        )
+                        try:
+                            connection.close()
+                        except OSError:
+                            pass
 
             waiting = threading.Thread(target=accept, daemon=True)
             waiting.start()
 
-            deadline = time.monotonic() + timeout_seconds
             address = cls._address_of(store, send_to, deadline)
             if address is not None:
                 host, _, port_text = address.rpartition(":")
-                left = max(1.0, deadline - time.monotonic())
+                # Capped, and not at the deadline. A peer that advertised an
+                # address nothing can reach should cost one short attempt and
+                # then the collective road, not the whole budget of a link that
+                # was never going to come up.
+                left = min(
+                    cls.CONNECT_TIMEOUT, max(1.0, deadline - time.monotonic())
+                )
                 outgoing = _socket.create_connection((host, int(port_text)), timeout=left)
-                outgoing.sendall(rank.to_bytes(4, "big"))
+                outgoing.sendall(rank.to_bytes(4, "big") + secret)
+                if not hmac.compare_digest(
+                    _recv_exactly(outgoing, len(cls._acknowledgement(secret, rank))),
+                    cls._acknowledgement(secret, rank),
+                ):
+                    raise OSError(
+                        "the peer at %s did not answer with this job's token; "
+                        "not pushing a store into it" % (address,)
+                    )
                 outgoing.settimeout(None)
 
             waiting.join(timeout=max(1.0, deadline - time.monotonic()))
@@ -482,6 +577,75 @@ class RingLink:
                 except OSError:
                     pass
             return None
+
+    @staticmethod
+    def _advertise(port: int) -> str:
+        """The address to publish: an IP a peer can reach, not this host's name.
+
+        Asking the routing table which local address would be used to reach the
+        rendezvous, which is the only host in the job every rank is already
+        talking to. A UDP socket sends nothing on `connect` — it fills in the
+        local address and stops there — so this is a lookup, not a packet.
+
+        The hostname is the obvious thing to publish and is the wrong thing.
+        Measured on a Windows box with a Hyper-V interface, 2026-09-05:
+        `create_connection` to this machine's own name took **10.06 s**, because
+        the name resolves to several addresses and the first ones are on virtual
+        interfaces that swallow the attempt until it times out. The same connect
+        by address is instant. A GPU box with docker, WSL or a VPN has exactly
+        that shape, and there the cost is not a slow test — it is a peer that
+        gives up before the right address is ever tried.
+
+        Falls back to the hostname when there is no rendezvous to probe towards
+        or the probe fails, because a name a cluster's DNS can resolve is still
+        better than nothing.
+        """
+        target = os.environ.get("MASTER_ADDR")
+        if target:
+            probe = None
+            try:
+                probe = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+                probe.connect((target, 1))
+                return "%s:%d" % (probe.getsockname()[0], port)
+            except OSError:
+                pass
+            finally:
+                if probe is not None:
+                    probe.close()
+        return "%s:%d" % (_socket.gethostname(), port)
+
+    @classmethod
+    def _shared_secret(cls, store, rank, deadline):
+        """The token every rank of this job proves it knows.
+
+        Rank 0 makes it and the others read it. Not agreed by a collective for
+        the same reason none of this is: the store is reachable by a rank that
+        belongs to no group yet, which is the case a joiner is in and the case
+        this whole road is built for.
+        """
+        if rank == 0:
+            token = secrets.token_hex(cls.TOKEN_CHARS // 2).encode("ascii")
+            store.set(cls.SECRET_KEY, token)
+            return token
+
+        while time.monotonic() < deadline:
+            if store.check([cls.SECRET_KEY]):
+                return store.get(cls.SECRET_KEY)
+            time.sleep(0.05)
+        return None
+
+    @staticmethod
+    def _acknowledgement(secret: bytes, peer: int) -> bytes:
+        """What a listener answers with, to prove it holds the token too.
+
+        Derived rather than echoed, and bound to the peer that asked, so the
+        answer to one rank's greeting is not a reusable answer to another's.
+        """
+        digest = hashlib.sha256()
+        digest.update(secret)
+        digest.update(b"ravex-ring-ack")
+        digest.update(peer.to_bytes(4, "big"))
+        return digest.hexdigest().encode("ascii")
 
     @staticmethod
     def _address_of(store, peer, deadline):
