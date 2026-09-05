@@ -1,8 +1,10 @@
-"""A plain PyTorch training script. It has never heard of Ravex or DeepSpeed.
+"""A plain PyTorch training script. It has never heard of DeepSpeed.
 
-That is the whole point of it. Ravex arrives through the autoloader and a
-``ravex.yaml`` in the working directory; this file must contain nothing that
-would work differently if it did not. The architecture matches what
+Of Ravex it has heard exactly once — the decorator on
+``main`` — and nothing else here changes: no callback, no checkpoint call, no
+resume logic, and the settings still come from the ``ravex.yaml`` in the working
+directory. The point survives the change, and it is worth restating in the
+narrower form it now has: **Ravex must not alter how this script trains.** The architecture matches what
 ``make_zero.py`` trains, because the checkpoint being converted is of that.
 
 Writes its state dict out after the first iteration, which is after Ravex's
@@ -12,11 +14,13 @@ batch is drawn.
 
 import argparse
 
+import ravex
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 
+@ravex.train_loop()
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--hidden", type=int, default=97)

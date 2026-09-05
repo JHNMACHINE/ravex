@@ -29,8 +29,9 @@ COPY integration ./integration
 
 RUN pip install --no-cache-dir -e .
 
-# The autoloader, so the training script below contains no reference to Ravex —
+# Ravex attaches through the decorator on the script's main(); this only
+# checks the install is sound —
 # same discipline as the rest of `integration/`.
-RUN ravex enable && ravex status
+RUN ravex status
 
 CMD ["python3"]

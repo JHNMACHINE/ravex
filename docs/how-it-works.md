@@ -9,22 +9,33 @@ third one being much harder than it looks.
 
 ## Startup
 
-Installing the package puts one line into site-packages:
+The decorator is the whole of it:
 
+```python
+@ravex.train_loop()
+def train():
+    ...
 ```
-import ravex._bootstrap
-```
 
-Python executes `.pth` files at interpreter startup, before any user code. That
-module is deliberately tiny: it imports nothing heavy, not even torch.
-Importing torch at startup would add seconds to every `python -c` on the
-machine and pull CUDA initialisation into processes that never asked for it.
+Calling `train()` resolves the configuration (defaults, then `ravex.yaml` at or
+above the working directory, then `RAVEX_*`, then whatever was passed to the
+decorator), builds the runtime, and installs the patches. Returning from it —
+by any route, including an exception — writes the final checkpoint, flushes, and
+takes the patches back off.
 
-Instead it checks whether this process should activate at all — an explicit
-`RAVEX_ENABLED`, or a `ravex.yaml` at or above the working directory — and if
-so installs a meta-path finder that waits for `import torch`. Only when torch
-actually loads does the runtime get built and the patches installed. A process
-that never imports torch pays nothing.
+**Where the boundary matters is the exit.** The patches are removed at a moment
+Ravex knows about, so a process that has finished training is a process with an
+unmodified PyTorch in it, and a second call starts clean rather than inheriting
+the first run's registry.
+
+Through 0.0.5 startup was a `.pth` file in site-packages holding the single line
+`import ravex._bootstrap`, executed by Python in *every* interpreter before any
+user code. That module checked for `RAVEX_ENABLED` or a `ravex.yaml`, and if it
+found one, installed a meta-path finder that waited for `import torch` before
+building anything. It worked, and it is gone: the price was that Ravex had to
+infer the loop's boundaries from the patches alone, which is what made exact
+RNG replay under `Trainer` and Lightning impossible and left sharded runs with
+no defined moment to write a final checkpoint at.
 
 ## Finding models
 
@@ -443,20 +454,22 @@ written on the way out.
 The backend is not built at activation. It is built the first time something
 needs to read or write.
 
-The reason is every process that imports torch inside a project with a
-`ravex.yaml` and then never sees a single step: dataloader workers, and any
-helper script in the same directory. Building a checkpoint manager eagerly would
-mean each of those creating directories and, with S3 or R2 configured, opening
-connections on behalf of a process with nothing to save.
+The reason is the processes that reach a runtime and never see a single step —
+principally dataloader workers, which on `fork` inherit their parent's live
+runtime wholesale. Building a checkpoint manager eagerly would mean each of them
+creating directories and, with S3 or R2 configured, opening connections on
+behalf of a process with nothing to save.
 
-The `torchrun` launcher used to be the clearest example — it imports torch to
-parse its own arguments, so a run with eight ranks announced nine runtimes. That
-one is now recognised at the autoloader and never activates at all. Recognising
-it means reading `sys.orig_argv`: under `python -m torch.distributed.run`, runpy
-imports `torch.distributed` while resolving which module to run, so torch — and
-with it the autoloader — fires before `sys.argv[0]` or `__main__.__spec__` say
-anything useful. A worker is never mistaken for it: `LOCAL_RANK` is set, and that
-answer comes first.
+This used to be a longer list, and the `torchrun` launcher was the ugliest entry
+on it. The launcher imports torch to parse its own arguments, so under the
+autoloader a run with eight ranks announced *nine* runtimes — and recognising it
+meant reading `sys.orig_argv`, because under `python -m torch.distributed.run`
+runpy imports `torch.distributed` while resolving which module to run, so the
+autoloader fired before `sys.argv[0]` or `__main__.__spec__` said anything
+useful. All of that is gone with GPU-108. The launcher never calls a decorated
+function, so it never builds a runtime, and there is nothing to recognise. It is
+the clearest single example of what the explicit entry point bought: a special
+case deleted rather than fixed.
 
 ## When it breaks
 

@@ -1,8 +1,14 @@
-"""A training script with no idea Ravex exists.
+"""A training script that says where Ravex applies, and nothing else.
 
-Deliberately contains zero references to ravex: no import, no activate, no
-callback. Whatever happens to it happens because the autoloader is installed
-and a ravex.yaml sits in the working directory.
+One import and one decorator on ``main``. That is the whole of it: no callback,
+no checkpoint call, no resume logic. Everything else here is a training script
+someone might have written before Ravex existed, and the settings still come
+from the ravex.yaml in the working directory.
+
+Until GPU-108 this file contained no reference to Ravex at all — the autoloader
+attached to it from site-packages. That is gone, and this is what replaced it:
+the attachment is now a line you can read in the source of the thing being
+attached to.
 
 Every step appends one JSON line to --trace, so a test can compare the loss
 sequence of an interrupted-and-resumed run against an uninterrupted one.
@@ -16,6 +22,7 @@ import json
 import os
 import signal
 
+import ravex
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
@@ -25,6 +32,7 @@ BATCH = 8
 SEED = 0
 
 
+@ravex.train_loop()
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--trace", required=True)

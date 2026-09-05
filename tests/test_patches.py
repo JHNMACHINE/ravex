@@ -31,7 +31,7 @@ def run_steps(model, optimizer, loader, steps):
 
 
 def test_objects_are_registered_without_touching_user_code(storage):
-    ravex.activate(backend="torch_save", checkpoint_every=10_000)
+    ravex._activate(backend="torch_save", checkpoint_every=10_000)
     model, optimizer, loader = make_loop()
     model.train()
 
@@ -42,7 +42,7 @@ def test_objects_are_registered_without_touching_user_code(storage):
 
 
 def test_optimizer_steps_are_counted(storage):
-    ravex.activate(backend="torch_save", checkpoint_every=10_000)
+    ravex._activate(backend="torch_save", checkpoint_every=10_000)
     model, optimizer, loader = make_loop()
 
     run_steps(model, optimizer, loader, 5)
@@ -50,7 +50,7 @@ def test_optimizer_steps_are_counted(storage):
 
 
 def test_gradient_accumulation_counts_optimizer_steps_not_microbatches(storage):
-    ravex.activate(backend="torch_save", checkpoint_every=10_000)
+    ravex._activate(backend="torch_save", checkpoint_every=10_000)
     model, optimizer, loader = make_loop()
 
     accumulation = 4
@@ -68,7 +68,7 @@ def test_gradient_accumulation_counts_optimizer_steps_not_microbatches(storage):
 
 
 def test_a_second_optimizer_does_not_double_count(storage):
-    ravex.activate(backend="torch_save", checkpoint_every=10_000)
+    ravex._activate(backend="torch_save", checkpoint_every=10_000)
     generator = nn.Linear(4, 4)
     discriminator = nn.Linear(4, 1)
     optimizer_g = torch.optim.SGD(generator.parameters(), lr=0.1)
@@ -84,7 +84,7 @@ def test_a_second_optimizer_does_not_double_count(storage):
 
 
 def test_a_checkpoint_lands_on_the_configured_cadence(storage):
-    ravex.activate(backend="torch_save", checkpoint_every=3)
+    ravex._activate(backend="torch_save", checkpoint_every=3)
     model, optimizer, loader = make_loop()
 
     # Seven steps, not six: a checkpoint due at step N is collected at the top
@@ -97,7 +97,7 @@ def test_a_checkpoint_lands_on_the_configured_cadence(storage):
 
 
 def test_a_checkpoint_pending_at_exit_still_gets_written(storage):
-    ravex.activate(backend="torch_save", checkpoint_every=3)
+    ravex._activate(backend="torch_save", checkpoint_every=3)
     model, optimizer, loader = make_loop()
 
     run_steps(model, optimizer, loader, 6)  # step 6 is due but not yet collected
@@ -108,7 +108,7 @@ def test_a_checkpoint_pending_at_exit_still_gets_written(storage):
 
 
 def test_old_checkpoints_are_pruned(storage):
-    ravex.activate(backend="torch_save", checkpoint_every=1, keep_last=2)
+    ravex._activate(backend="torch_save", checkpoint_every=1, keep_last=2)
     model, optimizer, loader = make_loop()
 
     run_steps(model, optimizer, loader, 5)
@@ -139,7 +139,7 @@ def test_the_amp_scaler_is_tracked_and_its_scale_survives_a_resume(storage):
     CPU here; the mechanism is device-independent since the hook is on
     GradScaler.__init__.
     """
-    ravex.activate(backend="torch_save", checkpoint_every=2)
+    ravex._activate(backend="torch_save", checkpoint_every=2)
     model, optimizer, loader = make_loop()
     scaler = torch.amp.GradScaler("cpu", enabled=True, init_scale=1024.0)
 
@@ -151,7 +151,7 @@ def test_the_amp_scaler_is_tracked_and_its_scale_survives_a_resume(storage):
     ravex.deactivate()
 
     # Fresh process: a new scaler back at its initial scale.
-    ravex.activate(backend="torch_save", checkpoint_every=2)
+    ravex._activate(backend="torch_save", checkpoint_every=2)
     model, optimizer, loader = make_loop()
     scaler = torch.amp.GradScaler("cpu", enabled=True, init_scale=1024.0)
     run_amp_steps(model, optimizer, loader, scaler, 1)
@@ -164,7 +164,7 @@ def test_deactivate_restores_pytorch(storage):
     original_init = torch.nn.Module.__init__
     original_step_owner = torch.optim.Optimizer.__init__
 
-    ravex.activate(backend="torch_save", checkpoint_every=10_000)
+    ravex._activate(backend="torch_save", checkpoint_every=10_000)
     assert torch.nn.Module.__init__ is not original_init
 
     ravex.deactivate()
@@ -183,7 +183,7 @@ def test_a_broken_backend_costs_the_checkpoint_not_the_run(storage, monkeypatch)
     enters. So the failure now costs one checkpoint, and the next one is tried
     on its own merits — a full disk is often not full a minute later.
     """
-    ravex.activate(backend="torch_save", checkpoint_every=1)
+    ravex._activate(backend="torch_save", checkpoint_every=1)
 
     attempts = []
 
@@ -222,7 +222,7 @@ def test_a_rank_with_nothing_to_write_still_answers_the_verdict(storage, monkeyp
     nothing collective came after. Now the verdict does, and a collective that
     seven ranks enter and one skips is exactly the hang this is all about.
     """
-    ravex.activate(backend="torch_save", checkpoint_every=10_000)
+    ravex._activate(backend="torch_save", checkpoint_every=10_000)
     model, optimizer, loader = make_loop()
     run_steps(model, optimizer, loader, 1)
 
@@ -252,7 +252,7 @@ def test_a_sharded_multirank_checkpoint_splits_skew_from_drain_by_default(
     hiding was mostly a rank waiting on a checkpointing peer, not queued
     device work, so the split no longer needs a flag to opt into.
     """
-    ravex.activate(backend="torch_save", checkpoint_every=10_000)
+    ravex._activate(backend="torch_save", checkpoint_every=10_000)
     model, optimizer, loader = make_loop()
     run_steps(model, optimizer, loader, 1)
 
@@ -301,7 +301,7 @@ def test_a_replicated_job_posts_no_collective_from_rank_zero_alone(
     reason. This pins both: a replicated job must enter neither the barrier
     nor the verdict collective from rank 0 alone.
     """
-    ravex.activate(backend="torch_save", checkpoint_every=10_000)
+    ravex._activate(backend="torch_save", checkpoint_every=10_000)
     model, optimizer, loader = make_loop()
     run_steps(model, optimizer, loader, 1)
 
@@ -338,7 +338,7 @@ def test_a_failure_on_another_rank_stops_this_one_too(storage, monkeypatch):
     rank — come back to it at the next checkpoint rather than treating it as
     done.
     """
-    ravex.activate(backend="torch_save", checkpoint_every=10_000)
+    ravex._activate(backend="torch_save", checkpoint_every=10_000)
     model, optimizer, loader = make_loop()
     run_steps(model, optimizer, loader, 1)
 

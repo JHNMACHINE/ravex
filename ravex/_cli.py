@@ -1,21 +1,22 @@
 """``ravex`` command line.
 
-Its subject is the autoloader: a one-line ``.pth`` file in site-packages that
-Python executes at interpreter startup. That file is what makes checkpointing
-work without touching the training script, and since 0.0.4 **the wheel ships
-it** — ``pip install ravex`` puts it there.
+One subcommand, and it answers one question: *what would Ravex do if I ran my
+training script from here?* Which config file it would find, what the resolved
+settings are, and whether the pieces it depends on are installed.
 
-So ``enable`` is no longer how the autoloader arrives. What it is for is
-putting it back after ``disable``, which is the command that still earns its
-keep: somebody who does not want a line of ours running in every interpreter
-of their environment should be able to say so, and to change their mind.
+Until 0.0.5 this had two more — ``enable`` and ``disable`` — whose subject was a
+``.pth`` file in site-packages that ran in every interpreter on the machine.
+That file is gone (see the changelog), and with it the whole category of
+question the CLI used to exist for: whether Ravex was armed, where, and how to
+disarm it. There is nothing to disarm now. A training run is checkpointed if its
+entry point is decorated with ``@ravex.train_loop`` and not otherwise, which is
+a fact you can read in the source rather than one you have to interrogate the
+environment about.
 
-The property this used to protect — that installing the package changes
-nothing for unrelated processes — is now defended in the file itself rather
-than by withholding it. ``ravex._bootstrap`` imports only ``os`` and ``sys``,
-looks for a ``ravex.yaml`` above the working directory, and installs nothing
-at all when there is not one. Measured at about a millisecond, against roughly
-twelve when it still pulled in ``typing``.
+``status`` survives because config resolution is still worth being able to ask
+about: ``ravex.yaml`` is searched for *above the working directory*, and
+``RAVEX_*`` variables win over it, so "which settings am I actually going to
+get" is not always obvious from where you are standing.
 """
 
 from __future__ import annotations
@@ -23,76 +24,33 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-import sysconfig
-from pathlib import Path
-
-PTH_NAME = "ravex_autoload.pth"
-PTH_CONTENT = "import ravex._bootstrap\n"
-
-
-def pth_path() -> Path:
-    """Where the autoloader lives for the *current* interpreter."""
-    return Path(sysconfig.get_paths()["purelib"]) / PTH_NAME
-
-
-def _enable(_args) -> int:
-    path = pth_path()
-    try:
-        path.write_text(PTH_CONTENT, encoding="utf-8")
-    except OSError as exc:
-        print(f"Could not write {path}: {exc}", file=sys.stderr)
-        print("Try again inside a virtualenv, or with elevated permissions.", file=sys.stderr)
-        return 1
-
-    print(f"Autoloader installed: {path}")
-    print()
-    print("Ravex now starts with every Python process in this environment,")
-    print("but only activates for projects that have a ravex.yaml (or when")
-    print("RAVEX_ENABLED=1 is set). Nothing else changes.")
-    print()
-    print("Since 0.0.4 the wheel ships this file, so a normal install already")
-    print("has it. This command is here to put it back after `ravex disable`.")
-    return 0
-
-
-def _disable(_args) -> int:
-    path = pth_path()
-    if not path.exists():
-        print(f"Autoloader is not installed ({path})")
-        return 0
-    try:
-        path.unlink()
-    except OSError as exc:
-        print(f"Could not remove {path}: {exc}", file=sys.stderr)
-        return 1
-    print(f"Autoloader removed: {path}")
-    print()
-    print("Note that `pip install --upgrade ravex` will put it back: the file")
-    print("ships in the wheel. Run `ravex disable` again after an upgrade, or")
-    print("set RAVEX_ENABLED=0 to turn Ravex off without removing anything.")
-    return 0
 
 
 def _status(_args) -> int:
     from ravex import __version__
-    from ravex._bootstrap import should_activate
     from ravex._config import RavexConfig, find_config_file
 
     print(f"ravex {__version__}")
     print(f"  python       {sys.version.split()[0]} ({sys.executable})")
-
-    path = pth_path()
-    print(f"  autoloader   {'installed' if path.exists() else 'not installed'} ({path})")
 
     config_file = find_config_file()
     print(f"  config file  {config_file or 'none found'}")
 
     flag = os.environ.get("RAVEX_ENABLED")
     print(f"  RAVEX_ENABLED  {flag if flag is not None else '<unset>'}")
-    print(f"  would activate here: {'yes' if should_activate() else 'no'}")
 
     config = RavexConfig.load()
     print(f"  resolved     {config.describe()}")
+
+    # The compiled core is not optional since GPU-105, so its absence is a
+    # broken install rather than a missing extra — worth saying plainly here,
+    # because the alternative is an ImportError deep inside a resume.
+    try:
+        from ravex import _core
+
+        print(f"  core         {_core.__version__} (compiled)")
+    except ImportError as exc:
+        print(f"  core         MISSING - {exc}")
 
     for name in ("torch", "moonclip", "yaml"):
         try:
@@ -108,21 +66,18 @@ def _status(_args) -> int:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="ravex",
-        description="Transparent checkpointing for PyTorch training.",
+        description="Checkpoint and resume for PyTorch training.",
+        epilog=(
+            "Ravex attaches to a training run through the @ravex.train_loop "
+            "decorator on its entry point. Nothing on this command line turns "
+            "it on or off."
+        ),
     )
     subparsers = parser.add_subparsers(dest="command")
 
     subparsers.add_parser(
-        "enable", help="reinstall the startup autoloader (the wheel ships it)"
-    ).set_defaults(
-        handler=_enable
-    )
-    subparsers.add_parser("disable", help="remove the startup autoloader").set_defaults(
-        handler=_disable
-    )
-    subparsers.add_parser("status", help="show what is installed and configured").set_defaults(
-        handler=_status
-    )
+        "status", help="show what is configured and what is installed"
+    ).set_defaults(handler=_status)
 
     args = parser.parse_args(argv)
     if not hasattr(args, "handler"):

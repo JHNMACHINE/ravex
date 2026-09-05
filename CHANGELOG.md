@@ -49,7 +49,124 @@
   `emergency_timeout`. See
   [Emergency checkpoint on preemption](docs/configuration.md#emergency-checkpoint-on-preemption-sharded-models).
 
+- **The framework adapter seam is connected to the runtime (GPU-69).**
+
+  `FrameworkAdapter` has declared three methods since the adapters were written
+  — `should_intercept_step`, `collect_extra_state`, `restore_extra_state` — and
+  nothing called any of them. `get_adapter()` had no caller anywhere in the
+  package; the only thing the runtime ever did with a detected framework was
+  write its name into the checkpoint's metadata. Three signatures and an
+  intention.
+
+  They have call points now. `should_intercept_step` is asked once, at
+  activation, and its answer is a bool the step hook reads — `on_step` is the
+  hottest path Ravex has and a dispatch through an adapter does not belong in
+  it. `collect_extra_state` runs inside `checkpoint()`, right after the state
+  is collected, and what it returns is written under `extra` — its own key,
+  because `models`, `sharded` and `rng` have formats this project's readers
+  understand and a framework's own bookkeeping is opaque to everything except
+  the adapter that produced it. `restore_extra_state` runs on the way out of a
+  resume, once the model, the optimizer, the schedulers and the dataset
+  position are back.
+
+  Asking at activation is worth something the autoloader could not have given.
+  Detection reads `sys.modules`, and the decorator (GPU-108, above) runs when
+  the training function is called — with transformers, or Lightning, or
+  DeepSpeed already imported by the script above it. The `.pth` asked the same
+  question at interpreter startup, before the script had imported anything, and
+  the honest answer then was always "vanilla".
+
+  **The failure modes are the design.** Collection runs on the training thread
+  inside the same window as the sharded collective, so an adapter that raises
+  there would have taken the weights with it — and on a sharded run it would
+  have taken them on one rank while the other seven wrote theirs, which is
+  worse than losing the checkpoint. Every one of the three is wrapped: the
+  exception is logged, the framework's contribution is treated as absent, and
+  the checkpoint, the resume or the run carries on. A `should_intercept_step`
+  that cannot answer counts steps, because the alternative is a run that trains
+  for hours, writes nothing, and looks fine until it is preempted.
+
+  Reading back: a checkpoint with no `extra` resumes exactly as it always did,
+  and one carrying state written under a different framework is skipped with a
+  warning that names both — handing Lightning's loop counters to a HuggingFace
+  adapter is a crash at best, and ignoring them silently is a resume that lost
+  half its state without saying so.
+
+  **No adapter overrides any of the three yet**, and that is what this entry
+  is: wiring, with `tests/test_adapter_seam.py` holding it to the contract
+  above. `Trainer.state` and Lightning's loop counters are the behaviour it was
+  built for and they come next. What has *not* been decided is DeepSpeed:
+  `detect_framework()` recognizes it, `_ADAPTERS` has no entry for it, and ZeRO
+  state does not pass through the optimizer hooks Ravex installs at all — a
+  gap to close or a limit to declare, but not one this seam settles.
+
 ### Changed
+
+- **Ravex has one way in, and it is `@ravex.train_loop` (GPU-108). This breaks
+  the public API.**
+
+  ```python
+  import ravex
+
+  @ravex.train_loop(preemption_handler=True)
+  def train():
+      model = build_model()
+      optimizer = torch.optim.Adam(model.parameters())
+      for batch in loader:
+          ...
+
+  train()
+  ```
+
+  Through 0.0.5 there was a second way in, and it was the one the README led
+  with: installing the package put `ravex_autoload.pth` in site-packages,
+  Python executed it in **every** interpreter on the machine, and any process
+  that had a `ravex.yaml` above its working directory got checkpointing
+  attached without a line of its own saying so. The argument for it was a real
+  one — a platform could enable checkpointing for code it does not own — and it
+  is what has been removed.
+
+  The decorator is not that same idea written out longhand. It buys something
+  import-time activation could not: Ravex knows where the loop begins and where
+  it ends, and it holds the function **before the model exists**. The
+  autoloader attached to an interpreter, not to a loop, and by the time it saw
+  anything the model was already built. Rebuilding a model under a new device
+  mesh is what an elastic regroup is, and that needs a callable which predates
+  the model — `ravex/_dist/elastic.py` stops at the rendezvous layer for
+  exactly this reason. The decorator is the prerequisite it was missing
+  (GPU-110). `elastic=True` is accepted as a keyword today and raises with that
+  explanation rather than being quietly ignored.
+
+  **Inside the wrapped function nothing changes.** The patches on module
+  construction, `Optimizer.step` and dataloader iteration are still what find
+  the model, the optimizer, the scheduler, the AMP scaler and the dataset
+  position; the zero-boilerplate half of Ravex is the half worth keeping. What
+  changed is when they go in — on entry to the decorated call rather than at
+  import — and that they come out again on exit, in a `finally`, so the loop is
+  unpatched whether it returns or raises and a second call starts clean instead
+  of finding the previous run's runtime. Step counting still advances on
+  `optimizer.step()`, which is why gradient accumulation still needs no special
+  case. Nesting two decorated functions raises rather than letting two runtimes
+  count the same steps.
+
+  **Porting existing code.** A `ravex.activate()` call becomes the decorator
+  around the training function. Code that relied on the autoloader has to name
+  Ravex now: import it, and decorate the entry point. `ravex enable` and
+  `ravex disable` are gone with the file they wrote, and `ravex status` no
+  longer reports whether the autoloader is armed, because nothing is armed —
+  a run is checkpointed if its entry point is decorated and not otherwise,
+  which is a fact you read in the source instead of interrogating the
+  environment for. `ravex.deactivate()` survives for the two callers that
+  still want the exit half by hand: the test suite, and a notebook stopping
+  early on a live interpreter.
+
+  One constraint disappeared with the `.pth`, and it had shaped the code:
+  `ravex/__init__.py` did not import `typing`, because the autoloader paid that
+  import in every interpreter on the machine — measured at 9.8 ms against the
+  module's own 0.4 ms, on `python -c` as much as on a training run. Nothing of
+  Ravex runs at import time any more, so the import is back and the comment
+  that forbade it is gone rather than left standing as an orphaned optimization
+  the next reader would take for a rule.
 
 - **A reshard no longer reads every old checkpoint twice (GPU-101).**
 
@@ -117,29 +234,49 @@
   Not ported, and not for want of trying: `_patches.py`, `_registry.py` and
   `_runtime.py` live on introspecting live Python objects, and moving them would
   mean crossing the PyO3 boundary on every `optimizer.step()`. `_bootstrap.py`
-  stays pure Python and nearly free because it runs in **every** interpreter on
-  the machine once the `.pth` is installed — a compiled extension loaded there
-  is the opposite of what that file is for. `ravex/__init__.py` imports nothing
-  from the core for the same reason, so the startup cost the package is careful
-  about is unchanged.
+  stayed pure Python for a different reason — it ran in **every** interpreter on
+  the machine once the `.pth` was installed, and a compiled extension loaded
+  there is the opposite of what that file was for — and GPU-108 has since
+  deleted it, later in this same unreleased cycle. `ravex/__init__.py` still
+  imports nothing from the core: it reaches for `ravex._core` inside the
+  functions that need it, so importing Ravex costs what it did.
 
 - **The build backend is maturin, and `setup.py` is gone.**
 
-  `ravex_autoload.pth` still lands in `site-packages`, which is the only place
-  Python will execute it from; it is now placed by `[tool.maturin] include`
-  rather than by a custom `build_py` command. The trap that made a custom
-  command necessary is unchanged and worth keeping written down: `data_files`
-  looks like the answer and installs the file one directory *above*
-  site-packages, where it arrives, looks installed, and is never run. The
-  release workflow now asserts the file is at the root of every wheel it
-  publishes, rather than leaving that to be discovered by someone whose Ravex
-  silently never activates.
+  `ravex_autoload.pth` moved from a custom `build_py` command to a
+  `[tool.maturin] include` entry, and then out of the package altogether:
+  GPU-108 removed the autoloader later in this same unreleased cycle, so no
+  wheel this release publishes contains it, and the release workflow no longer
+  asserts anything at the root of the archive.
+
+  The trap that made the custom command necessary is worth keeping written
+  down anyway, because it is what will catch whoever puts a `.pth` back:
+  `data_files` looks like the answer and installs the file one directory
+  *above* site-packages, where it arrives, looks installed, and is never run. A
+  wheel built that way is not obviously broken — Ravex simply never activates,
+  and there is nothing to see. This paragraph is where `pyproject.toml` sends
+  the reader who wonders what used to be in that `include` list.
 
   The version number is now written twice — `Cargo.toml`, which is what maturin
   builds the wheel from, and `ravex/__init__.py`, which is what `ravex status`
   prints — because maturin has no equivalent of setuptools' `dynamic = {attr}`.
   `tests/test_version_is_single.py` fails if the two ever disagree, and the
   release workflow checks both against the tag.
+
+### Removed
+
+- **The autoloader, and everything that existed to manage it (GPU-108).** Gone:
+  `ravex_autoload.pth`, `ravex/_bootstrap.py`, `tests/test_bootstrap.py`, the
+  `ravex enable` and `ravex disable` subcommands, the autoloader line in
+  `ravex status`, the `[tool.maturin] include` entry that shipped the file, and
+  the wheel-layout check in `release.yml` that asserted it at the root of the
+  archive. See the entry above for what replaces it and why.
+
+- **`ravex.activate()` (GPU-108).** It was the second of the two ways in, and
+  with the decorator it would have become a third form of the same thing. The
+  point of this release is that there is one. What it did is now the entry half
+  of `train_loop`, as `ravex._activate` — underscored, because the way in is
+  the decorator and only the decorator also guarantees the exit.
 
 ## 0.0.5 — 2026-08-30
 

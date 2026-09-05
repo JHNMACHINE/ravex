@@ -1,6 +1,6 @@
 """A DeepSpeed training script. It has never heard of Ravex.
 
-The same contract as every other script here: no reference to Ravex, a
+The same contract as every other script here: one decorator on ``main``, a
 ``ravex.yaml`` in the working directory does the rest. DeepSpeed is the case
 that tests ``ravex/_frameworks.py``'s claim rather than illustrating it,
 because its engine wraps the user's module in an ``nn.Module`` of its own and
@@ -15,11 +15,13 @@ the launcher's environment variables, and mpi4py is not installed.
 import argparse
 import json
 
+import ravex
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 
+@ravex.train_loop()
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", type=int, default=1, choices=[1, 2, 3])

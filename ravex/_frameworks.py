@@ -23,8 +23,18 @@ framework that replaces the optimizer's parameters is outside what hooking
 ``Optimizer.step`` can see*, and the argument from where the hooks are is an
 argument. ``integration/test_deepspeed.py`` is the evidence.
 
-Framework-specific state (``Trainer.state``, Lightning's loop counters) is a
-Sprint 2 concern; the adapters below are the seam it will plug into.
+Framework-specific state — ``Trainer.state``, Lightning's loop counters — is
+what the adapters below are for, and since GPU-69 the runtime calls them:
+:meth:`FrameworkAdapter.should_intercept_step` once at activation,
+:meth:`~FrameworkAdapter.collect_extra_state` inside
+``RavexRuntime.checkpoint``, :meth:`~FrameworkAdapter.restore_extra_state` on
+the way out of a resume.
+
+No adapter overrides any of the three yet, and connecting them first is
+deliberate: the wiring is testable on its own — a checkpoint that carries extra
+state, one that does not, one written under another framework — while
+behaviour bolted onto absent wiring is a rewrite of both at once. Read the
+contract on each method before writing the first override.
 """
 
 from __future__ import annotations
@@ -56,7 +66,39 @@ def detect_framework() -> str:
 
 
 class FrameworkAdapter:
-    """Default adapter: intercept everything, add nothing."""
+    """Default adapter: intercept everything, add nothing.
+
+    Three methods, and the runtime holds each to a contract:
+
+    ``should_intercept_step``
+        Asked **once**, at activation, before any step has run. ``False`` says
+        this framework's ``optimizer.step()`` is not the training loop's step
+        and Ravex must not count it — at which point advancing
+        ``registry.step_count`` becomes the adapter's job, and until something
+        does it nothing is ever checkpointed. Say ``False`` only with the rest
+        of that sentence in hand.
+
+    ``collect_extra_state``
+        Called on the training thread with the loop stopped, inside the same
+        window as the sharded collective, with every rank at the same point.
+        So: no I/O, nothing slow, and **no collective of its own** unless every
+        rank makes the same call — a rank that enters a collective its peers do
+        not is a hang, not an error. Return something the backend can write, or
+        an empty mapping for nothing.
+
+    ``restore_extra_state``
+        Called after the model, the optimizer, the schedulers and the dataset
+        position are back, so an adapter restoring loop counters may assume the
+        run around them exists. It gets what a *previous* run of this same
+        framework collected: state written under a different framework is
+        skipped with a warning, and a checkpoint from before any of this
+        existed carries nothing and the method is not called at all.
+
+    Raising from any of them costs the adapter's contribution and nothing else.
+    The exception is logged, the extra state is treated as absent, and the
+    checkpoint — or the resume, or the run — carries on. Framework state is a
+    bonus on top of weights and moments, never a reason to lose them.
+    """
 
     name = "vanilla"
 

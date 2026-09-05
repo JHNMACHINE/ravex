@@ -72,10 +72,11 @@ fi
 pip install --quiet PyYAML "$MOONCLIP_SPEC"
 pip install --quiet --no-deps -e $KIT_ROOT/ravex
 
-# The autoloader, so the training script contains no reference to Ravex — the
+# Checks the install rather than arming anything: the training script attaches
+# through its own decorator. The
 # same discipline the rest of integration/ runs under, and the thing a user
 # actually installs.
-ravex enable
+ravex status
 ravex status
 
 python - <<'PY'
