@@ -148,6 +148,35 @@
   could have done — but they are what the rewrite was for, and the number is the
   number.
 
+  **`exchange_stores` has both roads now, and the runtime picks one.** A
+  `RingLink` holds one connection to the ring successor and one from the
+  predecessor, opened once and reused for every round after — the shape the
+  protocol already had, since `prestage_send` leaves the connection open
+  precisely so a coarse first pass can be followed by smaller deltas.
+  Addressing is the rendezvous store rather than a new mechanism: a rank
+  advertises its listener under a key and reads its successor's, exactly as
+  `elastic.announce_join` / `pending_join` already do for a joiner that belongs
+  to no group yet. A store is not a collective — no group, no device, no
+  agreement about who is present.
+
+  `replication_transport` is the knob: `auto` (the default), `sockets`, or
+  `collectives`. The collective road is not deprecated and should not be. It
+  needs no rank to have an address another rank can reach, so on a cluster
+  where they cannot open connections to each other it is the one that works,
+  and `auto` falls back to it on its own — once, with the reason, rather than
+  retrying a hostname that will not resolve on the next round either.
+
+  `tests/test_dist_replication_sockets.py` is what makes the second road a road
+  and not a fork: two ranks, both roads, the same store in the same run, and
+  the assertion is that the receiving directory is identical down to the file
+  list and the completion marker — because everything downstream reads a
+  replica without knowing which way it arrived. It also covers the reverse
+  direction, which only the socket road has to think about. The recovery round
+  pushes a copy *back* against the ring, and on two ranks the successor and the
+  predecessor are the same peer, so the direction is passed in rather than
+  inferred from rank numbers. Getting it backwards is both ends pushing into
+  each other and neither reading, which is a hang rather than an error.
+
   **What this does not say.** One box, one platform, page cache warm, loopback.
   Between two rented machines the link was measured at 12 MB/s (GPU-96), which
   is two orders of magnitude below any of these numbers: on a real network none

@@ -87,10 +87,16 @@ def machine_of(rank: int, local_size: int) -> Optional[int]:
 
 # ─── moving a store, without moving it twice ────────────────────────
 
+import logging
 import os
 import shutil
+import socket as _socket
+import threading
+import time
 
 from ravex import _core
+
+logger = logging.getLogger("ravex")
 
 #: Bytes per chunk on the wire. Bounded on purpose: a real shard is over a
 #: gigabyte, and a whole-store buffer would be that allocation on the training
@@ -355,7 +361,229 @@ def _wire_tensor(block: bytes):
         return torch.frombuffer(block, dtype=torch.uint8)
 
 
+class RingLink:
+    """This rank's two connections around the replication ring, kept open.
+
+    Since GPU-109 the bytes of a replication round can travel on Ravex's own
+    sockets instead of ``dist.isend``/``dist.recv``, and this is what holds
+    them. One connection out to the ring successor, one in from the
+    predecessor, both established once and reused for every round that follows
+    — which is not an optimisation but the shape the protocol already had:
+    ``prestage_send`` deliberately leaves the connection open so a coarse first
+    pass can be followed by smaller deltas without a new handshake.
+
+    **Why sockets rather than the collectives.** Three reasons, and only the
+    third is speed. A collective wants a registered process group, which is the
+    wall ``elastic.py`` already hit for the pre-staging path. It is synchronous
+    with training, so a transfer competes with the step instead of running
+    behind it. And its device is not the data's: GPU-82 was CPU tensors handed
+    to the default NCCL group, "which cannot work, and the bench cannot see it".
+    A socket carrying bytes between files has none of those three.
+
+    **Addressing is the store, not a new mechanism.** Every rank publishes its
+    listener under a key and reads its successor's, exactly as
+    ``elastic.announce_join``/``pending_join`` already do for a joiner that is
+    not a member of any group yet. The rendezvous store is not a collective: it
+    needs no group, no device and no agreement about who is present.
+
+    **A link that cannot be built is not an error.** The hostname a rank
+    advertises has to be one its neighbour can reach, and on some clusters it
+    is not. `connect` returns None then, and the caller falls back to the
+    collective path, which needs no rank to be reachable by anyone.
+    """
+
+    #: Where a rank advertises its listener. Stamped with the issue that put it
+    #: there, so the next person reading a store dump knows what wrote it.
+    ADDRESS_KEY = "ravex/gpu109/replica/addr/%d"
+
+    def __init__(self, rank, send_to, receive_from, outgoing, incoming, listener):
+        self.rank = rank
+        self.send_to = send_to
+        self.receive_from = receive_from
+        #: The connection this rank *made*, to its successor. It carries the
+        #: ring's forward direction.
+        self.outgoing = outgoing
+        #: The connection this rank *accepted*, from its predecessor. It
+        #: carries the reverse direction, which is what the recovery round
+        #: uses — see `exchange_stores(forward=False)`.
+        self.incoming = incoming
+        self.listener = listener
+
+    @classmethod
+    def connect(cls, rank, send_to, receive_from, store, timeout_seconds=60):
+        """Bind, advertise, connect and accept. None if any of it fails.
+
+        The accept runs on a thread because every rank is doing both halves at
+        once: waiting for the predecessor before dialling the successor would
+        deadlock the ring on the first pair.
+        """
+        listener = None
+        outgoing = None
+        accepted = {}
+        try:
+            listener = _socket.socket()
+            listener.bind(("", 0))
+            listener.listen(8)
+            listener.settimeout(timeout_seconds)
+            port = listener.getsockname()[1]
+            store.set(
+                cls.ADDRESS_KEY % rank,
+                ("%s:%d" % (_socket.gethostname(), port)).encode("utf-8"),
+            )
+
+            def accept():
+                try:
+                    connection, _ = listener.accept()
+                    connection.settimeout(timeout_seconds)
+                    peer = int.from_bytes(_recv_exactly(connection, 4), "big")
+                    # Blocking from here on: the descriptor goes to the core,
+                    # and a socket with a timeout is non-blocking underneath,
+                    # where every read would come back as "would block".
+                    connection.settimeout(None)
+                    accepted[peer] = connection
+                except OSError:
+                    pass
+
+            waiting = threading.Thread(target=accept, daemon=True)
+            waiting.start()
+
+            deadline = time.monotonic() + timeout_seconds
+            address = cls._address_of(store, send_to, deadline)
+            if address is not None:
+                host, _, port_text = address.rpartition(":")
+                left = max(1.0, deadline - time.monotonic())
+                outgoing = _socket.create_connection((host, int(port_text)), timeout=left)
+                outgoing.sendall(rank.to_bytes(4, "big"))
+                outgoing.settimeout(None)
+
+            waiting.join(timeout=max(1.0, deadline - time.monotonic()))
+            incoming = accepted.get(receive_from)
+            if outgoing is None or incoming is None:
+                raise OSError(
+                    "ring link incomplete: %s to %d, %s from %d"
+                    % (
+                        "no connection" if outgoing is None else "connected",
+                        send_to,
+                        "nothing arrived" if incoming is None else "accepted",
+                        receive_from,
+                    )
+                )
+            return cls(rank, send_to, receive_from, outgoing, incoming, listener)
+        except Exception as exc:
+            logger.info(
+                "Replication over sockets is unavailable (%s) - using the "
+                "collectives, which need no rank to be reachable from another",
+                exc,
+            )
+            for closing in (outgoing, listener) + tuple(accepted.values()):
+                try:
+                    if closing is not None:
+                        closing.close()
+                except OSError:
+                    pass
+            return None
+
+    @staticmethod
+    def _address_of(store, peer, deadline):
+        """Poll for a peer's advertisement. Deliberately not `store.get`.
+
+        ``get`` blocks until the key exists and answers to the store's own
+        timeout, not this one; ``check`` is the non-blocking question, which is
+        the same reason ``elastic.pending_join`` is written the way it is.
+        """
+        key = RingLink.ADDRESS_KEY % peer
+        while time.monotonic() < deadline:
+            if store.check([key]):
+                return store.get(key).decode("utf-8")
+            time.sleep(0.05)
+        return None
+
+    def round(self, source, destination, forward=True, chunk=CHUNK):
+        """One exchange, both directions at once.
+
+        The two halves run together because the ring is a cycle: every rank is
+        somebody's sender and somebody else's receiver in the same round, and
+        doing them in sequence would serialise the whole ring behind one pair.
+        """
+        push_on = self.outgoing if forward else self.incoming
+        pull_on = self.incoming if forward else self.outgoing
+
+        outcome = {}
+
+        def pull():
+            try:
+                outcome["ok"] = _core.prestage_receive(pull_on.fileno(), destination)
+            except BaseException as exc:  # re-raised on the caller's thread
+                outcome["error"] = exc
+
+        thread = None
+        if destination is not None:
+            thread = threading.Thread(target=pull, daemon=True)
+            thread.start()
+
+        try:
+            if source is not None:
+                _core.prestage_send(push_on.fileno(), source, chunk)
+        finally:
+            if thread is not None:
+                thread.join()
+
+        if "error" in outcome:
+            raise outcome["error"]
+        return bool(outcome.get("ok", True))
+
+    def close(self):
+        for closing in (self.outgoing, self.incoming, self.listener):
+            try:
+                if closing is not None:
+                    closing.close()
+            except OSError:
+                pass
+
+
+def _recv_exactly(connection, count: int) -> bytes:
+    buffer = bytearray()
+    while len(buffer) < count:
+        block = connection.recv(count - len(buffer))
+        if not block:
+            raise OSError("peer closed during the ring handshake")
+        buffer += block
+    return bytes(buffer)
+
+
 def exchange_stores(
+    source: "str | None",
+    destination: "str | None",
+    send_to: int,
+    receive_from: int,
+    chunk: int = CHUNK,
+    group=None,
+    link: "RingLink | None" = None,
+    forward: bool = True,
+) -> bool:
+    """Trade one store for another around the ring.
+
+    Two roads under one name since GPU-109. With a :class:`RingLink` the bytes
+    go over Ravex's own sockets, framed by the Rust core; without one they go
+    over torch collectives exactly as they always have. The result is the same
+    either way — the same framing, the same skip list, the same replica on the
+    receiving disk — and the runtime decides which road on `link` alone.
+
+    ``forward`` says which direction this round runs relative to the ring, and
+    only the socket road can tell: the recovery pass sends a copy *back* to the
+    rank it belongs to, and on a two-rank job the successor and the predecessor
+    are the same peer, so the direction cannot be recovered from the rank
+    numbers. The collective road ignores it — there the rank numbers are the
+    addressing.
+    """
+    if link is not None:
+        return link.round(source, destination, forward=forward, chunk=chunk)
+    return _exchange_over_collectives(
+        source, destination, send_to, receive_from, chunk, group
+    )
+
+
+def _exchange_over_collectives(
     source: "str | None",
     destination: "str | None",
     send_to: int,
