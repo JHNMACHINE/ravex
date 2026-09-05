@@ -7,7 +7,8 @@ does not change — not one line, not one import.
 pip install ravex
 ```
 
-Ravex has a small Rust core — the reshard planner — so wheels are built per
+Ravex has a small Rust core — the reshard planner and the replica
+transport — so wheels are built per
 interpreter for Linux x86_64. On any other platform pip falls back to the source
 distribution, which builds if you have a Rust toolchain. Through 0.0.5 Ravex was
 pure Python and installed anywhere; what that bought and what it cost is in the
@@ -288,7 +289,7 @@ ravex/
 │   ├── collectives.py    gather vs per_rank; the SIGTERM channel
 │   ├── reshard.py        8 shards onto 4 ranks — re-exports the Rust core
 │   ├── identity.py       Who wrote this store, as part of which run
-│   ├── replication.py    Each rank copies its store to a peer
+│   ├── replication.py    Each rank copies its store to a peer — framing from the Rust core
 │   └── elastic.py        Membership changes without a restart
 └── _interop/         Checkpoints somebody else wrote
     ├── foreign.py        What is this directory? Layout first, fields second
@@ -319,7 +320,7 @@ and nothing in `_interop` is imported by anything outside it except `_runtime`.
 | `integration/multinode/` | One container per rank, for questions `--nproc_per_node` cannot ask ([README](integration/multinode/README.md)) |
 | `integration/two-machines/` | The rented-box harness: two real hosts, real network |
 | `docs/` | [configuration.md](docs/configuration.md), [how-it-works.md](docs/how-it-works.md) |
-| `src/` | The Rust core: `reshard.rs` is the planner, `python.rs` is the only file that knows an interpreter exists |
+| `src/` | The Rust core: `reshard.rs` is the planner, `transport.rs` frames and moves a store, `python.rs` is the only file that knows an interpreter exists |
 | `.forgejo/workflows/` | `checks.yml` on branches; `ci.yml` on main adds the moonclip backend and both integration jobs |
 
 As of 0.0.5 that is about 10.5k lines across 23 modules.

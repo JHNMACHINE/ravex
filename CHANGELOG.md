@@ -102,6 +102,62 @@
 
 ### Changed
 
+- **The replica transport is Rust, and the pre-staging path does not come back
+  through Python at all (GPU-109).**
+
+  `store_files`, the manifest encodings, `encoded_size`, `encode_store` and
+  `StoreWriter` moved from `ravex/_dist/replication.py` into `src/transport.rs`;
+  `ravex/_dist/elastic.py`'s `prestage_send` / `prestage_receive` are now two
+  lines each, handing their socket's descriptor to the core. The names, the
+  signatures and the module they are imported from are unchanged, and
+  `tests/test_dist_replication.py` — 69 tests written against the Python — was
+  not touched, which is what makes it the oracle for the Rust rather than a
+  description of it.
+
+  **The wire format did not change and could not.** A replica written by one
+  version is read back by another, and `exchange_stores` still moves its bytes
+  over torch collectives through this same framing: little-endian, a `<I` count,
+  then `<HQ` plus the name plus a `<B` skip flag per entry, then the bodies of
+  everything not skipped.
+
+  **This was measured before it was written, and the first measurement said
+  don't.** GPU-84 had found the transfer stuck at 529 MB/s against a 1462 MB/s
+  wire and collapsing to 113 MB/s as the chunk grew — a ceiling that was ours,
+  not the network's, and the case for rewriting it. That script was a throwaway
+  in a session scratchpad, so the first thing done here was to rebuild it as
+  `bench/transport_ceiling.py` and run it: 989 MB/s at a 4 MiB chunk, 735 at
+  64 MiB. Most of GPU-84's collapse had already been paid off by two earlier
+  copy removals, and what was left was not the wire — the real path ran at 81%
+  of the *encoding* arm while the wire itself was 4.6x faster than either.
+
+  So the honest reading was that a Rust socket would attack the half that was
+  already fast, and that is written down in GPU-109. It was overruled and the
+  port was done anyway. What the same bench says afterwards, 2 GiB in 8 files on
+  one box over loopback:
+
+  | arm | 4 MiB | 16 MiB | 64 MiB |
+  | --- | --- | --- | --- |
+  | `exchange_stores` (torch collectives, Rust framing) | 701 MB/s | 780 | 809 |
+  | `prestage_*` (Rust end to end) | 1063 MB/s | 1419 | **1611** |
+
+  Twice the throughput at a 64 MiB chunk, and **rising** with chunk size where
+  the old path fell. Two things did it: a cursor over the pending buffer instead
+  of `del pending[:take]`, which was a memmove of the tail at every file
+  boundary, and a reader thread bounded three chunks ahead so the disk and the
+  socket stop taking turns. Neither is a Rust trick — both are things the Python
+  could have done — but they are what the rewrite was for, and the number is the
+  number.
+
+  **What this does not say.** One box, one platform, page cache warm, loopback.
+  Between two rented machines the link was measured at 12 MB/s (GPU-96), which
+  is two orders of magnitude below any of these numbers: on a real network none
+  of this is what limits a replication round. The gain is real where the link is
+  fast — one machine, several ranks — and irrelevant where it is not.
+
+  `exchange_stores` itself still moves its bytes over torch collectives. Giving
+  it a socket means answering how ranks find each other outside a process group,
+  which is a design question and not a port.
+
 - **Ravex has one way in, and it is `@ravex.train_loop` (GPU-108). This breaks
   the public API.**
 

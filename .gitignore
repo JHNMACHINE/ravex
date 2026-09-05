@@ -26,4 +26,6 @@ ravex.log
 
 # The compiled core, built into the source tree by an editable install.
 ravex/_core*.pyd
+# Debug symbols maturin leaves beside the extension on Windows.
+ravex/*.pdb
 ravex/_core*.so

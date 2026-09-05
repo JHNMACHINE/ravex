@@ -148,19 +148,14 @@ def _prestage_worker(rank, main_port, socket_port, source_dir, dest_dir, out):
         import torch
         import torch.distributed as dist
 
-        import ravex._dist.replication as replication
         from ravex._dist.elastic import prestage_send, prestage_receive
 
+        # What the transport reports it wrote. It used to be counted by
+        # wrapping `replication.encode_store`; since GPU-109 the loop that
+        # writes the socket is Rust and does not come back through here, so the
+        # number comes from the call itself. The assertions below are the same
+        # ones and mean the same thing: round two must be smaller.
         sent_bytes = {"round1": 0, "round2": 0}
-        current_round = {"n": 1}
-        real_encode_store = replication.encode_store
-
-        def counting_encode_store(path, chunk=replication.CHUNK, skip=None):
-            for block in real_encode_store(path, chunk=chunk, skip=skip):
-                sent_bytes["round%d" % current_round["n"]] += len(block)
-                yield block
-
-        replication.encode_store = counting_encode_store
 
         if rank in (0, 1):
             os.environ["MASTER_ADDR"] = "127.0.0.1"
@@ -188,9 +183,8 @@ def _prestage_worker(rank, main_port, socket_port, source_dir, dest_dir, out):
             sock = conn
 
         # Round 1: nothing at the destination yet - full transfer.
-        current_round["n"] = 1
         if rank == 0:
-            prestage_send(sock, source_dir)
+            sent_bytes["round1"] = prestage_send(sock, source_dir)
         elif rank == 2:
             prestage_receive(sock, dest_dir)
 
@@ -204,9 +198,8 @@ def _prestage_worker(rank, main_port, socket_port, source_dir, dest_dir, out):
             _write_file(os.path.join(source_dir, "b.bin"), b"B" * 4096 + b"-v2")
             _write_file(os.path.join(source_dir, "c.bin"), b"C" * 2048)
 
-        current_round["n"] = 2
         if rank == 0:
-            prestage_send(sock, source_dir)
+            sent_bytes["round2"] = prestage_send(sock, source_dir)
         elif rank == 2:
             prestage_receive(sock, dest_dir)
 

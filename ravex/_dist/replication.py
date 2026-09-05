@@ -89,115 +89,74 @@ def machine_of(rank: int, local_size: int) -> Optional[int]:
 
 import os
 import shutil
-import struct
+
+from ravex import _core
 
 #: Bytes per chunk on the wire. Bounded on purpose: a real shard is over a
 #: gigabyte, and a whole-store buffer would be that allocation on the training
 #: process at checkpoint time — on top of the shadow copy and whatever the
 #: allocator is already holding. Host memory pressure right there is measured,
 #: not hypothetical; it is what GPU-54 turned out to be.
-CHUNK = 4 * 1024 * 1024
+CHUNK = _core.CHUNK
 
-#: ``<path length><size>`` ahead of each file, then the bytes.
-_ENTRY = struct.Struct("<HQ")
-_COUNT = struct.Struct("<I")
+# ─── the framing, which is Rust since GPU-109 ───────────────────────────────
+#
+# `store_files`, the two manifest encodings, `encoded_size`, `encode_store` and
+# `StoreWriter` were written here until GPU-109 and are now names over
+# `ravex._core`. **The format did not change and could not**: a replica written
+# by one version is read back by another, and `exchange_stores` below still
+# moves its bytes over torch collectives through this same framing. It is
+# little-endian throughout — a `<I` count, then `<HQ` plus the name plus a `<B`
+# flag per entry, then the bodies — and `src/transport.rs` is where it lives
+# now.
+#
+# Why they moved is measured rather than assumed, which is the rule GPU-105 set
+# itself and did not follow. Two numbers:
+#
+# * The receiving side buffered every chunk and then did `del pending[:take]`,
+#   a memmove of the tail at every file boundary. The transfer fell from
+#   529 MB/s to 113 MB/s as the chunk grew from 4 to 64 MiB — GPU-84, and the
+#   wrong way round for a block transfer. The Rust holds a cursor instead.
+# * Reading the disk and writing the socket took turns. Measured 2026-09-05
+#   with `bench/transport_ceiling.py`: 1.2 GB/s reading and framing, 4.5 GB/s
+#   on the wire, 0.99 GB/s for the two of them alternating. The Rust reads on
+#   its own thread, bounded to three chunks ahead.
+#
+# The names keep the leading underscores they had. This module's surface is
+# unchanged, `ravex/_dist/elastic.py` imports two of them, and the test suite
+# that covers them was written against the Python and has not been touched.
 
-
-def store_files(path: str) -> "list[tuple[str, int]]":
-    """Every file under a store, relative to it, with its size. Sorted.
-
-    Sorted so both ends agree on order without exchanging it, and so a failure
-    part-way through leaves a prefix rather than a scatter.
-    """
-    found = []
-    for root, _dirs, names in os.walk(path):
-        for name in names:
-            absolute = os.path.join(root, name)
-            try:
-                size = os.path.getsize(absolute)
-            except OSError:
-                continue
-            found.append((os.path.relpath(absolute, path).replace(os.sep, "/"), size))
-    found.sort()
-    return found
-
-
-#: One byte after each entry in the transfer header: 1 when the peer already
-#: has this file and no bytes for it follow on the wire, 0 when they do. Not
-#: part of the plain manifest exchanged in :func:`exchange_stores` to learn
-#: what a peer already holds — that one is never itself skippable.
-_FLAG = struct.Struct("<B")
-
-
-def _encode_manifest(entries: "list[tuple[str, int]]") -> bytes:
-    """``(name, size)`` pairs as bytes, no flag — what one side already holds."""
-    blob = bytearray(_COUNT.pack(len(entries)))
-    for relative, size in entries:
-        encoded = relative.encode("utf-8")
-        blob += _ENTRY.pack(len(encoded), size) + encoded
-    return bytes(blob)
-
-
-def _parse_manifest(blob: bytes) -> "list[tuple[str, int]]":
-    """The inverse of :func:`_encode_manifest`."""
-    (count,) = _COUNT.unpack_from(blob, 0)
-    offset = _COUNT.size
-    entries = []
-    for _ in range(count):
-        name_len, size = _ENTRY.unpack_from(blob, offset)
-        offset += _ENTRY.size
-        entries.append((blob[offset : offset + name_len].decode("utf-8"), size))
-        offset += name_len
-    return entries
+store_files = _core.store_files
+_encode_manifest = _core.encode_manifest
+_parse_manifest = _core.parse_manifest
+encoded_size = _core.encoded_size
+StoreWriter = _core.StoreWriter
 
 
 def encode_store(path: str, chunk: int = CHUNK, skip: "set[str] | None" = None):
     """Yield a store as a byte stream, reading from disk as it goes.
 
-    A generator rather than a buffer, and read file by file rather than
-    packed into a temporary archive first: the archive would be a second full
-    copy on a disk that is already the binding constraint on these machines —
-    the reason ``measure_handoff.sh`` has space guards at all.
+    An iterator rather than a buffer, and read file by file rather than packed
+    into a temporary archive first: the archive would be a second full copy on
+    a disk that is already the binding constraint on these machines — the
+    reason ``measure_handoff.sh`` has space guards at all.
 
     ``skip`` names files whose bytes must not be read or sent — the peer
     already holds them, byte for byte, and said so before this call. They are
-    still listed in the header, flagged, so the receiver's manifest and
-    pruning stay exactly as complete as a full transfer's; only the body is
-    shorter.
-    """
-    entries = store_files(path)
-    header = bytearray(_COUNT.pack(len(entries)))
-    for relative, size in entries:
-        encoded = relative.encode("utf-8")
-        already_there = skip is not None and relative in skip
-        header += (
-            _ENTRY.pack(len(encoded), size)
-            + encoded
-            + _FLAG.pack(1 if already_there else 0)
-        )
-    yield bytes(header)
+    still listed in the header, flagged, so the receiver's manifest and pruning
+    stay exactly as complete as a full transfer's; only the body is shorter.
 
-    for relative, size in entries:
-        if skip is not None and relative in skip:
-            continue
-        absolute = os.path.join(path, *relative.split("/"))
-        sent = 0
-        with open(absolute, "rb") as handle:
-            while sent < size:
-                block = handle.read(min(chunk, size - sent))
-                if not block:
-                    # Truncated under us. Pad so the receiver's framing stays
-                    # aligned; the manifest hash will condemn the file later,
-                    # which is a better failure than a desynchronised stream.
-                    block = bytes(size - sent)
-                sent += len(block)
-                yield block
+    A function wrapping the class rather than the class itself, so the
+    signature, the defaults and this docstring stay where a reader of this
+    module will look for them.
+    """
+    return _core.StoreEncoder(path, chunk, skip)
 
 
 #: Written last, deleted first. A replica directory is only trustworthy while
 #: this is present: everything else about it — the files, their names, even a
 #: manifest — is equally true of a copy that was cut off half way.
-COMPLETE_MARKER = ".ravex-replica-ok"
+COMPLETE_MARKER = _core.COMPLETE_MARKER
 
 
 def replica_is_complete(path: str) -> bool:
@@ -236,224 +195,6 @@ def unmark_replica(path: str) -> None:
         os.remove(os.path.join(path, COMPLETE_MARKER))
     except OSError:
         pass
-
-
-class StoreWriter:
-    """Turns the stream back into files, writing as the bytes arrive.
-
-    Streaming rather than buffering the whole store and unpacking at the end,
-    for the same reason: the buffer would be a second copy of the store on the
-    receiving disk, which then also has to hold the store itself.
-
-    Written in place rather than staged in a sibling directory and swapped.
-    Staging would be safer to reason about but doubles the replica's footprint
-    for the length of every transfer, and disk is the binding constraint on
-    these machines. Safety comes instead from :data:`COMPLETE_MARKER`, which is
-    removed before the first byte lands and written only once the last one has.
-    """
-
-    def __init__(self, path: str):
-        self.path = path
-        # Removed first: from here until `commit`, this directory is not a
-        # replica of anything and must not be read as one.
-        try:
-            os.remove(os.path.join(path, COMPLETE_MARKER))
-        except OSError:
-            pass
-        self._pending = bytearray()
-        self._entries: "list[tuple[str, int, bool]] | None" = None
-        self._index = 0
-        self._left = 0
-        self._handle = None
-        # Set when a file flagged "already here" turns out not to be, on
-        # disk, what the sender was told it was. `complete` must not go true
-        # over that — a wrong local file is exactly as unusable as a missing
-        # one, and the marker's whole job is to not vouch for either.
-        self._broken = False
-
-    def feed(self, block) -> None:
-        """Take one chunk off the wire. Any object with a buffer will do.
-
-        The fast path writes straight from the caller's memory. The buffered
-        path below costs three passes over the same bytes — appending to
-        ``_pending``, slicing a piece out of it, then deleting from the front,
-        which memmoves the tail — and on a 4 MiB chunk that is most of what the
-        receiving side does. Measured 2026-08-21: skipping it, together with
-        the matching copy on the sending side, took the whole exchange from
-        355 MB/s to 524 MB/s, which is the wire's own speed.
-
-        The condition is exactly "nothing is half-parsed": the header is in,
-        a file is open, and no remainder is waiting. That is the normal case,
-        because the files in a store are large and the chunks are not. Headers
-        and file boundaries fall through to the buffered path, which is where
-        the ragged cases have always been handled.
-        """
-        view = memoryview(block).cast("B")
-
-        while (
-            view
-            and not self._pending
-            and self._entries is not None
-            and self._handle is not None
-        ):
-            take = min(self._left, len(view))
-            self._handle.write(view[:take])
-            self._left -= take
-            view = view[take:]
-            if self._left == 0:
-                self._finish_file()
-
-        # Falls through even with nothing left over, and that is not a
-        # formality: a zero-length file is created by *reaching* it, not by
-        # writing to it, so a chunk that ends exactly on a file boundary must
-        # still hand control back to `_write_body` or a trailing empty file is
-        # never made. `test_an_empty_file_still_arrives` is precisely this.
-        if view:
-            self._pending += view
-
-        while True:
-            if self._entries is None:
-                if not self._read_header():
-                    return
-            if not self._write_body():
-                return
-
-    def _read_header(self) -> bool:
-        if len(self._pending) < _COUNT.size:
-            return False
-        (count,) = _COUNT.unpack_from(self._pending, 0)
-        offset = _COUNT.size
-        entries = []
-        for _ in range(count):
-            if len(self._pending) < offset + _ENTRY.size:
-                return False
-            name_len, size = _ENTRY.unpack_from(self._pending, offset)
-            offset += _ENTRY.size
-            if len(self._pending) < offset + name_len:
-                return False
-            if len(self._pending) < offset + name_len + _FLAG.size:
-                return False
-            relative = self._pending[offset : offset + name_len].decode("utf-8")
-            offset += name_len
-            (flag,) = _FLAG.unpack_from(self._pending, offset)
-            offset += _FLAG.size
-            entries.append((relative, size, bool(flag)))
-        del self._pending[:offset]
-        self._entries = entries
-        return True
-
-    def _verify_skip(self, relative: str, size: int) -> None:
-        """A file the sender didn't send because we said we already had it.
-
-        Said moments earlier, in the same synchronous call, by us — but
-        checked again rather than trusted blindly, because a wrong file
-        marked complete is the one failure this whole module exists to rule
-        out.
-        """
-        target = os.path.join(self.path, *relative.split("/"))
-        try:
-            ok = os.path.getsize(target) == size
-        except OSError:
-            ok = False
-        if not ok:
-            self._broken = True
-
-    def _write_body(self) -> bool:
-        assert self._entries is not None
-        while True:
-            if self._handle is None:
-                if self._index >= len(self._entries):
-                    return False
-                relative, size, skip = self._entries[self._index]
-                if skip:
-                    self._verify_skip(relative, size)
-                    self._index += 1
-                    continue
-                target = os.path.join(self.path, *relative.split("/"))
-                os.makedirs(os.path.dirname(target) or self.path, exist_ok=True)
-                self._handle = open(target, "wb")
-                self._left = size
-                if size == 0:
-                    self._finish_file()
-                    continue
-            if not self._pending:
-                return False
-            take = min(self._left, len(self._pending))
-            self._handle.write(self._pending[:take])
-            del self._pending[:take]
-            self._left -= take
-            if self._left == 0:
-                self._finish_file()
-
-    def _finish_file(self) -> None:
-        if self._handle is not None:
-            self._handle.close()
-            self._handle = None
-        self._index += 1
-
-    @property
-    def complete(self) -> bool:
-        """Whether every file the header promised is present here, whole."""
-        return (
-            self._entries is not None
-            and self._index >= len(self._entries)
-            and self._handle is None
-            and not self._broken
-        )
-
-    def close(self) -> None:
-        if self._handle is not None:
-            self._handle.close()
-            self._handle = None
-
-    def commit(self) -> bool:
-        """Drop what the source no longer has, then mark the copy good.
-
-        Without the pruning the replica only grows: the source is pruned by
-        retention and the copy is not, so a long run leaves a copy holding
-        every step ever sent while the original holds three. Seen on the bench
-        on 2026-08-19 — 194 files against 3 — and on machines where the disk is
-        the binding constraint that is not untidiness, it is the failure.
-        """
-        if not self.complete:
-            return False
-
-        assert self._entries is not None
-        wanted = {relative for relative, _, _ in self._entries}
-        for relative, _ in store_files(self.path):
-            if relative == COMPLETE_MARKER or relative in wanted:
-                continue
-            try:
-                os.remove(os.path.join(self.path, *relative.split("/")))
-            except OSError:
-                pass
-
-        try:
-            with open(
-                os.path.join(self.path, COMPLETE_MARKER), "w", encoding="utf-8"
-            ) as handle:
-                handle.write("ok")
-        except OSError:
-            return False
-        return True
-
-
-def encoded_size(path: str, skip: "set[str] | None" = None) -> int:
-    """Bytes :func:`encode_store` will produce, without producing them.
-
-    Needed before the first byte moves: the receiving side allocates buffers
-    from this, and both ends have to agree on how many chunks there will be.
-    Must be called with the same ``skip`` the matching :func:`encode_store`
-    call gets, or the two disagree about the stream's length and the chunk
-    count desyncs mid-transfer.
-    """
-    entries = store_files(path)
-    total = _COUNT.size
-    for relative, size in entries:
-        total += _ENTRY.size + _FLAG.size + len(relative.encode("utf-8"))
-        if skip is None or relative not in skip:
-            total += size
-    return total
 
 
 def fixed_chunks(blocks, size: int):

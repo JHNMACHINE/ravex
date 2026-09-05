@@ -105,9 +105,9 @@ import socket as _socket
 import struct
 from typing import Any, List, Optional
 
+from ravex import _core
 
 _JOIN_KEY = "gpu94/join/%d"
-_LENGTH_PREFIX = struct.Struct("!Q")
 
 
 def generation_store(base_store, generation: int):
@@ -199,19 +199,7 @@ def topology_decision(local_view: Any, timeout_seconds: int = 10) -> List[Any]:
     return gather_objects(local_view, group=group)
 
 
-def _recv_exact(sock, n: int) -> bytes:
-    buf = bytearray()
-    while len(buf) < n:
-        block = sock.recv(n - len(buf))
-        if not block:
-            raise ConnectionError(
-                "peer closed while %d of %d bytes were still expected" % (n - len(buf), n)
-            )
-        buf += block
-    return bytes(buf)
-
-
-def prestage_send(sock, source: str, chunk: int = 1 << 20) -> None:
+def prestage_send(sock, source: str, chunk: int = 1 << 20) -> int:
     """Push ``source`` to whatever ``prestage_receive`` holds on the other
     end of ``sock``, skipping files that already match. **Not a collective.**
 
@@ -232,20 +220,7 @@ def prestage_send(sock, source: str, chunk: int = 1 << 20) -> None:
     ``replicate_every``-style periodic re-syncs bring the candidate closer,
     without paying a new TCP handshake for every round.
     """
-    from ravex._dist.replication import _parse_manifest, encode_store, store_files
-
-    manifest_len = _LENGTH_PREFIX.unpack(_recv_exact(sock, _LENGTH_PREFIX.size))[0]
-    peer_existing = (
-        dict(_parse_manifest(_recv_exact(sock, manifest_len))) if manifest_len else {}
-    )
-
-    skip_names = {
-        relative
-        for relative, size in store_files(source)
-        if peer_existing.get(relative) == size
-    }
-    for block in encode_store(source, chunk=chunk, skip=skip_names):
-        sock.sendall(block)
+    return _core.prestage_send(sock.fileno(), source, chunk)
 
 
 def prestage_receive(sock, destination: str) -> bool:
@@ -263,19 +238,4 @@ def prestage_receive(sock, destination: str) -> bool:
     does not close its end after a round precisely so the same connection
     can carry the next one.
     """
-    from ravex._dist.replication import StoreWriter, _encode_manifest, store_files
-
-    existing_blob = _encode_manifest(store_files(destination))
-    sock.sendall(_LENGTH_PREFIX.pack(len(existing_blob)) + existing_blob)
-
-    writer = StoreWriter(destination)
-    try:
-        while not writer.complete:
-            block = sock.recv(1 << 16)
-            if not block:
-                break
-            writer.feed(block)
-        writer.close()
-        return writer.commit()
-    finally:
-        writer.close()
+    return _core.prestage_receive(sock.fileno(), destination)
