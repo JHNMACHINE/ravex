@@ -16,6 +16,7 @@ import json
 import os
 import signal
 
+import ravex
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset
@@ -75,6 +76,7 @@ class DieAt(TrainerCallback):
             os.kill(os.getpid(), signal.SIGKILL)
 
 
+@ravex.train_loop()
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--trace", required=True)

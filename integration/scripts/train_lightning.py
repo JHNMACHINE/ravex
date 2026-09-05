@@ -12,6 +12,7 @@ import os
 import signal
 
 import lightning as L
+import ravex
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
@@ -48,6 +49,7 @@ class Regressor(L.LightningModule):
         return torch.optim.Adam(self.parameters(), lr=5e-3)
 
 
+@ravex.train_loop()
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--trace", required=True)

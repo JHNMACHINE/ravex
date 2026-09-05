@@ -1,94 +1,229 @@
-"""Ravex — transparent checkpointing for PyTorch training.
+"""Ravex — checkpoint and resume for PyTorch training.
 
-Two ways in.
-
-**Zero code changes** (what the project is for). Install the autoloader once,
-drop a ``ravex.yaml`` next to your code, and run your script unchanged::
-
-    ravex enable
-    python train.py
-
-**One line**, when you would rather be explicit::
+One way in, and it is a decorator::
 
     import ravex
-    ravex.activate()
 
-Either way, from that point on every ``optimizer.step()`` is counted, a
-checkpoint is written every ``checkpoint_every`` steps, and rerunning the same
-script picks up where the last one stopped — model, optimizer, LR scheduler,
-AMP scaler, RNG state and dataset position included.
+    @ravex.train_loop(preemption_handler=True)
+    def train():
+        model = build_model()
+        optimizer = torch.optim.Adam(model.parameters())
+        for batch in loader:
+            ...
+
+    train()
+
+Inside that function nothing changes — not one line, not one import. Ravex
+notices the model, the optimizer, the scheduler, the AMP scaler and the
+dataloader as they are constructed, counts every ``optimizer.step()``, writes a
+checkpoint every ``checkpoint_every`` steps, and on a rerun puts the whole thing
+back: weights, optimizer moments, LR schedule, RNG state and dataset position.
+
+**What the decorator adds over the old autoloader** is not convenience, it is a
+*boundary*. Ravex now knows where the loop begins and where it ends, and — the
+part that mattered enough to break the API for — it holds the function
+**before the model exists**. That is what an elastic regroup needs and could
+never have: see ``ravex/_dist/elastic.py``, which stops at the rendezvous layer
+for exactly this reason.
+
+Through 0.0.5 there was a second way in: a ``.pth`` file in site-packages that
+ran in every interpreter on the machine and attached Ravex to any process that
+had a ``ravex.yaml`` above its working directory. It is gone, deliberately —
+see the changelog. Ravex is a library you adopt, not a capability switched on
+underneath code that does not know about it.
 """
 
 from __future__ import annotations
 
-# `typing` is deliberately **not** imported here, and this is a startup-cost
-# decision rather than a style one. `ravex_autoload.pth` is the line
-# `import ravex._bootstrap`, which runs this module first, in every Python
-# process in the environment. Measured with `-X importtime`: this module's own
-# code costs 0.4 ms and `typing` cost 9.8 ms — 85% of the total, for three
-# names that appear only in annotations, which `from __future__ import
-# annotations` above already turns into strings that are never resolved.
-#
-# So the annotations below use builtins. Anything added here that imports at
-# module scope is paid by every `python -c` on the machine.
+import functools
+from typing import Any, Callable, Optional, TypeVar
 
-#: The one place the version is written. `pyproject.toml` reads it from here
-#: (`[tool.setuptools.dynamic]`), because declaring it in both is a pair that
-#: drifts at the first bump — and `ravex status` reports this one, so the drift
-#: shows up as the CLI stating a version nobody installed.
+#: The version, written here and in ``Cargo.toml``, which is what maturin builds
+#: the wheel from. Two places, because maturin has no equivalent of setuptools'
+#: ``dynamic = {attr = ...}``; ``tests/test_version_is_single.py`` fails if they
+#: ever disagree.
 __version__ = "0.0.5"
 
 __all__ = [
-    "activate",
     "checkpoint",
     "deactivate",
     "flush",
     "is_active",
     "status",
     "step",
+    "track",
+    "train_loop",
     "__version__",
 ]
 
+F = TypeVar("F", bound=Callable[..., Any])
 
-def activate(**overrides: object):
-    """Install the PyTorch patches and start checkpointing.
 
-    Keyword arguments override the resolved configuration, e.g.
-    ``ravex.activate(checkpoint_every=100, backend="torch_save")``.
-    Calling this twice is harmless.
+def train_loop(
+    _function: Optional[F] = None,
+    *,
+    preemption_handler: Optional[bool] = None,
+    elastic: bool = False,
+    **overrides: object,
+) -> Any:
+    """Wrap a training function so Ravex checkpoints it.
+
+    Usable bare or called::
+
+        @ravex.train_loop
+        def train(): ...
+
+        @ravex.train_loop(checkpoint_every=100, backend="torch_save")
+        def train(): ...
+
+    Keyword arguments are configuration overrides and win over ``ravex.yaml``
+    and the ``RAVEX_*`` environment variables — they are the most specific thing
+    that could have said so. An unknown name raises ``TypeError`` rather than
+    being ignored, because a silently-ignored ``checkpoint_evry=50`` is a run
+    that checkpoints on the default cadence and never says why.
+
+    Two of them are named rather than passed through, because they are the two
+    the caller thinks in rather than the two the config file thinks in:
+
+    ``preemption_handler``
+        Catch SIGTERM and try to get a final checkpoint down before the process
+        is killed — a spot instance gets roughly ten seconds' notice. Sets
+        ``handle_sigterm``. Read what that promises in the changelog for GPU-92
+        before relying on it: on a sharded model it is a best-effort attempt
+        that will often not complete, not a guarantee.
+
+    ``elastic``
+        Resume onto a *different* number of ranks without the process exiting.
+        **Not implemented**, and this raises rather than accepting it quietly.
+        See the message it raises.
+
+    The teardown is a ``finally``, so it runs whether the function returns or
+    raises: final checkpoint, flush, patches removed, runtime dropped. A second
+    call to the decorated function starts cleanly rather than finding the
+    previous run's state — which is why the patches are uninstalled here instead
+    of at interpreter exit.
     """
-    from ravex._config import RavexConfig
+    if elastic:
+        raise NotImplementedError(
+            "elastic=True is not implemented. Resuming onto a different world "
+            "size *with a process restart* does work today — set "
+            "reshard_on_resume=true and relaunch. What does not exist is the "
+            "regroup without the restart: it needs the model rebuilt under a "
+            "new mesh, because torch refuses fully_shard() twice on the same "
+            "module and has no way to move a DTensor to another DeviceMesh. "
+            "That is GPU-110, and this decorator is its prerequisite: it is "
+            "the first thing Ravex has ever had that can rebuild a model."
+        )
+
+    if preemption_handler is not None:
+        overrides["handle_sigterm"] = bool(preemption_handler)
+
+    def decorate(function: F) -> F:
+        @functools.wraps(function)
+        def wrapper(*args: object, **kwargs: object):
+            _activate(**overrides)
+            try:
+                return function(*args, **kwargs)
+            finally:
+                deactivate()
+
+        return wrapper  # type: ignore[return-value]
+
+    if _function is not None:
+        # Used bare, as `@ravex.train_loop`. Nothing was configured, which is
+        # fine — `ravex.yaml` and the environment still apply.
+        return decorate(_function)
+    return decorate
+
+
+def track(
+    model: object = None,
+    optimizer: object = None,
+    dataloader: object = None,
+    *,
+    scheduler: object = None,
+    scaler: object = None,
+) -> None:
+    """Name an object explicitly, when leaving it to be noticed is not enough.
+
+    Inside a ``train_loop`` Ravex finds these on its own and this is not needed.
+    It is here for the cases where "on its own" is a guess: two models where only
+    one is being trained, an optimizer built before the decorated function was
+    entered, a dataloader that is never iterated through the patched path.
+
+    Registering something twice is harmless. Registering an optimizer through
+    this attaches the same step hook the automatic path attaches, so the step
+    count keeps working — an optimizer tracked here and stepped is counted.
+
+    Raises if there is no active ``train_loop``: the alternative is recording
+    objects into a registry that is about to be replaced, which looks like it
+    worked.
+    """
     from ravex._runtime import get_runtime
 
     runtime = get_runtime(create=False)
     if runtime is None:
-        config = RavexConfig.load()
-        for key, value in overrides.items():
-            if not hasattr(config, key):
-                raise TypeError(f"unknown configuration option {key!r}")
-            setattr(config, key, value)
-        config._normalize()
-
-        from ravex._runtime import RavexRuntime
-        import ravex._runtime as runtime_module
-
-        runtime = RavexRuntime(config)
-        runtime_module._runtime = runtime
-        runtime.activate()
-
-        import atexit
-
-        atexit.register(runtime.shutdown)
-    elif overrides:
         raise RuntimeError(
-            "Ravex is already active; configuration cannot be changed after "
-            "activation. Set the options in ravex.yaml or RAVEX_* env vars."
+            "ravex.track() outside a @ravex.train_loop function. There is no "
+            "runtime to register with, so this call would be silently lost."
         )
-    return runtime
+
+    registry = runtime.registry
+    if model is not None:
+        registry.register_model(model)
+    if optimizer is not None:
+        from ravex._patches import _attach_step_hook
+
+        registry.register_optimizer(optimizer)
+        _attach_step_hook(optimizer, runtime)
+    if dataloader is not None:
+        registry.register_dataloader(dataloader)
+    if scheduler is not None:
+        registry.register_scheduler(scheduler)
+    if scaler is not None:
+        registry.register_scaler(scaler)
+
+
+def _activate(**overrides: object) -> None:
+    """Build the runtime and install the patches. The decorator's entry half.
+
+    Underscored because it is not the way in — :func:`train_loop` is, and it is
+    the only form that also guarantees the exit. This exists as its own function
+    because the test suite needs to open the runtime without wrapping every
+    scenario in a decorated function, and because a seam that the decorator and
+    the tests share is one seam rather than two.
+    """
+    from ravex._config import RavexConfig
+    from ravex._runtime import RavexRuntime, get_runtime
+    import ravex._runtime as runtime_module
+
+    if get_runtime(create=False) is not None:
+        raise RuntimeError(
+            "a @ravex.train_loop function is already running in this process. "
+            "Nesting them would mean two runtimes counting the same steps; "
+            "if the inner one was meant to configure the outer, pass the "
+            "options to the outer decorator instead."
+        )
+
+    config = RavexConfig.load()
+    for key, value in overrides.items():
+        if not hasattr(config, key):
+            raise TypeError(f"unknown configuration option {key!r}")
+        setattr(config, key, value)
+    config._normalize()
+
+    runtime = RavexRuntime(config)
+    runtime_module._runtime = runtime
+    runtime.activate()
 
 
 def deactivate() -> None:
-    """Stop checkpointing and remove the patches. Mostly for tests."""
+    """Stop checkpointing, write the final checkpoint, and unpatch PyTorch.
+
+    The decorator's exit half, exposed because two callers still want it by
+    hand: the test suite, and a notebook that wants to stop early without
+    leaving the patches installed on a live interpreter.
+    """
     from ravex._runtime import get_runtime, reset_runtime
 
     runtime = get_runtime(create=False)

@@ -25,25 +25,47 @@ def losses(trace):
     return [entry["loss"] for entry in trace]
 
 
-def test_the_autoloader_activates_without_being_asked(workspace):
+def test_the_config_is_found_from_the_working_directory(workspace):
+    """The half of activation that a decorator does *not* make explicit.
+
+    Where Ravex applies is now written in the script. *How* it applies still is
+    not: `ravex.yaml` is searched for at and above the working directory, so the
+    same script run from two places is configured two ways. That search happens
+    in a fresh interpreter, which is why it is tested here and not in-process.
+    """
     directory = workspace("plain")
     result = run_training(directory, epochs=2)
 
     assert result.returncode == 0, result.stderr
-    # Nothing in the script mentions Ravex, yet:
     assert (directory / "checkpoints").is_dir()
     assert "Ravex active" in (directory / "ravex.log").read_text()
 
 
-def test_ravex_stays_out_of_a_project_that_did_not_opt_in(workspace, tmp_path):
+def test_a_decorated_script_runs_on_defaults_with_no_config(workspace, tmp_path):
+    """No ravex.yaml is not the same as "do nothing" any more, and this pins it.
+
+    Until GPU-108 this asserted the opposite: a directory without a ravex.yaml
+    got no checkpointing at all, because the autoloader ran in *every*
+    interpreter and a config file was the only way it could tell a project that
+    wanted Ravex from one that had merely installed it.
+
+    With the decorator that question is already answered — the script asked. So
+    a missing config file means "use the defaults", the way a missing config
+    file means that everywhere else. The opt-in moved from the directory to the
+    source, which is the whole point of the change, and the cost is stated
+    plainly: a decorated script writes checkpoints into ./checkpoints wherever
+    it is run from.
+    """
     directory = tmp_path / "no-config"
     directory.mkdir()
 
     result = run_training(directory, epochs=2)
 
     assert result.returncode == 0, result.stderr
-    assert not (directory / "checkpoints").exists()
-    assert not (directory / "ravex.log").exists()
+    assert (directory / "checkpoints").is_dir(), (
+        "a decorated script did nothing without a ravex.yaml: the opt-in is "
+        "supposed to be the decorator now, not the config file"
+    )
 
 
 def test_a_killed_run_resumes_where_it_stopped(workspace):

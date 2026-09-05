@@ -49,6 +49,7 @@ import os
 import signal
 import time
 
+import ravex
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -122,6 +123,7 @@ def peak_rss_bytes():
         return 0
 
 
+@ravex.train_loop()
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--params", type=float, default=1.5e9)

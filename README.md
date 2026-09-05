@@ -48,30 +48,51 @@ Ravex's test suite asserts the strong form of this: a run killed at step 20 and
 resumed produces losses that are **bit-identical**, step by step, to the run
 that was never interrupted, and the same final weights.
 
-## Two ways to use it
+## How you use it
 
-**Zero code changes.** `pip install ravex` puts a one-line `.pth` file in
-site-packages, which Python executes at interpreter startup. From then on Ravex
-attaches itself to any training process that has a `ravex.yaml`.
-
-That line costs about a millisecond and does almost nothing: it reads `os` and
-`sys`, looks for a `ravex.yaml` above the working directory, and stops there
-unless it finds one. When it does, it arms a hook that waits for `import
-torch` and only then loads the runtime — so a process that never touches
-PyTorch never pays for anything else, and the hook removes itself once it has
-fired.
-
-**One line**, when you would rather be explicit:
+One decorator on the function that trains:
 
 ```python
 import ravex
-ravex.activate()
+
+@ravex.train_loop(preemption_handler=True)
+def train():
+    model = build_model()
+    optimizer = torch.optim.Adam(model.parameters())
+    for batch in loader:
+        ...
+
+train()
 ```
 
-Both do the same thing. The `.pth` route exists so that a platform can enable
-checkpointing for code it does not own — and `ravex disable` removes it for
-people who would rather it were not there. A later `pip install --upgrade`
-puts it back.
+Inside that function nothing changes. Ravex notices the model, the optimizer,
+the LR scheduler, the AMP scaler and the dataloader as they are built, counts
+every `optimizer.step()`, and writes a checkpoint on the cadence you configured.
+Rerun the script and it picks up where it stopped.
+
+If "on its own" is a guess — two models and only one being trained, an optimizer
+built before the function was entered — name it:
+
+```python
+ravex.track(model, optimizer)
+```
+
+**What the decorator buys, beyond being readable.** It is a *boundary*. Ravex
+knows where the loop begins and ends, so the teardown is a `finally` rather than
+an `atexit` hook hoping to run, and it holds the function **before the model
+exists** — which is what resuming onto a different number of ranks needs and
+could never have.
+
+**What it replaced.** Through 0.0.5 `pip install ravex` also put a one-line
+`.pth` file in site-packages that ran in *every* Python process in the
+environment and attached Ravex to any of them that had a `ravex.yaml` above the
+working directory. It is gone. It was genuinely zero-code-changes, and it existed
+so a platform could turn on checkpointing for code it did not own — a real thing
+to give up, given up on purpose. What it cost was that Ravex had to guess where
+the loop began, and the guessing is what limited it: with HuggingFace `Trainer`
+and Lightning, dataset and RNG replay could not be made exact, and there was no
+defined moment of exit to write a final sharded checkpoint at. Both were filed as
+accepted limitations. Neither has to be, now.
 
 ## Configuration
 
@@ -139,15 +160,14 @@ not:
 - if a checkpoint fails, Ravex disables itself and logs it — training continues
 - nothing is ever written to stdout; logs go to `log_file`, or to stderr at
   WARNING and above
-- installing the package starts no checkpointing anywhere. The `.pth` runs in
-  every interpreter, and in one without a `ravex.yaml` above the working
-  directory — or `RAVEX_ENABLED=1` — it installs nothing and returns. Ravex is
-  **inert until a project asks for it**, which is a weaker promise than "it
-  writes no file" and the one that actually matters
-- it never imports torch to find that out. The runtime loads only once your
-  code has imported PyTorch itself
-- `ravex disable` removes the autoloader; `RAVEX_ENABLED=0` turns it off for a
-  single run
+- installing the package starts no checkpointing anywhere, and neither does
+  importing it. Ravex does nothing at all until a decorated function is called,
+  which is a much easier promise to check than the one this used to make: it is
+  visible in the source of the thing being checkpointed
+- the patches go on at that call and come off when it returns, including when it
+  returns by raising. A process that finishes training is a process with an
+  unpatched PyTorch in it
+- `RAVEX_ENABLED=0` turns it off for a single run without touching the code
 
 ## Status and limits
 
@@ -247,14 +267,15 @@ last verified on 8× RTX 5060 Ti with torch 2.12/cu130.
 ## Project layout
 
 Everything under `ravex` is private except `ravex` itself: the public surface
-is `activate()`, `__version__` and the `ravex` command, and every name below
-that starts with an underscore is free to move.
+is `train_loop()`, `track()`, a handful of small helpers (`checkpoint`, `flush`,
+`step`, `status`, `is_active`, `deactivate`), `__version__` and the `ravex`
+command. Every name below that starts with an underscore is free to move.
 
 ```
 ravex/
 ├── __init__.py       Public surface, and nothing else
-├── _bootstrap.py     The .pth entry point
-├── _cli.py           ravex enable / disable / status
+├── _cli.py           ravex status
+├── _core.pyi         Types for the compiled Rust core
 ├── _config.py        Defaults < ravex.yaml < RAVEX_*
 ├── _patches.py       The five monkey patches on PyTorch
 ├── _registry.py      What is being trained, held by weakref
@@ -265,7 +286,7 @@ ravex/
 ├── _frameworks.py    HF Trainer / Lightning / Accelerate detection
 ├── _dist/            More than one GPU, more than one machine
 │   ├── collectives.py    gather vs per_rank; the SIGTERM channel
-│   ├── reshard.py        8 shards onto 4 ranks — pure integer arithmetic
+│   ├── reshard.py        8 shards onto 4 ranks — re-exports the Rust core
 │   ├── identity.py       Who wrote this store, as part of which run
 │   ├── replication.py    Each rank copies its store to a peer
 │   └── elastic.py        Membership changes without a restart
@@ -279,10 +300,11 @@ ravex/
 
 The two subpackages are groups, not layers: neither re-exports anything, and
 callers import the submodule they want inside the function that wants it. That
-is not style. `_bootstrap` runs in **every** Python interpreter on the machine
-once the `.pth` is installed, so the cost of an import that did not have to
-happen is paid by every `python -c` on the box — and `_dist.collectives` pulls
-in `torch.distributed`. A single-process run loads neither subpackage.
+used to be a startup-cost rule — the `.pth` ran in every interpreter on the
+machine, so an import that did not have to happen was paid for by every
+`python -c` on the box. The `.pth` is gone and the discipline is kept for the
+weaker reason that still holds: `_dist.collectives` pulls in
+`torch.distributed`, and a single-process run should load neither subpackage.
 
 The import graph is a DAG with `_runtime` as its only hub; there are no cycles,
 and nothing in `_interop` is imported by anything outside it except `_runtime`.
@@ -292,7 +314,7 @@ and nothing in `_interop` is imported by anything outside it except `_runtime`.
 | Path | |
 |---|---|
 | `tests/` | 821 unit tests, in-process, no GPU and no container. Named for what they cover: `test_dist_*`, `test_interop_*` |
-| `integration/` | What only exists across a real process boundary — the `.pth`, a resume from an empty interpreter, `torchrun`. Linux, in Docker |
+| `integration/` | What only exists across a real process boundary — a resume from an empty interpreter, `torchrun`, a SIGKILL that runs no `finally`. Linux, in Docker |
 | `integration/scripts/` | The training scripts those tests kill and restart |
 | `integration/multinode/` | One container per rank, for questions `--nproc_per_node` cannot ask ([README](integration/multinode/README.md)) |
 | `integration/two-machines/` | The rented-box harness: two real hosts, real network |
@@ -319,8 +341,9 @@ cargo test --no-default-features
 ```
 
 The unit suite runs in-process. The parts that only exist across a real process
-boundary — the `.pth` autoloader, a resume starting from an empty interpreter,
-`torchrun` — live in `integration/` and need Linux:
+boundary — a resume starting from an empty interpreter, config discovery from
+the working directory, `torchrun`, and a SIGKILL that runs no `finally` — live
+in `integration/` and need Linux:
 
 ```bash
 docker build -f integration/Dockerfile -t ravex-integration .

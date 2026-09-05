@@ -1,14 +1,19 @@
 # Integration test environment.
 #
-# The unit suite runs in-process: it calls ravex.activate() and simulates a
-# crash with an exception. That cannot exercise the parts that only exist
-# across a real process boundary — the .pth autoloader, config discovery from
-# the working directory, and a resume that starts from a genuinely empty
-# interpreter. Nor can it run torchrun.
+# The unit suite runs in-process: it opens the runtime directly and simulates a
+# crash with an exception. That cannot exercise the parts that only exist across
+# a real process boundary — config discovery from the working directory, a
+# resume that starts from a genuinely empty interpreter, and a crash delivered
+# as SIGKILL, where no `finally` and no atexit hook runs. Nor can it run
+# torchrun.
 #
-# So: a Linux container, ravex installed for real, `ravex enable` writing the
-# autoloader into site-packages, and training scripts that contain not one
-# reference to ravex.
+# So: a Linux container, ravex installed for real, and training scripts that are
+# ordinary scripts with one decorator on `main`.
+#
+# Until GPU-108 the point of this image was narrower and larger at once: the
+# `.pth` autoloader, which attached Ravex to scripts containing no reference to
+# it. That is gone. What is left is still the only place several of these
+# questions can be asked.
 #
 #   docker build -f integration/Dockerfile -t ravex-integration .
 #   docker run --rm ravex-integration
@@ -66,8 +71,9 @@ COPY integration ./integration
 
 RUN pip install --no-cache-dir -e .
 
-# The real thing: one line in site-packages, executed at interpreter startup.
-# From here on nothing needs to import ravex explicitly.
-RUN ravex enable && ravex status
+# No autoloader to install since GPU-108; `status` stays because a broken
+# install — most likely a compiled core that did not build — is worth failing
+# on here rather than inside the first test.
+RUN ravex status
 
 CMD ["pytest", "integration", "-v", "--tb=short"]

@@ -1,4 +1,4 @@
-"""A DeepSpeed training script. It has never heard of Ravex.
+"""A DeepSpeed training script, Ravex-attached by one decorator and no more.
 
 The counterpart to ``train_plain.py``, and it exists to answer a question
 ``ravex/_frameworks.py`` asserts an answer to without ever having run it:
@@ -13,11 +13,13 @@ say whether it continued or started over.
 
 import argparse
 
+import ravex
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 
+@ravex.train_loop()
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", type=int, default=1, choices=[1, 2, 3])

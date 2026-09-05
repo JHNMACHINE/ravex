@@ -89,7 +89,7 @@ def run_scenario(tmp_path, monkeypatch, backend):
 
     # ── the run we are trying to reproduce ──────────────────────────
     monkeypatch.setenv("RAVEX_STORAGE_PATH", str(tmp_path / "reference"))
-    ravex.activate(**options)
+    ravex._activate(**options)
     reference_model, reference = train()
     reference_weights = weights(reference_model)
     ravex.deactivate()
@@ -98,7 +98,7 @@ def run_scenario(tmp_path, monkeypatch, backend):
 
     # ── same script, killed at step 20 ──────────────────────────────
     monkeypatch.setenv("RAVEX_STORAGE_PATH", str(tmp_path / "interrupted"))
-    ravex.activate(checkpoint_on_exit=False, **options)
+    ravex._activate(checkpoint_on_exit=False, **options)
     _, first_half = train(die_at=CRASH_AT)
     ravex.deactivate()
 
@@ -107,7 +107,7 @@ def run_scenario(tmp_path, monkeypatch, backend):
         assert loss == reference[step], f"step {step} diverged before the crash"
 
     # ── the process comes back, same storage, no code change ────────
-    ravex.activate(**options)
+    ravex._activate(**options)
     resumed_model, second_half = train()
     ravex.deactivate()
 
@@ -150,7 +150,7 @@ def test_resume_reproduces_the_uninterrupted_run_on_moonclip(tmp_path, monkeypat
 
 def test_a_fresh_run_starts_from_scratch(tmp_path, monkeypatch):
     monkeypatch.setenv("RAVEX_STORAGE_PATH", str(tmp_path / "empty"))
-    ravex.activate(backend="torch_save", checkpoint_every=4, max_steps=8)
+    ravex._activate(backend="torch_save", checkpoint_every=4, max_steps=8)
     _, losses = train()
     ravex.deactivate()
 

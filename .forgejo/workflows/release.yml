@@ -121,13 +121,13 @@ jobs:
           ls -la dist/
           twine check dist/*.tar.gz
           # It has to build without the working tree around it, which is the
-          # whole point of shipping one. The autoloader is checked by name: it
-          # is the file `setup.py` used to place by hand, and an sdist that has
-          # lost it installs a Ravex that never activates.
+          # whole point of shipping one. The crate is checked by name: an sdist
+          # missing `src/` is one pip cannot build, and the failure would land
+          # on whoever is not on Linux x86_64 rather than here.
           tmp=$(mktemp -d)
           tar xzf dist/*.tar.gz -C "$tmp"
           ls "$tmp"/*/pyproject.toml "$tmp"/*/Cargo.toml "$tmp"/*/src/lib.rs
-          ls "$tmp"/*/ravex_autoload.pth "$tmp"/*/CHANGELOG.md
+          ls "$tmp"/*/CHANGELOG.md
 
       - name: Upload to PyPI
         if: ${{ forgejo.event_name == 'push' }}
@@ -217,19 +217,19 @@ jobs:
             echo "no ${{ matrix.python }} wheel in dist/" >&2; exit 1; }
           twine check dist/*.whl
 
-          # The autoloader has to be at the *root* of the archive, which is what
-          # puts it in site-packages. maturin places it from `[tool.maturin]
-          # include`; the trap it replaced — `data_files` — produced a wheel that
-          # looked identical and installed the file one directory above
-          # site-packages, where Python never runs it. That failure is invisible
-          # until someone installs the release and finds Ravex silently inert,
-          # so it is checked here rather than discovered there.
+          # The compiled core has to be *in* the wheel. It is not optional since
+          # GPU-105 — there is no Python fallback behind it — so a wheel without
+          # it installs and then fails on the first resume, which is the worst
+          # place to find out.
+          #
+          # This used to also assert `ravex_autoload.pth` at the archive root.
+          # GPU-108 removed the autoloader; nothing has to be at the root now.
           #
           # Written as `-c` rather than as a heredoc: the body of a `run:` is a
           # YAML block scalar, so every line of a heredoc arrives indented and
           # the terminator never matches at column 0. `<<-` would not save it
           # either — it strips tabs, not spaces.
-          /opt/python/cp312-cp312/bin/python -c 'import sys, zipfile; names = zipfile.ZipFile(sys.argv[1]).namelist(); assert "ravex_autoload.pth" in names, "autoloader not at the wheel root"; assert any(n.startswith("ravex/_core.") for n in names), "no compiled core"; print("wheel layout ok")' "$(ls dist/*.whl)"
+          /opt/python/cp312-cp312/bin/python -c 'import sys, zipfile; names = zipfile.ZipFile(sys.argv[1]).namelist(); assert any(n.startswith("ravex/_core.") for n in names), "no compiled core"; print("wheel layout ok")' "$(ls dist/*.whl)"
 
       - name: Upload to PyPI
         if: ${{ forgejo.event_name == 'push' }}

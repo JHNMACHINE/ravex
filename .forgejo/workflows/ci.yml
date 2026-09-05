@@ -141,10 +141,11 @@ jobs:
           # only job where the default write path is exercised at all.
           pytest tests -v
 
-  # What the unit suite structurally cannot reach: the `.pth` autoloader, config
-  # discovery from the working directory, a resume that starts from a genuinely
-  # empty interpreter, torchrun, and a crash delivered as SIGKILL. Mirrors
-  # integration/Dockerfile — keep the two in step.
+  # What the unit suite structurally cannot reach: config discovery from the
+  # working directory, a resume that starts from a genuinely empty interpreter,
+  # torchrun, and a crash delivered as SIGKILL — where no `finally` and no
+  # atexit hook runs, which is the one thing the decorator cannot promise.
+  # Mirrors integration/Dockerfile — keep the two in step.
   integration:
     runs-on: codeberg-medium
     container:
@@ -179,12 +180,11 @@ jobs:
           pip install --quiet pytest numpy
           pip install --quiet -e .
 
-      - name: Install the autoloader
-        # The real thing: one line in site-packages, executed at interpreter
-        # startup. From here on nothing imports ravex explicitly.
-        run: |
-          ravex enable
-          ravex status
+      - name: Check the install
+        # Not "arm the autoloader" any more — there is nothing to arm since
+        # GPU-108. `status` still earns the step: it fails here if the compiled
+        # core did not build, instead of inside the first test that resumes.
+        run: ravex status
 
       - name: Integration suite
         # `integration/` and `tests/` both have a conftest.py, and pytest
@@ -236,10 +236,8 @@ jobs:
           pip install --quiet "transformers>=4.40" "accelerate>=1.1" "lightning>=2.2"
           pip install --quiet -e .
 
-      - name: Install the autoloader
-        run: |
-          ravex enable
-          ravex status
+      - name: Check the install
+        run: ravex status
 
       - name: Framework integration suite
         run: pytest integration/test_frameworks.py -v --tb=short

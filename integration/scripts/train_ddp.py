@@ -15,6 +15,7 @@ import json
 import os
 import signal
 
+import ravex
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -26,6 +27,7 @@ BATCH = 8
 SEED = 0
 
 
+@ravex.train_loop()
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--trace", required=True)

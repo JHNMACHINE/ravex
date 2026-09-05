@@ -24,6 +24,7 @@ import json
 import os
 import signal
 
+import ravex
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -38,6 +39,7 @@ def build_model():
     return nn.Sequential(nn.Linear(6, 12), nn.Tanh(), nn.Dropout(0.2), nn.Linear(12, 1))
 
 
+@ravex.train_loop()
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--trace", required=True)

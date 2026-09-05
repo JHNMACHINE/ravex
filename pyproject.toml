@@ -88,27 +88,16 @@ ravex = "ravex._cli:main"
 module-name = "ravex._core"
 features = ["extension-module"]
 
-# The autoloader has to land in **purelib** — the `site-packages` directory
-# itself — and this is the declaration that puts it there. It used to take a
-# custom `build_py` in setup.py, for a reason worth keeping written down: the
-# obvious answer is `data_files`, and it is a trap. That puts the file in the
-# wheel's `.data/data/` directory, which pip installs relative to `sys.prefix`
-# — in a virtualenv, one level *above* site-packages. The file arrives, looks
-# installed, and is never executed, because Python only runs `.pth` files found
-# in a site directory.
-#
-# Because it is a wheel entry it is also in RECORD, which is what makes
-# `pip uninstall ravex` take it away again. That matters more than it looks: an
-# orphaned `.pth` importing a module that no longer exists is the classic way
-# this scheme breaks, and it is not a risk here.
-#
 # CHANGELOG.md is sdist-only and was MANIFEST.in's job until maturin took over
 # the sdist: the source archive is what a distribution packager or an auditor
 # reads, and it was the one place the release notes were missing.
-include = [
-    { path = "ravex_autoload.pth", format = ["sdist", "wheel"] },
-    { path = "CHANGELOG.md", format = "sdist" },
-]
+#
+# `ravex_autoload.pth` was here too until GPU-108, with a long comment about
+# `data_files` installing it one directory above site-packages where Python
+# never runs it. The file is gone, so the trap is not worth documenting at a
+# place that no longer walks past it — the reasoning is in the changelog, where
+# someone wondering why the autoloader disappeared will actually look.
+include = [{ path = "CHANGELOG.md", format = "sdist" }]
 
 # maturin copies whatever sits under the Python source directory. Every
 # Moonclip 0.0.4 wheel shipped a `__pycache__/` full of cp314 `.pyc` files for

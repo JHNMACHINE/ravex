@@ -23,9 +23,9 @@ echo
 echo "=== install ==="
 pip install -q -e . pytest
 
-# Writes the one-line .pth into site-packages, so the training scripts below
+# Checks the install, including the compiled core. The training scripts below
 # stay free of any reference to Ravex.
-ravex enable
+ravex status
 
 echo
 echo "=== unit suite (fast, catches a broken install) ==="

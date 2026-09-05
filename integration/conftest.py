@@ -16,12 +16,19 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture(scope="session", autouse=True)
-def autoloader_is_installed():
-    """These tests are meaningless without the .pth actually in site-packages."""
-    from ravex._cli import pth_path
+def ravex_is_installed():
+    """A real install, with the compiled core in it.
 
-    if not pth_path().exists():
-        pytest.skip(f"autoloader not installed at {pth_path()} - run `ravex enable`")
+    This replaced a check that the ``.pth`` autoloader was in site-packages,
+    which was the thing that made these tests mean anything until GPU-108. What
+    makes them mean something now is narrower and easier to state: the training
+    scripts import ravex and are decorated, so the suite needs an importable
+    ravex — and, since GPU-105, one whose extension module actually built.
+    """
+    try:
+        from ravex import _core  # noqa: F401
+    except ImportError as exc:
+        pytest.skip(f"ravex is not importable in this interpreter: {exc}")
 
 
 @pytest.fixture
