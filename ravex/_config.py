@@ -281,6 +281,24 @@ class RavexConfig:
     # losing a machine loses at most this many checkpoints of progress.
     replicate_every: int = 10
 
+    #: How the replica bytes travel between ranks: ``"sockets"``,
+    #: ``"collectives"``, or ``"auto"``.
+    #:
+    #: Sockets are Ravex's own TCP connections between neighbouring ranks,
+    #: framed and driven by the Rust core, and ``auto`` prefers them whenever
+    #: the rendezvous store is reachable and every peer's address can be
+    #: resolved — which inside a torchrun job it usually is. Measured on one
+    #: box, 2 GiB in 8 files: 1611 MB/s against the collectives' 809 at a
+    #: 64 MiB chunk, and rising with the chunk size where the collective path
+    #: falls (GPU-109).
+    #:
+    #: ``"collectives"`` is the road back, and it is not deprecated. The
+    #: collective path needs no rank to have an address anyone else can reach,
+    #: so on a cluster where the ranks cannot open connections to each other it
+    #: is the one that works. ``auto`` falls back to it on its own when a link
+    #: cannot be built, and says so once.
+    replication_transport: str = "auto"
+
     # Whether Moonclip keeps the last full snapshot's bytes resident so the
     # next delta can be computed without reading them back from storage.
     #
@@ -469,6 +487,8 @@ class RavexConfig:
             self.save_dtype = _save_dtype_from_env(value)
         if (value := get("REPLICATE_EVERY")) is not None:
             self.replicate_every = _as_int(value, self.replicate_every)
+        if (value := get("REPLICATION_TRANSPORT")) is not None:
+            self.replication_transport = value
         if (value := get("KEEP_BASE_IN_MEMORY")) is not None:
             self.keep_base_in_memory = _as_bool(value, self.keep_base_in_memory)
         if (value := get("ASYNC_SAVE")) is not None:
@@ -577,7 +597,13 @@ class RavexConfig:
         if self.max_steps is not None:
             self.max_steps = _as_int(self.max_steps, 0) or None
 
-        for name in ("backend", "compression", "log_level", "sharded_checkpoints"):
+        for name in (
+            "backend",
+            "compression",
+            "log_level",
+            "sharded_checkpoints",
+            "replication_transport",
+        ):
             value = getattr(self, name)
             if not isinstance(value, str):
                 replacement = getattr(defaults, name)
@@ -609,6 +635,17 @@ class RavexConfig:
                 "'gather' or 'per_rank'; using 'gather'"
             )
             self.sharded_checkpoints = "gather"
+
+        if self.replication_transport not in ("auto", "sockets", "collectives"):
+            # Unlike `sharded_checkpoints`, an unrecognised value here costs
+            # nothing to guess wrong about: both roads move the same bytes and
+            # write the same replica, so the fallback is the one that decides
+            # for itself rather than the more conservative of the two.
+            self.problems.append(
+                f"replication_transport={self.replication_transport!r} is not "
+                "'auto', 'sockets' or 'collectives'; using 'auto'"
+            )
+            self.replication_transport = "auto"
 
         if self.checkpoint_every < 1:
             self.checkpoint_every = 1

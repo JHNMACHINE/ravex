@@ -91,6 +91,11 @@ class RavexRuntime:
     #: a job that has not established a transport has not got one.
     _byte_transport_ok = False
     _byte_group = None
+    #: None means the socket ring has not been tried yet, False that it was
+    #: and could not be had. Both roads move the same bytes, so a runtime
+    #: built with `__new__` starting on the collective one is the right
+    #: reading rather than a degraded one.
+    _ring_link = None
     #: Set only from `_install_signal_handler`'s closure - the one thing that
     #: code is allowed to do. See `on_step` for why.
     _emergency_requested = False
@@ -117,6 +122,11 @@ class RavexRuntime:
         #: to do it on. Settled once at activation; see `byte_transport_group`.
         self._byte_transport_ok = False
         self._byte_group = None
+        #: The socket ring, built on the first replication round that wants it
+        #: and kept for the process. `False` means it was tried and could not
+        #: be had, which is not the same as "not tried yet" and must not be
+        #: retried every round — see `_replication_link`.
+        self._ring_link: Any = None
         self._last_replicated_step: Optional[int] = None
         self._leader_optimizer_id: Optional[int] = None
         self._checkpoint_due = False
@@ -1061,6 +1071,12 @@ class RavexRuntime:
                 send_to=receive_from,
                 receive_from=send_to,
                 group=self._byte_group,
+                link=self._replication_link(send_to, receive_from),
+                # The copy travels to the rank it belongs to, so this round
+                # runs against the ring. On the socket road that cannot be read
+                # off the rank numbers - on two ranks the successor and the
+                # predecessor are the same peer - so it is said here.
+                forward=False,
             )
         except Exception as exc:
             logger.warning("Recovering this rank's store from a copy failed: %s", exc)
@@ -1085,6 +1101,59 @@ class RavexRuntime:
                 "brought back whole - starting from scratch.",
                 send_to,
             )
+
+    def _replication_link(self, send_to: int, receive_from: int):
+        """The socket ring for replication, or None to use the collectives.
+
+        Built once and kept: the connections outlive the round, which is what
+        makes the second round cheap — the manifest exchange happens over a
+        connection that is already up, and only the delta crosses. Built
+        *lazily* rather than at activation because a job that never replicates
+        should not open connections it will not use, and because the ring's
+        shape comes from `replication_ring`, which the caller has just worked
+        out.
+
+        A failure to build is remembered. The reasons a link cannot be made —
+        an unreachable hostname, a firewall between nodes — do not change from
+        one round to the next, and retrying every ten steps would turn a
+        one-line explanation into a log nobody reads.
+        """
+        if self.config.replication_transport == "collectives":
+            return None
+        if self._ring_link is False:
+            return None
+        if self._ring_link is not None:
+            return self._ring_link
+
+        from ravex._dist.replication import RingLink
+
+        store = None
+        try:
+            import torch.distributed as dist
+
+            if dist.is_available() and dist.is_initialized():
+                # Private, and deliberately reached through one `try`: this is
+                # the rendezvous every rank of a torchrun job already shares,
+                # and there is no public way to ask for it. If a torch release
+                # moves it, the socket road quietly stops being taken and the
+                # collective one keeps working.
+                store = dist.distributed_c10d._get_default_store()
+        except Exception:
+            store = None
+
+        if store is None:
+            if self.config.replication_transport == "sockets":
+                logger.warning(
+                    "replication_transport=sockets, but there is no rendezvous "
+                    "store to advertise addresses on - falling back to the "
+                    "collectives for this run"
+                )
+            self._ring_link = False
+            return None
+
+        link = RingLink.connect(get_rank(), send_to, receive_from, store)
+        self._ring_link = link if link is not None else False
+        return link
 
     def _replicate_if_due(self, step: int) -> None:
         """Trade stores around the ring, so no machine is the only copy.
@@ -1123,7 +1192,12 @@ class RavexRuntime:
             if self._backend is not None:
                 self._backend.consolidate()
             ok = exchange_stores(
-                source, destination, send_to, receive_from, group=self._byte_group
+                source,
+                destination,
+                send_to,
+                receive_from,
+                group=self._byte_group,
+                link=self._replication_link(send_to, receive_from),
             )
         except Exception as exc:
             logger.warning("Replication at step %d failed here: %s", step, exc)
@@ -1493,6 +1567,9 @@ class RavexRuntime:
                 self.checkpoint(final=True)
             if self._backend is not None:
                 self._backend.close()
+            if self._ring_link:
+                self._ring_link.close()
+                self._ring_link = None
             logger.info("Ravex shutdown complete at step %d", self.registry.step_count)
         except Exception as exc:
             logger.warning("Shutdown error: %s", exc)
