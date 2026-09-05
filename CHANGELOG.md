@@ -102,6 +102,46 @@
 
 ### Changed
 
+- **Both ends of a replication socket now prove they belong to the job
+  (GPU-112).**
+
+  The listening port GPU-109 opened on every rank is a surface the process
+  group never had: gloo and NCCL only ever speak to a member, and membership is
+  the launcher's to decide. Here anything that can reach the port can knock,
+  and a knock is not harmless — `StoreWriter` removes the completion marker
+  before the first byte lands, so a connection that arrives and then says
+  nothing is enough to stop a *good* replica from being read as one.
+
+  Rank 0 now generates a token and leaves it on the rendezvous store; a rank
+  dialling its successor presents it, and the listener answers with a digest of
+  the token bound to the rank that asked. Not a new trust boundary — whoever
+  can read that store is already inside the job. What it buys is that a
+  stranger who merely reaches the port is refused before any writer exists, and
+  that a rank never pushes a checkpoint into a port that cannot answer for
+  itself. A refusal costs that connection and nothing else: the listener keeps
+  waiting for the peer it expects, so a port scan cannot deny a rank its ring.
+
+  **What it is not**, said here because the alternative is someone assuming
+  otherwise: a shared secret in the clear on a connection nobody has encrypted.
+  It identifies, it does not protect. Against an attacker who can read the
+  traffic between two ranks or take over an established connection it does
+  nothing, and on a network where that is the threat
+  `replication_transport: collectives` is the answer — which is one of the
+  reasons that road stays supported.
+
+  **And a rank now advertises an address rather than its name.** Publishing
+  `socket.gethostname()` was the obvious thing and the wrong one: measured on a
+  Windows box with a Hyper-V interface, `create_connection` to this machine's
+  own name took **10.06 s**, because the name resolves to several addresses and
+  the first ones are on virtual interfaces that swallow the attempt until it
+  times out. By address it is instant. A GPU box with docker, WSL or a VPN has
+  exactly that shape, and there the cost is not a slow ring — it is a peer that
+  gives up before the right address is ever tried. What gets published is the
+  local address the routing table would use to reach the rendezvous, asked with
+  a UDP socket that sends nothing, with the hostname kept as the fallback. The
+  dial itself is capped at ten seconds rather than the link's whole budget, so
+  an address nothing can reach costs one attempt and then the collective road.
+
 - **The replica transport is Rust, and the pre-staging path does not come back
   through Python at all (GPU-109).**
 
