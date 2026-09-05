@@ -17,12 +17,18 @@
 //! something went wrong, which is a bug. `KeyError` means the caller has not
 //! recorded where a store lives.
 
+use std::collections::HashSet;
+use std::net::TcpStream;
+use std::path::{Path, PathBuf};
+
+use pyo3::buffer::PyBuffer;
 use pyo3::create_exception;
-use pyo3::exceptions::{PyException, PyKeyError, PyValueError};
+use pyo3::exceptions::{PyConnectionError, PyException, PyKeyError, PyOSError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyInt, PyList, PySet, PyTuple};
+use pyo3::types::{PyBytes, PyDict, PyInt, PyList, PySet, PyTuple};
 
 use crate::reshard::{self, Homes, Piece, Placement, ReshardError};
+use crate::transport::{self, TransportError};
 
 create_exception!(
     reshard,
@@ -527,6 +533,217 @@ pub fn register_reshard(module: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
+// ─── the transport: framing, and the socket under it ─────────────────────────
+
+/// Three Rust failures, three Python exceptions, and the split is the one the
+/// callers already make.
+///
+/// `ConnectionError` is what `elastic.py` raised when a peer hung up mid-round
+/// and what its callers catch: a machine that went away is the ordinary case
+/// replication exists to survive. `OSError` is a disk that said no.
+/// `ValueError` is a stream that is not the format, which is a bug in whoever
+/// wrote it.
+fn transport_err(error: TransportError) -> PyErr {
+    match error {
+        TransportError::Io(error) => PyOSError::new_err(error.to_string()),
+        TransportError::Protocol(what) => PyValueError::new_err(what),
+        TransportError::PeerClosed(what) => PyConnectionError::new_err(what),
+    }
+}
+
+fn skip_set(skip: Option<HashSet<String>>) -> HashSet<String> {
+    skip.unwrap_or_default()
+}
+
+/// Borrow the socket Python owns, for the length of one call.
+///
+/// `ManuallyDrop` because the descriptor belongs to the `socket` object on the
+/// other side of this boundary: closing it here would shut down a connection
+/// its owner still means to use for the next round, and the pre-staging design
+/// is built on that connection staying open.
+#[cfg(windows)]
+fn borrow_socket(handle: i64) -> std::mem::ManuallyDrop<TcpStream> {
+    use std::os::windows::io::FromRawSocket;
+    std::mem::ManuallyDrop::new(unsafe { TcpStream::from_raw_socket(handle as u64) })
+}
+
+#[cfg(unix)]
+fn borrow_socket(handle: i64) -> std::mem::ManuallyDrop<TcpStream> {
+    use std::os::unix::io::FromRawFd;
+    std::mem::ManuallyDrop::new(unsafe { TcpStream::from_raw_fd(handle as i32) })
+}
+
+/// Every file under a store, relative to it, with its size. Sorted.
+#[pyfunction]
+fn store_files(path: &str) -> PyResult<Vec<(String, u64)>> {
+    transport::store_files(Path::new(path)).map_err(|error| PyOSError::new_err(error.to_string()))
+}
+
+/// `(name, size)` pairs as bytes: what one side already holds.
+#[pyfunction]
+fn encode_manifest<'py>(
+    py: Python<'py>,
+    entries: Vec<(String, u64)>,
+) -> Bound<'py, PyBytes> {
+    PyBytes::new(py, &transport::encode_manifest(&entries))
+}
+
+#[pyfunction]
+fn parse_manifest(blob: &[u8]) -> PyResult<Vec<(String, u64)>> {
+    transport::parse_manifest(blob).map_err(transport_err)
+}
+
+/// Bytes a transfer will produce, without producing them.
+#[pyfunction]
+#[pyo3(signature = (path, skip = None))]
+fn encoded_size(path: &str, skip: Option<HashSet<String>>) -> PyResult<u64> {
+    transport::encoded_size(Path::new(path), &skip_set(skip))
+        .map_err(|error| PyOSError::new_err(error.to_string()))
+}
+
+/// A store as a stream of blocks, read from disk as it goes.
+///
+/// An iterator rather than a generator, and the blocks are ragged in exactly
+/// the places the Python generator's were — a header, then whatever came off
+/// each file — because `exchange_stores` re-cuts them with `fixed_chunks` and
+/// its tests are written against those boundaries.
+#[pyclass(module = "ravex._core")]
+struct StoreEncoder {
+    inner: transport::StoreEncoder,
+}
+
+#[pymethods]
+impl StoreEncoder {
+    #[new]
+    #[pyo3(signature = (path, chunk = transport::CHUNK, skip = None))]
+    fn new(path: &str, chunk: usize, skip: Option<HashSet<String>>) -> PyResult<Self> {
+        transport::StoreEncoder::new(Path::new(path), chunk, skip_set(skip))
+            .map(|inner| StoreEncoder { inner })
+            .map_err(|error| PyOSError::new_err(error.to_string()))
+    }
+
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyBytes>>> {
+        // The read happens without the GIL; only the copy into a Python
+        // `bytes` needs it. A store is gigabytes and the training thread is
+        // what would otherwise be waiting.
+        let block = py
+            .detach(|| self.inner.next_block())
+            .map_err(|error| PyOSError::new_err(error.to_string()))?;
+        Ok(block.map(|block| PyBytes::new(py, &block)))
+    }
+}
+
+/// Turns the stream back into files, writing as the bytes arrive.
+#[pyclass(module = "ravex._core")]
+struct StoreWriter {
+    inner: transport::StoreWriter,
+}
+
+#[pymethods]
+impl StoreWriter {
+    #[new]
+    fn new(path: &str) -> Self {
+        StoreWriter {
+            inner: transport::StoreWriter::new(Path::new(path)),
+        }
+    }
+
+    /// Take one chunk off the wire. Anything with a buffer will do.
+    ///
+    /// `exchange_stores` hands this a numpy view over a torch tensor, and
+    /// `prestage_receive` handed it `bytes`; a buffer is what both of those are
+    /// and neither is copied here.
+    ///
+    /// **The GIL is held for the write**, which is the one place in this file
+    /// that does I/O without releasing it. Releasing it would mean holding a
+    /// borrow into memory Python is free to reuse, and the alternative — copy
+    /// the chunk out first — is the copy this port exists to remove. The
+    /// pure-Python method this replaces held the GIL for all of it, including
+    /// the memmove, so nothing waits longer than it used to.
+    fn feed(&mut self, py: Python<'_>, block: PyBuffer<u8>) -> PyResult<()> {
+        if !block.is_c_contiguous() {
+            return Err(PyValueError::new_err(
+                "feed() needs a contiguous buffer; this one is strided",
+            ));
+        }
+        let cells = block
+            .as_slice(py)
+            .ok_or_else(|| PyValueError::new_err("feed() could not read the buffer"))?;
+        // Sound while the GIL is held: `ReadOnlyCell<u8>` is a transparent
+        // wrapper over the byte, and `block` keeps the exporter alive.
+        let bytes = unsafe { std::slice::from_raw_parts(cells.as_ptr().cast::<u8>(), cells.len()) };
+        self.inner.feed(bytes).map_err(transport_err)
+    }
+
+    /// The parsed header: `(name, size, already_there)` per entry, or None
+    /// before it has arrived. Underscored because it is not API — it is what
+    /// `tests/test_dist_replication.py` reads to assert that a skip flag does
+    /// not reorder the transfer.
+    #[getter]
+    fn _entries(&self) -> Option<Vec<(String, u64, bool)>> {
+        self.inner.entries()
+    }
+
+    /// Whether every file the header promised is present here, whole.
+    #[getter]
+    fn complete(&self) -> bool {
+        self.inner.complete()
+    }
+
+    fn close(&mut self) -> PyResult<()> {
+        self.inner.close().map_err(transport_err)
+    }
+
+    /// Drop what the source no longer has, then mark the copy good.
+    fn commit(&mut self, py: Python<'_>) -> PyResult<bool> {
+        py.detach(|| self.inner.commit()).map_err(transport_err)
+    }
+}
+
+/// Push a store down a socket Python already connected, skipping what the peer
+/// says it holds. Returns the bytes written.
+#[pyfunction]
+#[pyo3(signature = (fileno, source, chunk = transport::CHUNK))]
+fn prestage_send(py: Python<'_>, fileno: i64, source: &str, chunk: usize) -> PyResult<u64> {
+    let source = PathBuf::from(source);
+    py.detach(|| {
+        let guard = borrow_socket(fileno);
+        let mut stream: &TcpStream = &guard;
+        transport::prestage_send(&mut stream, &source, chunk)
+    })
+    .map_err(transport_err)
+}
+
+/// The other end: say what is already here, then take what comes back.
+#[pyfunction]
+fn prestage_receive(py: Python<'_>, fileno: i64, destination: &str) -> PyResult<bool> {
+    let destination = PathBuf::from(destination);
+    py.detach(|| {
+        let guard = borrow_socket(fileno);
+        let mut stream: &TcpStream = &guard;
+        transport::prestage_receive(&mut stream, &destination)
+    })
+    .map_err(transport_err)
+}
+
+pub fn register_transport(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add("CHUNK", transport::CHUNK)?;
+    module.add("COMPLETE_MARKER", transport::COMPLETE_MARKER)?;
+    module.add_class::<StoreEncoder>()?;
+    module.add_class::<StoreWriter>()?;
+    module.add_function(wrap_pyfunction!(store_files, module)?)?;
+    module.add_function(wrap_pyfunction!(encode_manifest, module)?)?;
+    module.add_function(wrap_pyfunction!(parse_manifest, module)?)?;
+    module.add_function(wrap_pyfunction!(encoded_size, module)?)?;
+    module.add_function(wrap_pyfunction!(prestage_send, module)?)?;
+    module.add_function(wrap_pyfunction!(prestage_receive, module)?)?;
+    Ok(())
+}
+
 /// The compiled half of Ravex.
 ///
 /// Underscored because nothing outside the package should import it:
@@ -541,6 +758,7 @@ pub fn register_reshard(module: &Bound<'_, PyModule>) -> PyResult<()> {
 #[pymodule]
 fn _core(module: &Bound<'_, PyModule>) -> PyResult<()> {
     register_reshard(module)?;
+    register_transport(module)?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

@@ -10,7 +10,12 @@ other two are measured against.
 **encode** - `encode_store` read off disk and thrown away, sender side only.
 Framing plus disk, no network.
 
-**exchange** - `exchange_stores`, the path a replication round actually takes.
+**exchange** - `exchange_stores`, the path a replication round takes between
+ranks of one job: torch collectives carrying the bytes, over the framing.
+
+**prestage** - `prestage_send`/`prestage_receive`, the same store over a socket
+of our own. Rust end to end since GPU-109, including the loop; the arm exists to
+be compared against `exchange` on the same store in the same run.
 
 GPU-84 ran exactly this on 2026-08-21 (128 cores, 4 GiB in 8 files) and found
 1462 MB/s on the wire, 3411 MB/s encoding, and **529 MB/s** through the real
@@ -41,10 +46,13 @@ import shutil
 import tempfile
 import time
 
+import socket
+
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from ravex._dist.elastic import prestage_receive, prestage_send
 from ravex._dist.replication import (
     encode_store,
     encoded_size,
@@ -134,6 +142,49 @@ def arm_exchange(rank: int, source: str, destination: str, chunk: int) -> float:
     return elapsed
 
 
+def arm_prestage(rank: int, source: str, destination: str, chunk: int) -> float:
+    """The Rust socket path, one way, on a connection this function makes.
+
+    A fresh destination each time for the same reason `arm_exchange` wipes
+    one: a second round over a store that is already there measures the skip
+    list, which is a different question and a much larger number.
+    """
+    if rank == 1:
+        shutil.rmtree(destination, ignore_errors=True)
+        os.makedirs(destination, exist_ok=True)
+
+    listening = None
+    port = torch.zeros(1, dtype=torch.int64)
+    if rank == 1:
+        listening = socket.socket()
+        listening.bind(("127.0.0.1", 0))
+        listening.listen(1)
+        port[0] = listening.getsockname()[1]
+    dist.broadcast(port, src=1)
+
+    dist.barrier()
+    started = time.perf_counter()
+    if rank == 0:
+        peer = socket.create_connection(("127.0.0.1", int(port[0].item())))
+        try:
+            prestage_send(peer, source, chunk)
+        finally:
+            peer.close()
+        elapsed = time.perf_counter() - started
+    else:
+        connection, _ = listening.accept()
+        try:
+            ok = prestage_receive(connection, destination)
+        finally:
+            connection.close()
+            listening.close()
+        elapsed = time.perf_counter() - started
+        if not ok:
+            raise RuntimeError("the pre-staged store did not arrive whole")
+    dist.barrier()
+    return elapsed
+
+
 def worker(rank: int, args, root: str, results) -> None:
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", str(args.port))
@@ -170,6 +221,12 @@ def worker(rank: int, args, root: str, results) -> None:
         if rank == 1:
             results.append(("exchange", chunk_mib, seconds, framed))
 
+    for chunk_mib in args.chunks:
+        chunk = chunk_mib * MIB
+        seconds = arm_prestage(rank, source, os.path.join(root, "prestaged"), chunk)
+        if rank == 1:
+            results.append(("prestage", chunk_mib, seconds, framed))
+
     dist.destroy_process_group()
 
 
@@ -200,7 +257,7 @@ def main() -> None:
         if not args.keep:
             shutil.rmtree(root, ignore_errors=True)
 
-    order = {"wire": 0, "encode": 1, "exchange": 2}
+    order = {"wire": 0, "encode": 1, "exchange": 2, "prestage": 3}
     rows.sort(key=lambda row: (order[row[0]], row[1]))
 
     print()
