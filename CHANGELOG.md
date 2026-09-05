@@ -78,6 +78,69 @@
   read a shape out of it short of unpickling the lot. Needs Moonclip >= 0.1.0
   for the fast path.
 
+- **The reshard planner is Rust, and Ravex is no longer a pure Python package
+  (GPU-105).**
+
+  `ravex._dist.reshard` — the arithmetic that lines a per-rank checkpoint up
+  with a different number of ranks — is now a crate in `src/`, reached through
+  PyO3 and built into the wheel by maturin. Same shape as Moonclip: a Rust
+  engine with a thin Python surface.
+
+  **The import path did not change.** `from ravex._dist.reshard import
+  plan_reshard` works as it always did; that module is now twenty lines of
+  re-export over `ravex._core`. Every function takes what it took, returns what
+  it returned and raises what it raised, down to the wording of the messages.
+  That was the condition of the port rather than a courtesy:
+  `tests/test_dist_reshard.py` and `tests/test_dist_reshard_locality.py` were
+  written against the Python implementation and were **not touched**, so 408
+  tests written for the old code are what the new code is held to. A port whose
+  tests had to be edited to pass would have proved nothing.
+
+  `reshard.py` went first because it was the one module with no excuse: no
+  torch, no process group, no I/O, and a suite that already covered every
+  `N -> M` pair in a range rather than the one pair a GPU box happens to have.
+  The planner's own tests now run twice — once in `cargo test`, with no
+  interpreter and no torch, and once through pytest as before.
+
+  **What this costs, stated plainly, because it is the whole decision.** Until
+  now `pip install ravex` worked everywhere, and only the Moonclip backend was
+  tied to Linux x86_64. That constraint has moved onto Ravex itself: wheels are
+  built per interpreter for Linux x86_64, and anywhere else pip falls back to
+  the source distribution, which needs a Rust toolchain to build. The
+  alternative was an optional core with the Python kept as a fallback — two
+  implementations of the same arithmetic, drifting quietly, with the exhaustive
+  test suite proving only whichever one happened to be loaded. One
+  implementation and a narrower install was judged the better trade; if it turns
+  out to be the wrong one, the Python is in the history and the boundary is a
+  single module.
+
+  Not ported, and not for want of trying: `_patches.py`, `_registry.py` and
+  `_runtime.py` live on introspecting live Python objects, and moving them would
+  mean crossing the PyO3 boundary on every `optimizer.step()`. `_bootstrap.py`
+  stays pure Python and nearly free because it runs in **every** interpreter on
+  the machine once the `.pth` is installed — a compiled extension loaded there
+  is the opposite of what that file is for. `ravex/__init__.py` imports nothing
+  from the core for the same reason, so the startup cost the package is careful
+  about is unchanged.
+
+- **The build backend is maturin, and `setup.py` is gone.**
+
+  `ravex_autoload.pth` still lands in `site-packages`, which is the only place
+  Python will execute it from; it is now placed by `[tool.maturin] include`
+  rather than by a custom `build_py` command. The trap that made a custom
+  command necessary is unchanged and worth keeping written down: `data_files`
+  looks like the answer and installs the file one directory *above*
+  site-packages, where it arrives, looks installed, and is never run. The
+  release workflow now asserts the file is at the root of every wheel it
+  publishes, rather than leaving that to be discovered by someone whose Ravex
+  silently never activates.
+
+  The version number is now written twice — `Cargo.toml`, which is what maturin
+  builds the wheel from, and `ravex/__init__.py`, which is what `ravex status`
+  prints — because maturin has no equivalent of setuptools' `dynamic = {attr}`.
+  `tests/test_version_is_single.py` fails if the two ever disagree, and the
+  release workflow checks both against the tag.
+
 ## 0.0.5 — 2026-08-30
 
 ### Added
@@ -266,7 +329,6 @@
   Checkpoints written before this are still read: both the short form and the
   long `Shard(dim=0)` one are parsed back. Nothing about resuming an existing
   checkpoint at the same world size changes.
-
 
 - **The Moonclip backend now builds `MoonclipManager` rather than
   `CheckpointManager`.** Ravex owns the topology and hands Moonclip a value;

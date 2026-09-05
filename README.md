@@ -7,12 +7,17 @@ does not change — not one line, not one import.
 pip install ravex
 ```
 
-Ravex itself is pure Python and installs anywhere. Its default checkpoint engine,
-[Moonclip](https://codeberg.org/JHNMACHINE/moonclip), ships wheels for Linux
-x86_64 only — so `pip install "ravex[moonclip]"` is a Linux thing, and on any
-other platform Ravex falls back to `torch_save` on its own. What changed between
-versions is in
-[CHANGELOG.md](https://codeberg.org/JHNMACHINE/ravex/src/branch/main/CHANGELOG.md).
+Ravex has a small Rust core — the reshard planner — so wheels are built per
+interpreter for Linux x86_64. On any other platform pip falls back to the source
+distribution, which builds if you have a Rust toolchain. Through 0.0.5 Ravex was
+pure Python and installed anywhere; what that bought and what it cost is in the
+[CHANGELOG](https://codeberg.org/JHNMACHINE/ravex/src/branch/main/CHANGELOG.md),
+along with everything else that changed between versions.
+
+Its default checkpoint engine, [Moonclip](https://codeberg.org/JHNMACHINE/moonclip),
+ships wheels for the same platform — so `pip install "ravex[moonclip]"` is a
+Linux thing, and where it is unavailable Ravex falls back to `torch_save` on its
+own.
 
 Drop a `ravex.yaml` next to your code and run what you always ran:
 
@@ -286,12 +291,13 @@ and nothing in `_interop` is imported by anything outside it except `_runtime`.
 
 | Path | |
 |---|---|
-| `tests/` | 812 unit tests, in-process, no GPU and no container. Named for what they cover: `test_dist_*`, `test_interop_*` |
+| `tests/` | 821 unit tests, in-process, no GPU and no container. Named for what they cover: `test_dist_*`, `test_interop_*` |
 | `integration/` | What only exists across a real process boundary — the `.pth`, a resume from an empty interpreter, `torchrun`. Linux, in Docker |
 | `integration/scripts/` | The training scripts those tests kill and restart |
 | `integration/multinode/` | One container per rank, for questions `--nproc_per_node` cannot ask ([README](integration/multinode/README.md)) |
 | `integration/two-machines/` | The rented-box harness: two real hosts, real network |
 | `docs/` | [configuration.md](docs/configuration.md), [how-it-works.md](docs/how-it-works.md) |
+| `src/` | The Rust core: `reshard.rs` is the planner, `python.rs` is the only file that knows an interpreter exists |
 | `.forgejo/workflows/` | `checks.yml` on branches; `ci.yml` on main adds the moonclip backend and both integration jobs |
 
 As of 0.0.5 that is about 10.5k lines across 23 modules.
@@ -301,6 +307,15 @@ As of 0.0.5 that is about 10.5k lines across 23 modules.
 ```bash
 pip install -e ".[dev]"
 pytest
+```
+
+That editable install compiles the Rust core into the source tree, so it needs a
+toolchain: `rust-toolchain.toml` names the version and rustup will fetch it. The
+half of the engine that has no Python in it has its own tests, and they are the
+faster gate — no interpreter, no torch, milliseconds:
+
+```bash
+cargo test --no-default-features
 ```
 
 The unit suite runs in-process. The parts that only exist across a real process

@@ -1,0 +1,41 @@
+[package]
+name = "ravex"
+# Duplicated from `ravex/__init__.py`, and the duplication is forced: maturin
+# builds the wheel from *this* number, and there is no equivalent of
+# setuptools' `dynamic = ["version"]` reading it out of a Python attribute.
+#
+# `tests/test_version_is_single.py` fails if the two drift, which is the only
+# reason the duplication is tolerable — a version the CLI reports and a version
+# pip installed disagreeing is precisely the failure the old comment in
+# `__init__.py` existed to prevent.
+version = "0.0.5"
+edition = "2021"
+# Set by pyo3 0.29, the highest MSRV among the dependencies. Declared so a
+# toolchain that is too old fails with that message rather than with an
+# unrelated error from deep inside a dependency.
+rust-version = "1.83"
+description = "The arithmetic core of Ravex: reshard planning, checkpoint format readers"
+license = "Apache-2.0"
+repository = "https://codeberg.org/JHNMACHINE/ravex"
+readme = "README.md"
+publish = false
+
+[lib]
+name = "ravex_core"
+# rlib so the planner can be linked from another Rust program — the
+# cross-machine cost tool in `integration/two-machines/` is the first
+# candidate — and cdylib for the Python extension module.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.29", features = ["extension-module"], optional = true }
+# For the legacy placement strings only. Hand-rolling those three patterns was
+# the alternative and was rejected: Python's `\d`, `\w` and `\s` are
+# Unicode-aware in `str` patterns and so are this crate's, while an ASCII
+# hand-parser would silently disagree with the module it is replacing on
+# exactly the inputs nobody thought to test.
+regex = "1"
+
+[features]
+default = ["extension-module"]
+extension-module = ["dep:pyo3"]

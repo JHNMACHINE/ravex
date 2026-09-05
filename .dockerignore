@@ -12,3 +12,6 @@ ravex.log
 dist
 build
 *.egg-info
+
+# Cargo build output: gigabytes, and rebuilt inside the image anyway.
+target

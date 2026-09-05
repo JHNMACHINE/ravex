@@ -41,12 +41,25 @@ RUN pip install --no-cache-dir "transformers>=4.40" "accelerate>=1.1" "lightning
 # communication extension on first use, and without a compiler the failure is
 # an ImportError about a `.so` that was never built — which reads like a broken
 # install rather than a missing build tool.
-RUN apt-get update && apt-get install -y --no-install-recommends g++ \
+RUN apt-get update && apt-get install -y --no-install-recommends g++ curl \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir deepspeed
 
+# Rust, since GPU-105: the reshard planner is a compiled extension and
+# `pip install -e .` builds it. Debian's rustc is far too old and
+# `rust-toolchain.toml` pins 1.97.1, so that exact version is installed here —
+# naming a different one only makes rustup fetch a second compiler to satisfy
+# the toolchain file.
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.97.1 --profile minimal
+ENV PATH="/root/.cargo/bin:${PATH}"
+
 WORKDIR /app
 COPY pyproject.toml README.md LICENSE NOTICE ./
+# The crate. `Cargo.lock` is copied too: the image is a test environment, and a
+# dependency resolving differently here than in CI is a difference nobody asked
+# for and nobody would look for.
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY src ./src
 COPY ravex ./ravex
 COPY tests ./tests
 COPY integration ./integration

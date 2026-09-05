@@ -10,6 +10,11 @@ name: Checks
 # integration suite. Those still gate nothing until main — that is the trade
 # taken when the pipeline moved off pull requests.
 #
+# Since GPU-105 this also compiles the crate, which is the largest single item
+# in the job. `cargo test` runs before pytest: the planner's own tests need no
+# interpreter, they finish in milliseconds, and a failure there is a smaller
+# thing to read than the same failure arriving through pytest.
+#
 # 3.12 is the version to run here because it is the one the Moonclip backend
 # and the integration jobs also use, so a break there is the likeliest to be
 # caught by this rather than only later.
@@ -24,10 +29,15 @@ jobs:
     container:
       image: python:3.12-bookworm
     steps:
-      - name: Install git
+      - name: Install git and Rust
         run: |
           apt-get update -qq
-          apt-get install -y -qq git
+          apt-get install -y -qq git build-essential
+          # Debian bookworm ships rustc 1.63 and `rust-toolchain.toml` asks for
+          # 1.97.1. Pinning the same version here matters: rustup honours the
+          # toolchain file regardless, so a different `--default-toolchain`
+          # means downloading two compilers to use one.
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.97.1 --profile minimal
 
       # Not shallow: `--depth 1` fetches only the default branch's tip, so the
       # pushed commit is missing from the clone and the job quietly tests main
@@ -38,9 +48,28 @@ jobs:
           git clone ${{ forgejo.server_url }}/${{ forgejo.repository }}.git .
           git checkout ${{ forgejo.sha }}
 
+      # The half of the engine that has no Python in it. Fast, and it fails with
+      # a Rust error rather than with a Python traceback wrapped around one.
+      - name: Planner tests
+        run: |
+          set -eu
+          . "$HOME/.cargo/env"
+          # Without the extension. `cargo test` cannot link one: a test binary
+          # built with `extension-module` has no libpython behind it, so it
+          # fails on undefined Python symbols rather than on anything real. The
+          # planner's tests need no interpreter anyway, which is the point of
+          # keeping it free of pyo3.
+          cargo test --no-default-features --locked
+          cargo clippy --no-default-features --locked -- -D warnings
+          # And with it, so `src/python.rs` is linted too — the previous line
+          # compiles that file out entirely, and a boundary nobody lints is
+          # where the unchecked conversions accumulate.
+          cargo clippy --locked -- -D warnings
+
       - name: Unit suite on 3.12
         run: |
           set -eu
+          . "$HOME/.cargo/env"
           # torch is not a dependency of Ravex - it is the thing Ravex hooks,
           # and declaring it would decide the build (CPU or CUDA) for everyone
           # who installs. But five test modules import it at module scope, so
@@ -56,5 +85,8 @@ jobs:
           # keep a second copy of the wheel on top. Nothing here is ever reused
           # - the container is thrown away - so the cache buys nothing.
           pip install --quiet --no-cache-dir --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple torch
+          # `-e .` is a maturin editable install since GPU-105: it compiles the
+          # crate and puts `_core` in the source tree, so this is where the
+          # build cost lands.
           pip install --quiet -e . pytest
           pytest tests -q

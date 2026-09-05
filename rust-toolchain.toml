@@ -1,0 +1,19 @@
+# The toolchain this repository is developed and tested against, pinned for the
+# same reason Moonclip's is: local and CI diverging silently is discovered the
+# wrong way round, as a red `cargo clippy` on a machine where nothing broke.
+#
+# Keep in step with the rustup line in `.forgejo/workflows/*.yml`. Those pin the
+# same version and are what actually runs the gate; this makes a contributor's
+# rustup agree with it instead of finding out later.
+#
+# The patch number is not decoration. `channel = "1.97"` does not match the
+# `1.97.1-x86_64-unknown-linux-gnu` a pinned rustup install is named, so rustup
+# syncs the 1.97 channel and downloads a second copy of the same compiler on
+# every job of every workflow. Measured in Moonclip's container: 31s against
+# 1.4s.
+#
+# **This is not the MSRV.** `rust-version` in Cargo.toml says 1.83, which is
+# what pyo3 needs; a rust-toolchain.toml only applies inside this directory.
+[toolchain]
+channel = "1.97.1"
+components = ["clippy"]

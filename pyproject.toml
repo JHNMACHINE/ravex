@@ -1,10 +1,20 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.build_meta"
+# maturin, since GPU-105: the reshard planner is Rust and the wheel has a
+# compiled extension in it. The cost is stated plainly because it is the whole
+# trade of that issue — a Ravex wheel is now platform-specific, where a pure
+# Python one installed anywhere, and building from source needs a Rust
+# toolchain rather than only a C compiler that is never invoked.
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
 
 [project]
 name = "ravex"
-# Read from ravex/__init__.py; see [tool.setuptools.dynamic] below.
+# Read from Cargo.toml, which is where maturin looks and the only place it will
+# look: there is no equivalent of setuptools' `dynamic = {attr = ...}` reading a
+# Python attribute. `ravex/__init__.py` still carries the literal because
+# `ravex status` reports it and importing the package to print a version is what
+# the CLI is trying to avoid; `tests/test_version_is_single.py` fails if the two
+# ever disagree.
 dynamic = ["version"]
 description = "Transparent checkpoint and resume for PyTorch training, with no changes to your training code"
 readme = "README.md"
@@ -70,18 +80,50 @@ Changelog = "https://codeberg.org/JHNMACHINE/ravex/src/branch/main/CHANGELOG.md"
 [project.scripts]
 ravex = "ravex._cli:main"
 
-[tool.setuptools]
-# Listed explicitly rather than discovered: `find` would also sweep up `tests`,
-# `bench` and `integration`, which are in the repository and not in the wheel.
-# The cost is that a new subpackage has to be added here or it silently does not
-# ship — the import works in a checkout and fails after `pip install`.
-packages = ["ravex", "ravex._dist", "ravex._interop"]
+[tool.maturin]
+# `ravex/` at the repository root is the Python half of a mixed project;
+# maturin finds it from `module-name` and puts the compiled `_core` inside it.
+# Subpackages no longer have to be listed the way setuptools needed — what is
+# under `ravex/` ships, and `tests`, `bench` and `integration` are outside it.
+module-name = "ravex._core"
+features = ["extension-module"]
 
-[tool.setuptools.dynamic]
-version = { attr = "ravex.__version__" }
+# The autoloader has to land in **purelib** — the `site-packages` directory
+# itself — and this is the declaration that puts it there. It used to take a
+# custom `build_py` in setup.py, for a reason worth keeping written down: the
+# obvious answer is `data_files`, and it is a trap. That puts the file in the
+# wheel's `.data/data/` directory, which pip installs relative to `sys.prefix`
+# — in a virtualenv, one level *above* site-packages. The file arrives, looks
+# installed, and is never executed, because Python only runs `.pth` files found
+# in a site directory.
+#
+# Because it is a wheel entry it is also in RECORD, which is what makes
+# `pip uninstall ravex` take it away again. That matters more than it looks: an
+# orphaned `.pth` importing a module that no longer exists is the classic way
+# this scheme breaks, and it is not a risk here.
+#
+# CHANGELOG.md is sdist-only and was MANIFEST.in's job until maturin took over
+# the sdist: the source archive is what a distribution packager or an auditor
+# reads, and it was the one place the release notes were missing.
+include = [
+    { path = "ravex_autoload.pth", format = ["sdist", "wheel"] },
+    { path = "CHANGELOG.md", format = "sdist" },
+]
 
-[tool.setuptools.package-data]
-ravex = ["py.typed"]
+# maturin copies whatever sits under the Python source directory. Every
+# Moonclip 0.0.4 wheel shipped a `__pycache__/` full of cp314 `.pyc` files for
+# exactly this reason — built from a tree where the tests had already run.
+# `build/` and `dist/` are the second half of that: they are gitignored, but
+# maturin globs the working tree rather than asking git, so a leftover
+# `build/lib/ravex/` from the setuptools era shipped a *second*, stale copy of
+# every module inside the source distribution.
+exclude = [
+    "**/__pycache__/**",
+    "**/*.py[cod]",
+    "build/**",
+    "dist/**",
+    "target/**",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
