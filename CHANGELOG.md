@@ -102,6 +102,54 @@
 
 ### Changed
 
+- **`all_ranks_agree` asks the rendezvous store instead of the collectives
+  (GPU-111).**
+
+  It keeps a resume all-or-nothing — one rank quietly starting from scratch
+  while the others restore is a job that stops making progress without failing
+  — and it did that by pickling a Python bool across two collectives to move
+  one bit. Now every rank writes its answer under a key and reads the others'
+  with one `wait` and one `multi_get`. Same question, same answer, and
+  `ravex/_dist/agreement.py` is the one primitive underneath: an all-gather of
+  a *scalar*, not an `all_reduce`, because none of the things Ravex needs its
+  ranks to agree about is a tensor.
+
+  **The difference that matters is not the microseconds.** A collective waits
+  for a missing rank and then fails the whole group; here the question has a
+  deadline, and running out of it *is* the answer — a rank that never said it
+  succeeded did not — and the log names which rank went silent, which a group
+  timeout never could.
+
+  **The microseconds, measured, and bounded.** `bench/agreement_cost.py` at 4
+  ranks on loopback: 1544 µs over the collectives against 849 µs here. That is
+  1.8x, not the twenty a bare store lookup (70–98 µs) would suggest, and the
+  gap between those two numbers is worth keeping straight: **a gather cannot
+  escape waiting for the slowest rank on any medium**. With 5 ms of skew on one
+  rank both roads pay it, 5.9 ms here against 6.9 ms there. What the store
+  changes for a gather is the cost of the mechanism, not the cost of waiting.
+
+  **The first implementation was slower than what it replaced**, and it is
+  recorded here because the bench is the only reason anyone found out. Polling
+  `check` on a ladder of sleeps and then reading each answer with its own `get`
+  measured **1592 µs** — worse than the 1088 µs collective — because a rank
+  arriving 100 µs late still costs a whole sleep, and four answers were four
+  round trips. `store.wait` blocks on the server and wakes on the write;
+  `multi_get` reads them together. Three round trips and no sleeping. The
+  polling road survives as the fallback for a store without those methods, with
+  the number attached to it so nobody mistakes it for the fast one.
+
+  `agreement_transport` (`auto` by default, or `store` / `collectives`) is the
+  knob. The collective road is kept for a reason that is not performance: a
+  store round decides on its own when a rank goes quiet, and a job that would
+  rather fail together than proceed without one rank wants the old behaviour.
+
+  Only this one function moved. `agree_on_step` is next and is the same shape;
+  `gather_visible_stores` and `agree_on_run_id` carry structures rather than
+  scalars, and they stay where they are until someone decides how a
+  peer-written blob should be parsed — that is a security question, not an
+  encoding one. `emergency_signalled`, the one that runs every step, is a
+  different design and not a port: see GPU-111.
+
 - **Both ends of a replication socket now prove they belong to the job
   (GPU-112).**
 
