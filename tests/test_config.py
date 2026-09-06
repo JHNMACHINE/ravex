@@ -301,3 +301,126 @@ def test_a_junk_save_dtype_in_the_environment_falls_back_and_says_so(monkeypatch
     config = RavexConfig.load()
     assert config.resolve_save_dtype() is None
     assert any("not a dtype" in p for p in config.problems), config.problems
+
+
+# ─── the storage section, from both ways in ────────────────────────────
+
+
+def test_a_mapping_for_storage_becomes_a_storage_config():
+    """The obvious thing to reach for, because `ravex.yaml` spells it that way.
+
+    It used to replace the dataclass with the dict, and the failure arrived
+    several frames later as `AttributeError: 'dict' object has no attribute
+    'path'` from inside `_normalize`, naming neither `storage` nor the
+    decorator that passed it.
+    """
+    from ravex._config import StorageConfig
+
+    config = RavexConfig()
+    config.apply_storage({"path": "./elsewhere", "type": "s3", "bucket": "b"})
+
+    assert isinstance(config.storage, StorageConfig)
+    assert config.storage.path == "./elsewhere"
+    assert config.storage.is_remote
+    # Untouched keys keep their defaults rather than being cleared.
+    assert config.storage.region == "us-east-1"
+    config._normalize()
+    assert config.problems == []
+
+
+def test_a_storage_config_passes_through_unchanged():
+    from ravex._config import StorageConfig
+
+    config = RavexConfig()
+    given = StorageConfig(path="./given")
+    config.apply_storage(given)
+    assert config.storage is given
+
+
+def test_a_bad_storage_section_in_a_file_is_recorded_not_raised():
+    """A config file must never stop a training run - it degrades and says so."""
+    config = RavexConfig()
+    config.apply_storage("./just-a-path")
+
+    assert config.storage.path == "./checkpoints", "the defaults did not stand"
+    assert len(config.problems) == 1
+    assert "storage=" in config.problems[0]
+
+
+def test_an_unknown_storage_key_in_a_file_is_recorded_rather_than_dropped():
+    config = RavexConfig()
+    config.apply_storage({"pth": "./typo"})
+
+    assert config.storage.path == "./checkpoints"
+    assert "unknown storage option 'pth'" in config.problems[0]
+    assert "path" in config.problems[0], "the message does not say what is valid"
+
+
+def test_a_property_on_storage_is_not_something_to_assign_to():
+    """`hasattr` accepts `is_remote` and assigning to it raises from nowhere.
+
+    The field list is the dataclass's own for this reason: `is_remote` is a
+    property with no setter and `resolve_credentials` is a method.
+    """
+    config = RavexConfig()
+    config.apply_storage({"is_remote": True})
+    assert "unknown storage option 'is_remote'" in config.problems[0]
+
+
+def test_yaml_still_reaches_the_storage_section(tmp_path, monkeypatch):
+    """The file path goes through the same function, so it keeps working."""
+    path = tmp_path / "ravex.yaml"
+    path.write_text(
+        textwrap.dedent(
+            """
+            storage:
+              path: ./from-yaml
+              type: local
+            """
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("RAVEX_CONFIG", str(path))
+    assert RavexConfig.load().storage.path == "./from-yaml"
+
+
+@pytest.mark.parametrize(
+    "bad, expected",
+    [
+        ("./a-bare-path", "storage="),
+        (["./a", "./b"], "storage="),
+        ({"pth": "./typo"}, "unknown storage option 'pth'"),
+    ],
+)
+def test_the_decorator_refuses_a_storage_it_cannot_use(bad, expected, tmp_path,
+                                                       monkeypatch):
+    """A keyword typed at the call site raises, like an unknown option does.
+
+    The opposite of the file: this is the most specific thing that could have
+    said so, and degrading it silently would train against a path nobody wrote.
+    """
+    import ravex
+
+    monkeypatch.delenv("RAVEX_CONFIG", raising=False)
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(TypeError, match=expected):
+
+        @ravex.train_loop(storage=bad, enabled=False)
+        def train():
+            pass
+
+        train()
+
+
+def test_the_decorator_takes_a_storage_mapping(tmp_path, monkeypatch):
+    import ravex
+    from ravex._runtime import get_runtime
+
+    monkeypatch.delenv("RAVEX_CONFIG", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    @ravex.train_loop(storage={"path": str(tmp_path / "here")}, enabled=False)
+    def train():
+        return get_runtime().config.storage.path
+
+    assert train() == str(tmp_path / "here")
