@@ -1,0 +1,340 @@
+"""GPU-115: collecting the round with a deadline instead of a collective.
+
+Real sockets on loopback, a store made of a dictionary. The store is fake
+because what is under test is the protocol — the rendezvous on a round number,
+the deadline, the token — and not torch's key-value server, which is the same
+split ``tests/test_dist_agreement.py`` makes for the same reason.
+
+The sockets are **not** fake, and that is deliberate. Every claim this module
+makes is about what happens when the other end does not behave: a node that
+never starts, one that answers late, one that answers with another model's
+tensors, one that reached the port without belonging to the job. None of those
+can be produced by a stub that stands in for the network, because in each of
+them the network is the thing doing the work.
+"""
+
+import os
+import threading
+import time
+
+import pytest
+
+torch = pytest.importorskip("torch")
+pytest.importorskip("moonclip")
+
+from ravex._dist import report as _report  # noqa: E402
+from ravex._dist.exchange import ADDRESS_KEY, DeltaExchange  # noqa: E402
+
+
+class FakeStore:
+    """The three methods this module asks of a rendezvous store."""
+
+    def __init__(self):
+        self.values = {}
+        self.lock = threading.Lock()
+
+    def set(self, key, value):
+        with self.lock:
+            self.values[key] = value
+
+    def get(self, key):
+        with self.lock:
+            return self.values[key]
+
+    def check(self, keys):
+        with self.lock:
+            return all(key in self.values for key in keys)
+
+
+def a_delta(scale=1.0):
+    torch.manual_seed(0)
+    return {"w": torch.randn(3, 4) * scale, "b": torch.randn(3) * scale}
+
+
+@pytest.fixture
+def store():
+    return FakeStore()
+
+
+@pytest.fixture
+def nodes(store, tmp_path):
+    """Two started exchanges, closed however the test ends."""
+    made = []
+
+    def make(rank):
+        exchange = DeltaExchange(
+            rank,
+            store,
+            root=os.path.join(str(tmp_path), "rank%d" % rank),
+            node="n%d" % rank,
+            patience=5.0,
+        )
+        assert exchange.start(), "rank %d could not open its listener" % rank
+        made.append(exchange)
+        return exchange
+
+    yield make
+    for exchange in made:
+        exchange.close()
+
+
+def publish(exchange, delta, round_number, steps):
+    exchange.publish(delta, round_number, steps)
+
+
+def test_two_nodes_trade_a_round(nodes):
+    zero, one = nodes(0), nodes(1)
+    mine, theirs = a_delta(), a_delta(scale=2.0)
+    publish(zero, mine, 0, 10)
+    publish(one, theirs, 0, 25)
+
+    got = zero.gather([1], 0, _report.expectation(mine), time.monotonic() + 10)
+
+    assert len(got) == 1
+    assert got[0].node == "n1"
+    assert got[0].steps == 25
+    assert torch.equal(got[0].delta["w"], theirs["w"])
+
+
+def test_the_step_counts_come_back_differing(nodes):
+    """A heterogeneous round is the normal case, not an anomaly to reconcile."""
+    zero, one, two = nodes(0), nodes(1), nodes(2)
+    delta = a_delta()
+    publish(zero, delta, 0, 100)
+    publish(one, delta, 0, 20)
+    publish(two, delta, 0, 63)
+
+    got = zero.gather([1, 2], 0, _report.expectation(delta), time.monotonic() + 10)
+    assert sorted(report.steps for report in got) == [20, 63]
+
+
+def test_a_node_that_never_answers_is_an_absence_and_not_a_failure(nodes, caplog):
+    """The whole fault tolerance of GPU-113, on a real socket.
+
+    Rank 1 has an address on the store and nothing behind it, which is what a
+    box that was killed between advertising and publishing looks like.
+    """
+    zero = nodes(0)
+    delta = a_delta()
+    publish(zero, delta, 0, 10)
+    zero.store.set(ADDRESS_KEY % 1, b"127.0.0.1:1")
+
+    with caplog.at_level("WARNING", logger="ravex"):
+        started = time.monotonic()
+        got = zero.gather([1], 0, _report.expectation(delta), started + 3)
+
+    assert got == []
+    assert (time.monotonic() - started) < 10
+    assert "did not contribute" in caplog.text
+
+
+def test_one_silent_node_does_not_cost_the_others_their_round(nodes):
+    """A collective would have failed the group; here the others are untouched."""
+    zero, one = nodes(0), nodes(1)
+    delta = a_delta()
+    publish(zero, delta, 0, 10)
+    publish(one, delta, 0, 11)
+    zero.store.set(ADDRESS_KEY % 2, b"127.0.0.1:1")
+
+    got = zero.gather([1, 2], 0, _report.expectation(delta), time.monotonic() + 3)
+
+    assert [report.node for report in got] == ["n1"]
+
+
+def test_a_node_that_never_advertised_is_simply_not_there(nodes):
+    zero = nodes(0)
+    delta = a_delta()
+    publish(zero, delta, 0, 10)
+    got = zero.gather([7], 0, _report.expectation(delta), time.monotonic() + 1)
+    assert got == []
+
+
+def test_a_peer_still_finishing_its_round_is_waited_for(nodes):
+    """The rendezvous. Under a wall clock the peer is about to publish.
+
+    A refusal here would mean every node needing to know in advance when the
+    others will be ready, and there is no channel that carries that.
+    """
+    zero, one = nodes(0), nodes(1)
+    delta = a_delta()
+    publish(zero, delta, 0, 10)
+
+    def late():
+        time.sleep(0.4)
+        publish(one, delta, 0, 99)
+
+    threading.Thread(target=late, daemon=True).start()
+    got = zero.gather([1], 0, _report.expectation(delta), time.monotonic() + 10)
+
+    assert len(got) == 1 and got[0].steps == 99
+
+
+def test_a_peer_already_past_the_round_says_so_instead_of_hanging(nodes):
+    zero, one = nodes(0), nodes(1)
+    delta = a_delta()
+    publish(zero, delta, 0, 10)
+    publish(one, delta, 5, 10)  # rank 1 is five rounds ahead
+
+    started = time.monotonic()
+    got = zero.gather([1], 0, _report.expectation(delta), started + 10)
+
+    assert got == []
+    assert (time.monotonic() - started) < 5, "GONE should be immediate"
+
+
+def test_a_peer_training_another_model_is_refused_and_named(nodes, caplog):
+    zero, one = nodes(0), nodes(1)
+    mine = a_delta()
+    publish(zero, mine, 0, 10)
+    publish(one, {"w": torch.randn(9, 9), "b": torch.randn(9)}, 0, 10)
+
+    with caplog.at_level("WARNING", logger="ravex"):
+        got = zero.gather([1], 0, _report.expectation(mine), time.monotonic() + 5)
+
+    assert got == []
+    assert "Unusable report" in caplog.text
+
+
+def test_a_connection_without_the_job_token_gets_nothing(nodes, caplog):
+    """Anything that can reach the port can knock; the token is what answers."""
+    import socket as _socket
+
+    zero = nodes(0)
+    publish(zero, a_delta(), 0, 10)
+    host, _, port = zero.address.rpartition(":")
+
+    from ravex._dist.exchange import REQUEST, REQUEST_MAGIC, RESPONSE
+
+    with caplog.at_level("WARNING", logger="ravex"):
+        connection = _socket.create_connection((host, int(port)), timeout=5)
+        try:
+            connection.sendall(REQUEST.pack(REQUEST_MAGIC, b"0" * 32, 1, 0))
+            connection.settimeout(2)
+            assert connection.recv(RESPONSE.size) == b"", "a stranger was answered"
+        finally:
+            connection.close()
+
+    assert "without the job token" in caplog.text
+
+
+def test_a_node_cannot_be_talked_into_answering_for_a_peer_it_did_not_reach(nodes):
+    """Who answered is keyed by the peer dialled, never by the payload's name.
+
+    Rank 1 reports itself as ``n0``. If the caller believed that field, one
+    machine would be counted twice in the average.
+    """
+    zero, one = nodes(0), nodes(1)
+    delta = a_delta()
+    publish(zero, delta, 0, 10)
+    one.node = "n0"  # rank 1 reports itself under rank 0's name
+    publish(one, delta, 0, 77)
+
+    got = zero.gather([1], 0, _report.expectation(delta), time.monotonic() + 5)
+    assert len(got) == 1 and got[0].steps == 77
+
+
+def test_the_deadline_is_the_deadline(nodes):
+    """A peer that trickles must not hold the round open past its own clock."""
+    zero = nodes(0)
+    delta = a_delta()
+    publish(zero, delta, 0, 10)
+
+    import socket as _socket
+
+    listener = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    held = []
+
+    def accept_and_say_nothing():
+        try:
+            connection, _ = listener.accept()
+            held.append(connection)
+            time.sleep(30)
+        except OSError:
+            pass
+
+    threading.Thread(target=accept_and_say_nothing, daemon=True).start()
+    zero.store.set(
+        ADDRESS_KEY % 1, ("127.0.0.1:%d" % listener.getsockname()[1]).encode()
+    )
+
+    try:
+        started = time.monotonic()
+        got = zero.gather([1], 0, _report.expectation(delta), started + 2)
+        elapsed = time.monotonic() - started
+    finally:
+        listener.close()
+        for connection in held:
+            connection.close()
+
+    assert got == []
+    assert elapsed < 8, "gather ran %.1fs past a 2s deadline" % (elapsed - 2)
+
+
+def test_a_round_with_no_peers_asks_nothing(nodes):
+    zero = nodes(0)
+    assert zero.gather([], 0, _report.expectation(a_delta()), time.monotonic() + 5) == []
+
+
+def test_the_exchange_survives_several_rounds_on_one_listener(nodes):
+    """The listener and the token are built once; only the payload changes."""
+    zero, one = nodes(0), nodes(1)
+    delta = a_delta()
+    for round_number in range(4):
+        publish(zero, delta, round_number, 10)
+        publish(one, delta, round_number, 20 + round_number)
+        got = zero.gather([1], round_number, _report.expectation(delta),
+                          time.monotonic() + 10)
+        assert len(got) == 1
+        assert got[0].round_number == round_number
+        assert got[0].steps == 20 + round_number
+
+
+def test_closing_twice_is_not_an_error(store, tmp_path):
+    exchange = DeltaExchange(0, store, root=str(tmp_path), patience=2.0)
+    assert exchange.start()
+    exchange.close()
+    exchange.close()
+
+
+def test_leaving_waits_for_the_last_report_to_be_taken(nodes):
+    """The defect the end-to-end test found, kept where it cannot come back.
+
+    A node that shuts its listener the moment it has applied its own outer step
+    takes its last report with it. The peer still fetching it gets nothing,
+    closes that round with one contributor fewer, and the two models end the
+    run different - which is a wrong answer arriving quietly, not a crash.
+    """
+    zero, one = nodes(0), nodes(1)
+    delta = a_delta()
+    publish(zero, delta, 4, 10)
+    publish(one, delta, 4, 10)
+
+    late = []
+
+    def fetch_after_a_moment():
+        time.sleep(0.5)
+        late.extend(
+            one.gather([0], 4, _report.expectation(delta), time.monotonic() + 10)
+        )
+
+    puller = threading.Thread(target=fetch_after_a_moment, daemon=True)
+    puller.start()
+
+    zero.close(linger=10, expect=[1])
+    puller.join(10)
+
+    assert len(late) == 1, "rank 0 left before rank 1 had taken round 4"
+
+
+def test_leaving_does_not_outlive_a_peer_that_will_never_fetch(nodes):
+    """Best effort, and bounded: a dead peer is not worth waiting out."""
+    zero = nodes(0)
+    publish(zero, a_delta(), 0, 10)
+
+    started = time.monotonic()
+    zero.close(linger=1.0, expect=[9])
+    elapsed = time.monotonic() - started
+
+    assert 0.8 < elapsed < 5, "linger ran %.1fs for a peer that never comes" % elapsed

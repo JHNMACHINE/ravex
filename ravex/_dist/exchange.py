@@ -1,0 +1,736 @@
+"""Collecting everyone's round report, with a deadline instead of a collective.
+
+GPU-115, under GPU-113. :mod:`ravex._dist.outer` decides what to do with a list
+of contributions; this is what produces the list. It is the piece that makes
+"a node dies and the training does not stop" true rather than arranged, because
+the list being short is the only thing that happens.
+
+**Pull, not push.** Every node serves its own report and fetches everyone
+else's, each fetch on its own socket with its own deadline. A collective — any
+collective, on any medium — needs every participant to arrive, and turns one
+absent node into a group-wide failure after a timeout measured in the training
+group's patience. Here an absent node is one connection that does not answer,
+the other fetches are untouched, and the round closes with whoever replied.
+That difference is the whole issue.
+
+**What it costs, said plainly.** Each node downloads ``(N-1) × S`` bytes, where
+``S`` is one delta. A ring all-reduce moves ``2(N-1)/N × S`` — so at two nodes
+these are identical, at four this is twice the traffic, and it grows from
+there. The trade is deliberate and it is not permanent: a ring is bandwidth
+optimal *and* is exactly the shape that has to be rebuilt when a link in it
+goes away. Fault tolerance first on a link where a node vanishing is the normal
+case, then the hierarchical topology of GPU-113's point 6, which cuts the
+traffic by region rather than by rewriting this.
+
+**Rounds rendezvous here, and that is on purpose.** A node asking for round 5
+from a peer still finishing round 4 does not get a refusal, it waits — up to
+the deadline it brought with it. Under a wall-clock round the peer is about to
+publish, and the alternative to waiting is every node needing to already know
+when the others will be ready, which is the thing there is no channel for.
+
+**Reused rather than rebuilt.** The listener address (``RingLink._advertise``,
+and the ten seconds a hostname cost on a box with a Hyper-V interface), the
+job token (``RingLink._shared_secret``, GPU-112) and its derived
+acknowledgement all come from the replication ring. Same question — "is this
+one of us" — and answering it twice is how two answers end up differing.
+
+**The bytes are moonclip's, and so is the format.** A report is written as a
+moonclip snapshot and moved with the same Rust framing the replication ring
+uses (``_core.prestage_send`` / ``prestage_receive``), manifest and skip list
+included — so a peer only ever receives the rounds it does not already hold.
+Nothing here invents a way to write a tensor down; :mod:`ravex._dist.report`
+says why that matters and what it buys.
+
+**A deadline needs SO_RCVTIMEO, not settimeout, and this is not a style
+choice.** ``socket.settimeout`` puts the descriptor into non-blocking mode with
+the timeout enforced in Python — and the descriptor is then handed to Rust,
+where every read comes straight back as "would block". ``RingLink`` knows this
+and answers it with ``settimeout(None)``, which is why *the replication
+transport has no deadline at all* once bytes start moving. That was tolerable
+there. Here the deadline is the entire mechanism, so the socket stays blocking
+and the bound is set on the kernel with ``SO_RCVTIMEO``/``SO_SNDTIMEO``:
+measured on 2026-09-06, a stalled peer aborts the Rust transfer at 1.50 s
+against a 1.5 s bound, where ``settimeout`` aborted it at 0.00 s having
+transferred nothing.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import socket as _socket
+import struct
+import sys
+import threading
+import time
+from typing import Any, Dict, List, Optional
+
+from ravex._dist import report as _report
+
+logger = logging.getLogger("ravex")
+
+#: Where a node advertises the port it serves its reports on.
+ADDRESS_KEY = "ravex/gpu115/exchange/addr/%d"
+
+#: How an operator says what address peers should dial. **Required whenever the
+#: nodes are not on one network** — which is the case this whole subsystem
+#: exists for. Nothing a process can ask its own kernel returns the address a
+#: peer on another continent reaches it at: behind NAT the local interface
+#: address is not it, and the hostname is not it either.
+ADDRESS_ENV = "RAVEX_EXCHANGE_ADDRESS"
+
+#: Greeting and answer, both fixed length so neither side ever reads a length a
+#: stranger chose.
+REQUEST = struct.Struct("<8s32sII")
+RESPONSE = struct.Struct("<64sBQ")
+REQUEST_MAGIC = b"RVXROUND"
+
+#: Response status bytes.
+OK = 0
+GONE = 1  #: the round asked for is behind the one this node has published
+
+#: How long a served connection may hold a slot waiting for the local round.
+#: Bounded so a peer that connects and then stalls cannot pin a handler for the
+#: length of the round.
+SERVE_PATIENCE = 600.0
+
+#: Concurrent handlers. A node serves one report to each of its peers, so this
+#: is a ceiling on the job's node count and not a tuning knob; past it the
+#: listen backlog holds the rest, which is the right place for them to wait.
+MAX_HANDLERS = 256
+
+#: Bytes moved per socket call.
+CHUNK = 1 << 20
+
+
+def close_round(loop, exchange: "DeltaExchange", peers, deadline: float):
+    """Publish this node's report, collect the peers', take the outer step.
+
+    The one function a training loop calls, and the seam between the two halves
+    of GPU-113: :mod:`ravex._dist.outer` knows what to do with a list of
+    contributions and nothing about a network, this knows how to get the list
+    and nothing about momentum.
+
+    The local contribution is added here rather than inside ``gather`` — which
+    returns peers only — so that "did this node average itself in twice" has
+    exactly one place to be answered.
+
+    Returns whatever :meth:`ravex._dist.outer.OuterLoop.apply` returns, and
+    that report is the honest record of the round: how many nodes were in it,
+    and how far apart their step counts were.
+    """
+    from ravex._dist.outer import Contribution
+
+    mine = loop.contribution()
+    expected = _report.expectation(mine.delta)
+    exchange.publish(mine.delta, loop.round_number, mine.steps)
+    reports = exchange.gather(peers, loop.round_number, expected, deadline)
+    return loop.apply(
+        [mine]
+        + [
+            Contribution(delta=r.delta, steps=r.steps, node=r.node)
+            for r in reports
+        ]
+    )
+
+
+#: The round number the starting parameters are published under. Training
+#: rounds begin at 1, so this one can never collide with a real round.
+SEED_ROUND = 0
+
+
+def adopt_outer_state(loop, exchange: "DeltaExchange", source: int, rank: int,
+                      deadline: float) -> bool:
+    """Make every node start from the *same* outer parameters.
+
+    **This is not a nicety, and leaving it out is silently wrong.** An outer
+    round applies the same averaged pseudo-gradient on every node, to whatever
+    outer parameters that node is holding. So if two nodes start from different
+    ones, the difference between them is never touched again by anything: it is
+    a constant added to one node's model for the length of the run. The nodes
+    look like they are converging — the loss falls, the rounds close over
+    everybody — and they are training two models a fixed distance apart.
+
+    That happens for a reason nobody would predict from the outside: the outer
+    loop is built at the first optimizer step that has a model to build it
+    from, which is *after* that step has moved the weights, and each node moved
+    them with its own data. Measured on two ranks at 0.044 per parameter sum,
+    constant across every round that followed.
+
+    So one node's parameters are taken as the truth and the others adopt them.
+    Not averaged — averaging is what the rounds do, and it would leave the same
+    problem one iteration smaller. The same call is what a node joining a run
+    already in progress needs, which is why ``source`` is a parameter rather
+    than rank 0 written into the body.
+
+    Returns whether this node ended up holding the shared state.
+    """
+    exchange.publish(loop.outer, SEED_ROUND, 0)
+    if rank == source:
+        return True
+
+    reports = exchange.gather(
+        [source], SEED_ROUND, _report.expectation(loop.outer), deadline
+    )
+    if not reports:
+        return False
+
+    loop.outer = reports[0].delta
+    loop.write_back()
+    return True
+
+
+def _rust_core():
+    """Ravex's own transport, the same one the replication ring is framed by."""
+    from ravex import _core
+
+    return _core
+
+
+def set_deadline(sock, seconds: float) -> None:
+    """Bound every read and write on ``sock``, **keeping it blocking**.
+
+    ``settimeout`` cannot be used for this. It makes the descriptor
+    non-blocking and enforces the timeout in Python, and the descriptor is then
+    handed to the Rust transport, where the first read returns "would block"
+    immediately — measured at 0.00 s on 2026-09-06, having moved nothing.
+    ``SO_RCVTIMEO``/``SO_SNDTIMEO`` is the kernel's own bound and leaves the
+    socket blocking: the same test aborted at 1.50 s against a 1.5 s bound.
+
+    Windows takes a DWORD of milliseconds where everything else takes a
+    ``timeval``, which is the whole reason this is a function.
+    """
+    seconds = max(0.001, float(seconds))
+    if sys.platform == "win32":
+        value = struct.pack("<I", int(seconds * 1000))
+    else:
+        value = struct.pack("@qq", int(seconds), int((seconds % 1) * 1_000_000))
+    for option in (_socket.SO_RCVTIMEO, _socket.SO_SNDTIMEO):
+        sock.setsockopt(_socket.SOL_SOCKET, option, value)
+
+
+def advertise(port: int) -> str:
+    """The address to publish, and **never this host's name**.
+
+    ``RingLink._advertise`` solves the same problem for the replication ring
+    and is used here whenever it can answer, including the measurement behind
+    it: on a Windows box with a Hyper-V interface, dialling the machine's own
+    name took **10.06 s** because the name resolves to several addresses and
+    the virtual ones swallow the attempt. Reproduced on 2026-09-06 on a
+    different box at **16.1 s**.
+
+    Where this differs is the fallback. ``RingLink`` ends at the hostname,
+    reasoning that a name a cluster's DNS can resolve beats nothing. For a
+    round with a deadline that reasoning inverts: sixteen seconds spent on an
+    address that then refuses the connection is a round lost, and it is lost
+    the same way every time. So the order here is
+
+    1. ``RAVEX_EXCHANGE_ADDRESS``, which is the only one that can be right when
+       the nodes are on different continents — behind NAT no local lookup
+       returns the address a peer dials.
+    2. The routing table, asked which local address would be used to reach
+       ``MASTER_ADDR``. Same trick as ``RingLink._advertise``: a UDP
+       ``connect`` sends no packet, it only fills in the local address.
+    3. The same question asked toward a public address, for a node launched
+       without a torchrun rendezvous — which is what an independently started
+       node on a rented box is.
+    4. Loopback, with a warning that says plainly that no other machine will
+       reach it.
+    """
+    configured = os.environ.get(ADDRESS_ENV)
+    if configured:
+        return configured if ":" in configured else "%s:%d" % (configured, port)
+
+    for target in (os.environ.get("MASTER_ADDR"), "8.8.8.8"):
+        if not target:
+            continue
+        probe = None
+        try:
+            probe = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+            probe.connect((target, 1))
+            return "%s:%d" % (probe.getsockname()[0], port)
+        except OSError:
+            continue
+        finally:
+            if probe is not None:
+                probe.close()
+
+    logger.warning(
+        "No address to advertise for the round exchange: falling back to "
+        "loopback, which no other machine can reach. Set %s to the address "
+        "peers should dial.",
+        ADDRESS_ENV,
+    )
+    return "127.0.0.1:%d" % port
+
+
+class DeltaExchange:
+    """This node's server and its fetches, for the whole run.
+
+    Built once and kept: the listener, the advertised address and the job token
+    do not change between rounds, and re-establishing them every round would
+    put a rendezvous on the critical path of something already paying for a
+    network.
+    """
+
+    def __init__(
+        self,
+        rank: int,
+        store,
+        root: str,
+        node: str = "",
+        patience: float = 60.0,
+        compression_level: int = 3,
+        save_dtype=None,
+    ):
+        self.rank = int(rank)
+        self.node = node or str(rank)
+        self.store = store
+        self.patience = float(patience)
+        self.listener: Optional[Any] = None
+        self.secret: Optional[bytes] = None
+        self.address: Optional[str] = None
+
+        #: This node's reports, and one directory per peer for theirs. The peer
+        #: directories persist across rounds on purpose: the transport's
+        #: manifest skips what is already there, so after the first round only
+        #: the new snapshot's files cross the link.
+        self.root = root
+        self.mine_path = os.path.join(root, "mine")
+        self.peers_path = os.path.join(root, "peers")
+        os.makedirs(self.mine_path, exist_ok=True)
+        os.makedirs(self.peers_path, exist_ok=True)
+        self.mine = _report.open_store(
+            self.mine_path,
+            compression_level=compression_level,
+            save_dtype=save_dtype,
+        )
+
+        #: Held while this node's store is being written, and while it is being
+        #: read down a socket. **Windows needs this and it is not a Windows
+        #: quirk being papered over.** moonclip writes its manifest by renaming
+        #: a temporary file over the old one, and a rename onto a file another
+        #: handle has open fails there with "access denied" — which surfaced as
+        #: a round failing to publish, the node's round number not advancing,
+        #: and the peers quietly drifting out of alignment with it.
+        #:
+        #: What it costs is that publishing waits for an in-flight fetch. That
+        #: is close to free where it lands: publish and gather both happen at
+        #: the round boundary, so the node was about to wait on the network
+        #: anyway. It is taken *after* the wait for the round, never before, or
+        #: a peer waiting for a round would hold the lock the publish needs.
+        self._io_lock = threading.Lock()
+
+        self._round = -1
+        #: The newest round each peer has actually taken from this node. Not
+        #: bookkeeping: it is what :meth:`close` waits on, and the only thing
+        #: that distinguishes "published" from "delivered".
+        self._served: Dict[int, int] = {}
+        self._lock = threading.Condition()
+        self._handlers = threading.Semaphore(MAX_HANDLERS)
+        self._stop = threading.Event()
+        self._accepting: Optional[threading.Thread] = None
+
+    # -- setup ------------------------------------------------------------
+
+    def start(self) -> bool:
+        """Bind, take the token, advertise, and start serving. False if not.
+
+        False rather than an exception because a node that cannot be reached is
+        not a broken node: it can still fetch from everyone else, and the
+        caller's fallback — fewer contributors, or the collective road — is a
+        decision about the round rather than about this object.
+        """
+        from ravex._dist.replication import RingLink
+
+        try:
+            deadline = time.monotonic() + self.patience
+            self.secret = RingLink._shared_secret(self.store, self.rank, deadline)
+            if self.secret is None:
+                logger.warning(
+                    "No job token on the rendezvous store after %.0fs; this "
+                    "node cannot prove it belongs and will not serve.",
+                    self.patience,
+                )
+                return False
+
+            listener = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+            listener.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+            listener.bind(("", 0))
+            listener.listen(MAX_HANDLERS)
+            listener.settimeout(0.5)
+            self.listener = listener
+
+            self.address = advertise(listener.getsockname()[1])
+            self.store.set(ADDRESS_KEY % self.rank, self.address.encode("utf-8"))
+        except OSError as exc:
+            logger.warning("Could not open the round exchange: %s", exc)
+            self.close()
+            return False
+
+        self._accepting = threading.Thread(target=self._accept, daemon=True)
+        self._accepting.start()
+        return True
+
+    def close(self, linger: float = 0.0, expect=None) -> None:
+        """Stop serving. ``linger`` first, so a last report is not lost with it.
+
+        **Leaving is not free, and this was measured rather than reasoned
+        about.** A node that finishes its final round, applies its own outer
+        step and shuts the listener down takes its last report with it: a peer
+        still fetching that round gets nothing, closes the round with one fewer
+        contributor, and the two models end the run *different*. That is
+        exactly what the end-to-end test showed the first time it ran — rank 0
+        exited, rank 1 logged "round 3 closed without rank 0", and the
+        parameters diverged in the fifth decimal.
+
+        So ``expect`` names the peers whose fetch this node waits for, and
+        ``linger`` bounds the wait. Best effort on purpose: a peer that has
+        itself died will never fetch, and outliving it is not a service to
+        anybody. What the bound buys is that the ordinary case — everyone
+        finishing within a round of each other — never loses a report, and the
+        pathological one costs a known number of seconds.
+        """
+        if linger > 0 and expect:
+            deadline = time.monotonic() + linger
+            with self._lock:
+                while time.monotonic() < deadline:
+                    if all(self._served.get(peer, -1) >= self._round for peer in expect):
+                        break
+                    self._lock.wait(min(0.2, max(0.01, deadline - time.monotonic())))
+            waiting = [p for p in expect if self._served.get(p, -1) < self._round]
+            if waiting:
+                logger.info(
+                    "Leaving with round %d untaken by rank(s) %s after %.0fs.",
+                    self._round,
+                    ", ".join(str(peer) for peer in waiting),
+                    linger,
+                )
+
+        self._stop.set()
+        with self._lock:
+            self._lock.notify_all()
+        listener, self.listener = self.listener, None
+        if listener is not None:
+            try:
+                listener.close()
+            except OSError:
+                pass
+
+    # -- publishing -------------------------------------------------------
+
+    def publish(self, delta, round_number: int, steps: int) -> None:
+        """Write this node's report and offer it to whoever asks.
+
+        The round number is the snapshot's step, so a peer asks for a round by
+        name rather than trusting whatever is newest — which matters because by
+        the time this node answers it may well be a round further on.
+
+        A few rounds are kept rather than only the current one, so that serving
+        a peer can never race retention deleting the thing being served. Past
+        that a peer is asking for a round it can no longer join, and the answer
+        is to catch up from the current outer state rather than to be handed
+        history one round at a time.
+        """
+        with self._io_lock:
+            _report.write(self.mine, delta, round_number, steps, self.node)
+        with self._lock:
+            self._round = max(self._round, int(round_number))
+            self._lock.notify_all()
+
+    # -- fetching ---------------------------------------------------------
+
+    def gather(
+        self,
+        peers: List[int],
+        round_number: int,
+        expected,
+        deadline: float,
+    ) -> List[_report.Report]:
+        """Everyone else's report for this round, or as many as arrive in time.
+
+        ``deadline`` is absolute (``time.monotonic``). What comes back is
+        whoever answered — never padded, never waited past. The caller adds its
+        own contribution; this returns peers only, so that a node cannot
+        average itself in twice by a mistake made in one place.
+        """
+        if not peers:
+            return []
+
+        answered: Dict[int, _report.Report] = {}
+        found = threading.Lock()
+        threads = []
+        for peer in peers:
+            thread = threading.Thread(
+                target=self._fetch_into,
+                args=(peer, round_number, expected, deadline, answered, found),
+                daemon=True,
+            )
+            thread.start()
+            threads.append(thread)
+
+        for thread in threads:
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                thread.join(remaining)
+
+        # Keyed by peer rather than by the name in the payload: who answered is
+        # a fact this node knows, and a report's own ``node`` field is written
+        # by the peer. Trusting the latter to identify the former is how one
+        # machine gets counted twice.
+        silent = [peer for peer in peers if peer not in answered]
+        if silent:
+            logger.warning(
+                "Round %d closed without rank(s) %s. It goes on with %d of %d "
+                "peer(s) - a node that did not answer did not contribute, "
+                "which is an answer and not a failure.",
+                round_number,
+                ", ".join(str(peer) for peer in silent),
+                len(answered),
+                len(peers),
+            )
+        return [answered[peer] for peer in peers if peer in answered]
+
+    def _fetch_into(self, peer, round_number, expected, deadline, answered, found):
+        try:
+            report = self.fetch(peer, round_number, expected, deadline)
+        except Exception as exc:  # one peer's failure is not the round's
+            logger.info("No report from rank %s this round: %s", peer, exc)
+            return
+        if report is None:
+            return
+        with found:
+            answered[peer] = report
+
+    def fetch(self, peer: int, round_number: int, expected, deadline: float):
+        """One peer's report, or None if it did not arrive before ``deadline``."""
+        from ravex._dist.replication import RingLink
+
+        address = self._address_of(peer, deadline)
+        if address is None:
+            return None
+
+        host, _, port = address.rpartition(":")
+        connection = None
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            connection = _socket.create_connection(
+                (host, int(port)), timeout=min(remaining, 30.0)
+            )
+            connection.sendall(
+                REQUEST.pack(
+                    REQUEST_MAGIC,
+                    self.secret or b"",
+                    self.rank,
+                    int(round_number) & 0xFFFFFFFF,
+                )
+            )
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            connection.settimeout(remaining)
+            head = _recv_exactly(connection, RESPONSE.size, deadline)
+            acknowledgement, status, length = RESPONSE.unpack(head)
+
+            expect = RingLink._acknowledgement(self.secret, self.rank)
+            if acknowledgement != expect:
+                logger.warning(
+                    "Rank %s answered without the job token. Not reading a "
+                    "delta from it.",
+                    peer,
+                )
+                return None
+            if status != OK:
+                logger.info(
+                    "Rank %s no longer holds round %d and cannot serve it.",
+                    peer,
+                    round_number,
+                )
+                return None
+
+            # From here the descriptor belongs to the Rust transport, so the
+            # bound has to be one the kernel enforces on a blocking socket -
+            # see `set_deadline`. The socket-level `timeout` set by
+            # `create_connection` is cleared for the same reason.
+            connection.settimeout(None)
+            set_deadline(connection, max(1.0, deadline - time.monotonic()))
+            destination = self._peer_path(peer)
+            _core = _rust_core()
+            if not _core.prestage_receive(connection.fileno(), destination):
+                return None
+        except (OSError, _socket.timeout):
+            return None
+        finally:
+            if connection is not None:
+                try:
+                    connection.close()
+                except OSError:
+                    pass
+
+        try:
+            # Opened fresh: a manager reads its manifest when it is built, and
+            # the manifest is exactly what just changed on disk.
+            #
+            # This is also the one place moonclip's recovery scan is load
+            # bearing rather than a safety net. Snapshots appear in this
+            # directory without *this* process having written them — the
+            # transport put them there — which from the store's point of view
+            # is indistinguishable from a run killed after writing and before
+            # recording. It says so on stderr, and it is right to: the files
+            # are complete and it adopts them, which is what makes a
+            # prestaged store readable at all.
+            theirs = _report.open_store(destination)
+            report = _report.read(theirs, round_number, expected)
+        except _report.ReportError as exc:
+            # Not "absent": absent is silence. This peer said something this
+            # node will not act on, and that is worth a louder line, because it
+            # is a version skew or a misconfiguration rather than a machine
+            # that went away.
+            logger.warning("Unusable report from rank %s: %s", peer, exc)
+            return None
+        except Exception as exc:
+            logger.warning("Could not read rank %s's report: %s", peer, exc)
+            return None
+        return report
+
+    def _peer_path(self, peer: int) -> str:
+        path = os.path.join(self.peers_path, str(peer))
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def _address_of(self, peer: int, deadline: float) -> Optional[str]:
+        """Poll for a peer's advertisement. ``check``, never ``get``.
+
+        ``get`` blocks to the store's own timeout rather than to this round's,
+        which is how a deadline stops being a deadline.
+        """
+        key = ADDRESS_KEY % peer
+        while time.monotonic() < deadline and not self._stop.is_set():
+            try:
+                if self.store.check([key]):
+                    return self.store.get(key).decode("utf-8")
+            except Exception:
+                return None
+            time.sleep(0.05)
+        return None
+
+    # -- serving ----------------------------------------------------------
+
+    def _accept(self) -> None:
+        while not self._stop.is_set():
+            listener = self.listener
+            if listener is None:
+                return
+            try:
+                connection, _ = listener.accept()
+            except (_socket.timeout, OSError):
+                continue
+            if not self._handlers.acquire(blocking=False):
+                # Past MAX_HANDLERS the backlog is the right queue to wait in.
+                try:
+                    connection.close()
+                except OSError:
+                    pass
+                continue
+            threading.Thread(
+                target=self._serve, args=(connection,), daemon=True
+            ).start()
+
+    def _serve(self, connection) -> None:
+        from ravex._dist.replication import RingLink
+
+        try:
+            connection.settimeout(SERVE_PATIENCE)
+            greeting = _recv_exactly(
+                connection, REQUEST.size, time.monotonic() + SERVE_PATIENCE
+            )
+            magic, token, peer, wanted = REQUEST.unpack(greeting)
+            if magic != REQUEST_MAGIC or token != (self.secret or b""):
+                # Silence rather than a message. Something that reached the
+                # port without the token is not owed an explanation, and a
+                # refusal that says which half was wrong is a hint.
+                logger.warning("Refused a connection without the job token.")
+                return
+
+            if not self._await_round(wanted):
+                connection.sendall(
+                    RESPONSE.pack(RingLink._acknowledgement(self.secret, peer), GONE, 0)
+                )
+                return
+            connection.sendall(
+                RESPONSE.pack(RingLink._acknowledgement(self.secret, peer), OK, 0)
+            )
+            # The descriptor goes to Rust from here, so the bound has to be the
+            # kernel's - see `set_deadline`.
+            connection.settimeout(None)
+            set_deadline(connection, SERVE_PATIENCE)
+            with self._io_lock:
+                _rust_core().prestage_send(
+                    connection.fileno(), self.mine_path, CHUNK
+                )
+            # Recorded only after the last byte is out. "Published" and
+            # "delivered" are different facts, and `close` waits on this one.
+            with self._lock:
+                if wanted > self._served.get(peer, -1):
+                    self._served[peer] = wanted
+                self._lock.notify_all()
+        except (OSError, _socket.timeout, struct.error):
+            pass
+        finally:
+            self._handlers.release()
+            try:
+                connection.close()
+            except OSError:
+                pass
+
+    def _await_round(self, wanted: int) -> bool:
+        """Whether this node can serve ``wanted``, waiting for it if it is coming.
+
+        A peer ahead of us waits; a peer asking for a round retention has
+        already dropped gets ``GONE``. Which of the two it is cannot be decided
+        by the asker, because the asker is the one without the information — so
+        it is decided here, where the published round is known.
+
+        Note what is *not* checked: whether ``wanted`` is the newest round.
+        The whole store goes down the socket and the reader looks up the round
+        it asked for by number, so a node that has moved on can still answer
+        for a round it still holds. That is what makes a slightly slow peer a
+        contributor rather than a casualty.
+        """
+        deadline = time.monotonic() + SERVE_PATIENCE
+        while not self._stop.is_set():
+            if _report.snapshot_of_round(self.mine, wanted) is not None:
+                return True
+            with self._lock:
+                if wanted < self._round:
+                    return False  # retention has dropped it
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._lock.wait(min(remaining, 1.0))
+        return False
+
+
+def _recv_exactly(connection, count: int, deadline: float) -> bytes:
+    """``count`` bytes or an error. Never a short read treated as a message.
+
+    The deadline is rechecked per chunk rather than only set on the socket:
+    a peer trickling one byte per timeout would otherwise hold a fetch open
+    long past the round it belongs to.
+    """
+    if count == 0:
+        return b""
+    buffer = bytearray()
+    while len(buffer) < count:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise OSError("deadline passed after %d of %d bytes" % (len(buffer), count))
+        connection.settimeout(min(remaining, 30.0))
+        block = connection.recv(min(CHUNK, count - len(buffer)))
+        if not block:
+            raise OSError("peer closed after %d of %d bytes" % (len(buffer), count))
+        buffer += block
+    return bytes(buffer)

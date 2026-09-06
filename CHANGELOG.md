@@ -4,6 +4,137 @@
 
 ### Added
 
+- **`outer_loop`: training across the internet, reached from `@ravex.train_loop`
+  (GPU-116, under GPU-113).**
+
+  The outer loop and its transport were only reachable from a test. Now
+  `outer_loop: true` — in `ravex.yaml`, the environment, or the decorator —
+  wires them into the runtime, and a training function that mentions neither
+  rounds nor deltas nor peers trains with its peers. Proved on two processes
+  under a real rendezvous, ending with bit-identical models. Documented in
+  `docs/configuration.md`.
+
+  **It never turns itself on.** The rest of Ravex activates by itself because
+  the worst it does is write a checkpoint; this changes what the run *trains*.
+  An inherited config switching it on quietly would be a run doing something
+  other than what its own code says.
+
+  A round is flagged inside `optimizer.step()` and closed at the batch
+  boundary, the same discipline `checkpoint_every` already follows and for a
+  stronger version of the same reason: closing one where it is noticed would
+  write outer parameters into a model mid-step, after spending minutes of
+  network inside the optimizer.
+
+  **Two defects the wiring exposed, both silent, both found by two processes
+  disagreeing about a model.**
+
+  *The outer parameters have to be adopted, not snapshotted.* A round applies
+  the same averaged pseudo-gradient to whatever outer state each node holds, so
+  a difference in the *starting* state is never touched again — it is a
+  constant added to one node's model for the whole run, while the loss falls
+  and every round closes over everybody. It arose because the loop is built at
+  the first step that has a model, which is after that step moved the weights
+  with each node's own data: measured at 0.044 per parameter sum, unchanged by
+  any round after. There is now a seed round in which one node's parameters are
+  taken as the truth and the others adopt them — the same call a node joining a
+  run in progress needs.
+
+  *A failed round has to advance the round number anyway.* A node whose
+  exchange failed stayed on its number while the peers moved on, so from then
+  on it asked for rounds they had retired while they asked for one it never
+  reached: both running, both logging closed rounds, permanently invisible to
+  each other. One failed publish was enough. A round is defined by the local
+  training that filled it, not by whether the network agreed about it.
+
+  That failed publish was itself real: on Windows, serving a peer while writing
+  the next round raced moonclip's manifest rename and returned "access denied".
+  Writing and serving this node's store now exclude each other.
+
+- **The round exchange: everyone's delta collected with a deadline instead of a
+  collective (GPU-115, under GPU-113).**
+
+  What makes "a node dies and the training does not stop" true rather than
+  arranged. Every node serves its own round report and pulls everyone else's,
+  each fetch on its own socket with its own deadline. A collective — on any
+  medium — needs every participant to arrive and turns one absent node into a
+  group-wide failure; here an absent node is one connection that does not
+  answer, the other fetches are untouched, and the round closes with whoever
+  replied. Proved on real sockets, with a process that stops mid-run and
+  survivors that keep converging and stay bit-identical to each other.
+
+  **A report is a moonclip snapshot**, moved by the same Rust framing the
+  replication ring uses, manifest and skip list included — measured: after the
+  first round only the new snapshot crosses the link, not the accumulated
+  store. The first version of this shipped a hand-rolled wire format, which was
+  a second way to write tensors down next to the one the project already owns.
+  What using the real one actually buys was not what was expected: **zstd on a
+  float delta is 1.08x and worth nothing**, while `save_dtype` is 2.56x at bf16
+  and 4.84x at fp8 — GPU-113's quantised round already built, as a constructor
+  argument.
+
+  **A deadline needs `SO_RCVTIMEO`, not `settimeout`.** `settimeout` makes the
+  descriptor non-blocking with the timeout enforced in Python, and the
+  descriptor is then handed to Rust, where the first read returns "would block"
+  — measured at 0.00s having moved nothing, against 1.50s for a 1.5s kernel
+  bound. `RingLink` answers this with `settimeout(None)`, which means **the
+  replication transport has no deadline at all** once bytes start moving. That
+  was tolerable there and is not here.
+
+  Two defects the tests found, both silent. A node that finished its last round
+  and shut its listener **took its report with it**: the peer still fetching it
+  closed that round with one contributor fewer, and the two models ended the
+  run different in the fifth decimal — so leaving is now an event the protocol
+  carries, bounded by a linger. And a node advertising its own hostname cost
+  **16.1 seconds** per dial on a box with virtual interfaces, which for a round
+  with a deadline is the round; the address is now resolved by the routing
+  table, or configured through `RAVEX_EXCHANGE_ADDRESS` — required whenever the
+  nodes are not on one network, because behind NAT nothing a process can ask
+  its own kernel returns the address a peer dials.
+
+- **An outer loop: many local steps, then one exchange of parameter deltas
+  (GPU-114, under GPU-113).**
+
+  The first piece of training *over the internet* rather than inside a
+  datacenter. The link between two rented boxes on different continents
+  carries 7 MB/s, measured and reproduced nine days apart, and on that link an
+  all-reduce of a one-billion-parameter model's gradients costs **429 seconds
+  per step**. Synchronous data parallelism is not slow there, it is out of the
+  question.
+
+  So each node trains locally for H steps with its own optimizer, and then the
+  nodes exchange the *difference* between the parameters they started the
+  round with and the ones they hold now. That difference is signed to point
+  the way a gradient points, and an outer optimizer — Nesterov, momentum 0.9 —
+  takes one step on the average of everybody's. The bytes per round are
+  unchanged; they are paid once per H steps instead of every step.
+
+  `ravex._dist.outer` imports no `torch.distributed` at all: it takes a list of
+  contributions and says what to do about them, so every rule in it is provable
+  in one process. Who collects them, with what deadline, and what to do about
+  a node that never answered, is the transport's business and is not written
+  yet.
+
+  **Two things it buys immediately, and both are properties of one line.** A
+  node that dies during a round is simply not in the list, and the round closes
+  over the rest — there is no collective to hang in. A node that runs five
+  times slower reports fewer steps rather than holding anyone back, because the
+  round can close on the clock instead of on a count.
+
+  **How contributions are averaged was decided by measurement, and the first
+  measurement was blind.** A delta is already proportional to the work behind
+  it, so weighting *again* by step count counts a fast node twice. On a bench
+  where every node draws from the same distribution, that argument is
+  untestable — over-weighting a node biases the average toward data that says
+  what everyone else's says — and `step_weighted` duly came out slightly
+  *ahead* of the plain mean. Give each node its own target and the order
+  reverses: `step_weighted` is **45% worse** (2.92 against 2.01), and worse
+  than ignoring heterogeneity entirely. The default is the plain mean, all
+  three modes stay selectable, and `bench/outer_loop.py --skew-data` is the arm
+  that can tell them apart.
+
+  The outer momentum is what separates this from parameter averaging, and it
+  pays: 0.0143 against 0.0466 without it, on the same run.
+
 - **Coordinated emergency checkpoint on SIGTERM, for sharded models split
   across more than one machine (GPU-92).**
 
@@ -99,6 +230,34 @@
   `detect_framework()` recognizes it, `_ADAPTERS` has no entry for it, and ZeRO
   state does not pass through the optimizer hooks Ravex installs at all — a
   gap to close or a limit to declare, but not one this seam settles.
+
+### Fixed
+
+- **`@ravex.train_loop(storage={"path": ...})` crashed several frames from the
+  mistake.**
+
+  `storage` is the one option whose value is a *section* rather than a scalar,
+  and the decorator applied every override with a bare `setattr` — so the dict
+  replaced the `StorageConfig` dataclass and the failure surfaced later as
+  `AttributeError: 'dict' object has no attribute 'path'` from inside
+  `_normalize`, naming neither the option nor the decorator. A mapping is the
+  obvious thing to reach for, because it is exactly how `ravex.yaml` spells
+  that section.
+
+  Both ways in now go through one function, `RavexConfig.apply_storage`, which
+  accepts a mapping or a `StorageConfig` and leaves untouched keys at their
+  defaults. The two callers differ in one way, and it is the distinction the
+  rest of the module already makes: a config *file* must never stop a training
+  run, so a bad section there is recorded in `problems` and the defaults stand;
+  a decorator keyword is someone typing at the call site and raises, exactly as
+  an unknown top-level option already did.
+
+  Two smaller things fell out. An unknown key inside the section — `pth` for
+  `path` — was silently dropped by the YAML path and is now reported with the
+  valid names. And the field list is the dataclass's own rather than `hasattr`,
+  because `hasattr` accepts `is_remote`, which is a property with no setter:
+  `storage: {is_remote: true}` in a config file used to raise `AttributeError`
+  from somewhere with nothing to do with configuration.
 
 ### Changed
 
