@@ -45,6 +45,20 @@ def _as_int(value: Any, default: int) -> int:
         return default
 
 
+def _as_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+#: How the outer loop weights each node's contribution. Mirrors
+#: ``ravex._dist.outer.COMBINE_MODES``, and duplicated for the same reason
+#: ``_SAVE_DTYPES`` is: this has to be checkable at config load, which happens
+#: before anything under ``_dist`` is imported and long before a round.
+_OUTER_COMBINE_MODES = ("mean", "normalized", "step_weighted")
+
+
 #: Every ``save_dtype`` target Moonclip accepts, in every spelling it accepts
 #: it. Duplicated here on purpose: Moonclip reports a bad target when the
 #: manager is *constructed*, which under Ravex is mid-run and inside the
@@ -427,6 +441,63 @@ class RavexConfig:
     #: would kill otherwise-healthy runs.
     emergency_timeout: int = 20
 
+    # ─── the outer loop, GPU-113 ────────────────────────────────────────
+    #
+    #: Train across nodes that communicate once every `outer_inner_steps`
+    #: rather than every step, exchanging parameter deltas instead of
+    #: gradients. See `ravex._dist.outer` for what that is and why a 7 MB/s
+    #: link leaves no alternative.
+    #:
+    #: **Off, and it is the one thing here that never turns itself on.** The
+    #: rest of Ravex activates on its own because the worst it does is write a
+    #: checkpoint. This changes what the run *trains*: the weights get averaged
+    #: with other machines'. An inherited `ravex.yaml` switching that on
+    #: quietly would be a run doing something other than what its own code
+    #: says, and no log line makes up for that afterwards.
+    outer_loop: bool = False
+
+    #: Local optimizer steps per round. The whole saving over synchronous data
+    #: parallelism is this number, so it wants to be large — hundreds — and
+    #: what it costs in convergence has not been measured past 20.
+    outer_inner_steps: int = 500
+
+    #: Close the round on the clock instead of, or as well as, on the count.
+    #: **This is the one that makes heterogeneous nodes work**: every node
+    #: stops at the same moment having done as many steps as it could, and the
+    #: step counts differing becomes the normal case rather than a straggler.
+    #: 0 disables it. Whichever of the two comes first closes the round.
+    outer_round_seconds: float = 0.0
+
+    #: The outer optimizer. DiLoCo's published values; `outer_lr` is not small
+    #: on purpose — the step is meant to travel most of the way to the average
+    #: of where the nodes went, not to nudge toward it.
+    outer_lr: float = 0.7
+    outer_momentum: float = 0.9
+
+    #: How contributions are weighted: `mean`, `normalized` or `step_weighted`.
+    #: The default is derivable and was then measured — see
+    #: `ravex._dist.outer.combine`, where `step_weighted` costs 45% more loss
+    #: once the nodes' data actually differs.
+    outer_combine: str = "mean"
+
+    #: Seconds a node waits for its peers' reports before closing the round
+    #: without them. **A deadline, not a timeout**: running out of it is the
+    #: answer rather than a failure, and it is what makes a dead node an
+    #: absence. Sized for the link — a round moves one model's worth of bytes.
+    outer_deadline: int = 900
+
+    #: Cast the delta before it goes on the wire: `bf16` halves a round,
+    #: `fp8` quarters it. Measured in `ravex._dist.report`; what it costs in
+    #: convergence is not measured, so this is off by default.
+    outer_save_dtype: Optional[str] = None
+
+    #: Where round reports are staged. Defaults to `rounds/` beside the
+    #: checkpoint store. Kept apart from the checkpoints deliberately: these
+    #: are in-flight working copies with their own retention, and mixing them
+    #: into the store a resume reads from is how a round report becomes a
+    #: checkpoint nobody meant to keep.
+    outer_root: Optional[str] = None
+
     log_file: Optional[str] = None
     log_level: str = "INFO"
     fallback_on_error: bool = True
@@ -533,6 +604,24 @@ class RavexConfig:
             self.emergency_check_every = _as_int(value, self.emergency_check_every)
         if (value := get("EMERGENCY_TIMEOUT")) is not None:
             self.emergency_timeout = _as_int(value, self.emergency_timeout)
+        if (value := get("OUTER_LOOP")) is not None:
+            self.outer_loop = _as_bool(value, self.outer_loop)
+        if (value := get("OUTER_INNER_STEPS")) is not None:
+            self.outer_inner_steps = _as_int(value, self.outer_inner_steps)
+        if (value := get("OUTER_ROUND_SECONDS")) is not None:
+            self.outer_round_seconds = _as_float(value, self.outer_round_seconds)
+        if (value := get("OUTER_LR")) is not None:
+            self.outer_lr = _as_float(value, self.outer_lr)
+        if (value := get("OUTER_MOMENTUM")) is not None:
+            self.outer_momentum = _as_float(value, self.outer_momentum)
+        if (value := get("OUTER_COMBINE")) is not None:
+            self.outer_combine = value
+        if (value := get("OUTER_DEADLINE")) is not None:
+            self.outer_deadline = _as_int(value, self.outer_deadline)
+        if (value := get("OUTER_SAVE_DTYPE")) is not None:
+            self.outer_save_dtype = value or None
+        if (value := get("OUTER_ROOT")) is not None:
+            self.outer_root = value or None
         if (value := get("LOG_FILE")) is not None:
             self.log_file = value or None
         if (value := get("LOG_LEVEL")) is not None:
@@ -580,6 +669,8 @@ class RavexConfig:
             "replicate_every",
             "emergency_check_every",
             "emergency_timeout",
+            "outer_inner_steps",
+            "outer_deadline",
         )
         boolean = (
             "enabled",
@@ -594,6 +685,7 @@ class RavexConfig:
             "track_rng",
             "handle_sigterm",
             "emergency_coordination",
+            "outer_loop",
             "fallback_on_error",
             "framework_auto_detect",
         )
@@ -687,6 +779,18 @@ class RavexConfig:
             self.emergency_check_every = 1
         if self.emergency_timeout < 1:
             self.emergency_timeout = 1
+        if self.outer_inner_steps < 1:
+            self.outer_inner_steps = 1
+        if self.outer_round_seconds < 0:
+            self.outer_round_seconds = 0.0
+        if self.outer_deadline < 1:
+            self.outer_deadline = 1
+        if str(self.outer_combine) not in _OUTER_COMBINE_MODES:
+            self.problems.append(
+                f"outer_combine={self.outer_combine!r} is not one of "
+                f"{', '.join(_OUTER_COMBINE_MODES)}; using 'mean'"
+            )
+            self.outer_combine = "mean"
         if str(self.compression).strip().lower() in ("none", "off", ""):
             self.compression_level = 0
 

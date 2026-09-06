@@ -26,7 +26,7 @@ import signal
 import sys
 import threading
 import time
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 from ravex._backends import get_backend
 from ravex._config import RavexConfig
@@ -140,6 +140,14 @@ class RavexRuntime:
         self._emergency_requested = False
         self._emergency_active: Optional[bool] = None
         self._emergency_group = None
+        #: The outer loop and its transport (GPU-113), built on the first step
+        #: that wants them. `False` means it was tried and could not be had —
+        #: not the same as "not tried yet", and not retried every step, the
+        #: same distinction `_ring_link` makes.
+        self._outer: Any = None
+        self._exchange: Any = None
+        self._outer_peers: List[int] = []
+        self._round_due = False
         self._shutdown_done = False
         self._lock = threading.RLock()
         self._framework = "unknown"
@@ -496,6 +504,20 @@ class RavexRuntime:
 
         self.registry.step_count += 1
 
+        if self.config.outer_loop:
+            outer = self._outer_loop()
+            if outer is not None:
+                outer.record_step()
+                if outer.round_is_over():
+                    # Flagged, not closed. Same discipline as `_checkpoint_due`
+                    # right below and for a stronger version of the same
+                    # reason: this is the middle of `optimizer.step()`, before
+                    # the LR scheduler has run, and closing a round here would
+                    # write the outer parameters into the model underneath an
+                    # optimizer that is still mid-step — after having spent
+                    # however many minutes of network inside it.
+                    self._round_due = True
+
         if self._emergency_coordination_active():
             if self.registry.step_count % self.config.emergency_check_every == 0:
                 self._check_emergency_signal()
@@ -514,10 +536,185 @@ class RavexRuntime:
 
     def on_batch_boundary(self) -> None:
         """Called at the top of each training iteration, before the batch."""
-        if not self._enabled or not self._checkpoint_due:
+        if not self._enabled:
+            return
+        if self._round_due:
+            self._round_due = False
+            self._close_outer_round()
+        if not self._checkpoint_due:
             return
         self._checkpoint_due = False
         self.checkpoint()
+
+    # ─── the outer loop, GPU-113 ────────────────────────────────────────
+
+    def _outer_loop(self):
+        """The outer loop and its exchange, built once. None if unavailable.
+
+        Built here rather than at activation because it needs a model, and at
+        activation there may not be one yet — the registry fills up as the
+        training loop runs. First step that has one is the earliest honest
+        moment, and it is before any round could be due.
+
+        ``False`` is remembered as "asked and could not be had", so a job
+        without a rendezvous does not retry, and log, every step of the run.
+        """
+        if self._outer is False:
+            return None
+        if self._outer is not None:
+            return self._outer
+
+        if not self.registry.models:
+            # Not a refusal, and this distinction is load bearing: a model
+            # built inside the decorated function is registered by the patches
+            # partway through, so "none yet" at step one is ordinary and
+            # remembering it as a failure would leave the run training alone
+            # for a reason that stopped being true immediately after.
+            return None
+
+        try:
+            self._outer = self._build_outer_loop()
+        except Exception as exc:
+            logger.warning(
+                "Could not start the outer loop (%s). Training continues "
+                "locally, which for a job that expected to train with peers "
+                "is not a degraded mode - it is a different run.",
+                exc,
+            )
+            self._outer = False
+            return None
+        return self._outer or None
+
+    def _build_outer_loop(self):
+        """Open the round exchange and the outer loop, or explain the refusal.
+
+        Raises rather than returning None so that every reason ends up in one
+        log line at the caller, said the same way.
+        """
+        from ravex._dist.agreement import rendezvous_store
+        from ravex._dist.collectives import get_rank, get_world_size
+        from ravex._dist.exchange import SEED_ROUND, DeltaExchange, adopt_outer_state
+        from ravex._dist.outer import OuterLoop
+
+        models = self.registry.models
+        if len(models) > 1:
+            raise RuntimeError(
+                "%d models are registered and the outer loop averages one. "
+                "Name the one being trained with ravex.track(model=...)"
+                % len(models)
+            )
+
+        store = rendezvous_store()
+        if store is None:
+            # Worth being precise about, because it reads like a
+            # fault-tolerance limit and is not one. The process group is used
+            # for its *store* — addresses and the job token — and never for
+            # the exchange, so a rank dying breaks a group nothing here
+            # touches. What it constrains is the start: `init_process_group`
+            # is collective, so everyone has to be present once.
+            raise RuntimeError(
+                "no rendezvous store: the outer loop takes peer addresses and "
+                "the job token from torch's store, which exists only after "
+                "init_process_group. Launch under torchrun (across machines "
+                "with --rdzv-backend=c10d)"
+            )
+
+        world = get_world_size()
+        if world < 2:
+            raise RuntimeError("world size is %d; a round needs peers" % world)
+
+        rank = get_rank()
+        self._outer_peers = [peer for peer in range(world) if peer != rank]
+        root = self.config.outer_root or os.path.join(
+            self.config.storage.path, "rounds", str(rank)
+        )
+
+        exchange = DeltaExchange(
+            rank,
+            store,
+            root=root,
+            node=str(rank),
+            compression_level=self.config.compression_level,
+            save_dtype=self.config.outer_save_dtype,
+        )
+        if not exchange.start():
+            raise RuntimeError("the round exchange could not open its listener")
+        self._exchange = exchange
+
+        loop = OuterLoop(
+            models[0],
+            inner_steps=self.config.outer_inner_steps,
+            round_seconds=self.config.outer_round_seconds or None,
+            lr=self.config.outer_lr,
+            momentum=self.config.outer_momentum,
+            combine_mode=self.config.outer_combine,
+            node=str(rank),
+        )
+
+        # Before anything else, and it is not optional: every node has to hold
+        # the same outer parameters or the difference between them is never
+        # touched again. See `adopt_outer_state` for what that looks like from
+        # the outside, which is a run that appears to be working.
+        if not adopt_outer_state(
+            loop, exchange, 0, rank, time.monotonic() + self.config.outer_deadline
+        ):
+            raise RuntimeError(
+                "could not take the starting parameters from rank 0 within "
+                "%ds. Training on this node's own would put it a fixed "
+                "distance from every peer for the rest of the run"
+                % self.config.outer_deadline
+            )
+        # Training rounds start after the seed round, which used number 0.
+        loop.round_number = SEED_ROUND + 1
+        logger.info(
+            "Outer loop on: rank %d of %d, %d inner step(s) per round%s, "
+            "reports staged in %s.",
+            rank,
+            world,
+            self.config.outer_inner_steps,
+            " or %.0fs" % self.config.outer_round_seconds
+            if self.config.outer_round_seconds
+            else "",
+            root,
+        )
+        return loop
+
+    def _close_outer_round(self) -> None:
+        """Exchange deltas with the peers and take the outer step.
+
+        Never raises. A round that could not be closed leaves the model exactly
+        where the local training put it and the next round carries on from
+        there — which is worse than a round that worked and is very much better
+        than a training script that stops because a peer's disk was full.
+        """
+        from ravex._dist.exchange import close_round
+
+        if not self._outer or self._exchange is None:
+            return
+        try:
+            started = time.monotonic()
+            report = close_round(
+                self._outer,
+                self._exchange,
+                self._outer_peers,
+                time.monotonic() + self.config.outer_deadline,
+            )
+            logger.info(
+                "Outer round %d took %.1fs over %d node(s).",
+                report["round"],
+                time.monotonic() - started,
+                report["nodes"],
+            )
+        except Exception as exc:
+            logger.warning("Outer round failed: %s", exc)
+            # Advance anyway. A node that stays on a number its peers have left
+            # behind is asking for a round they retired while they ask for one
+            # it never reaches - both still running, both still logging closed
+            # rounds, permanently invisible to each other.
+            try:
+                self._outer.abandon_round()
+            except Exception:
+                pass
 
     def should_stop(self) -> bool:
         """Whether the configured step budget has been spent.
@@ -1570,6 +1767,16 @@ class RavexRuntime:
             if self._ring_link:
                 self._ring_link.close()
                 self._ring_link = None
+            if self._exchange is not None:
+                # Lingering, because leaving is not free: a node that shuts its
+                # listener the moment it is done takes its last report with it,
+                # and the peer still fetching it closes that round one
+                # contributor short - see `DeltaExchange.close`.
+                self._exchange.close(
+                    linger=min(60.0, float(self.config.outer_deadline)),
+                    expect=self._outer_peers,
+                )
+                self._exchange = None
             logger.info("Ravex shutdown complete at step %d", self.registry.step_count)
         except Exception as exc:
             logger.warning("Shutdown error: %s", exc)

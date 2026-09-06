@@ -533,6 +533,67 @@ other rank that entered the save together goes back to ordinary training,
 exactly as after any periodic checkpoint — a false alarm costs one
 out-of-cadence checkpoint, not a stopped job.
 
+## Training across the internet
+
+Nodes on different continents cannot synchronise gradients. The link between
+two rented boxes carries about 7 MB/s, and an all-reduce of a 1B model's
+gradients is 3 GB per node — **429 seconds per step**. So instead of
+communicating every step, each node trains locally for `outer_inner_steps` and
+then the nodes exchange the *difference* between the parameters they started
+the round with and the ones they hold now. An outer optimizer takes one step on
+the average. The bytes per round are the same as one gradient all-reduce; they
+are paid once per H steps.
+
+```yaml
+outer_loop: true
+outer_inner_steps: 500
+outer_round_seconds: 0       # or a wall clock, see below
+outer_lr: 0.7
+outer_momentum: 0.9
+outer_combine: mean          # mean | normalized | step_weighted
+outer_deadline: 900
+outer_save_dtype: null       # bf16 halves a round
+outer_root: null             # defaults to <storage.path>/rounds
+```
+
+**It never turns itself on.** Everything else in Ravex activates by itself
+because the worst it does is write a checkpoint. This changes what the run
+*trains* — the weights get averaged with other machines'. `outer_loop` is
+`false` until somebody writes otherwise.
+
+**A node dying does not stop the round.** Reports are pulled over Ravex's own
+sockets, each with its own deadline, and the round closes over whoever
+answered. There is no collective to hang in. `outer_deadline` is that deadline:
+running out of it is the answer, not a failure.
+
+**`outer_round_seconds` is what makes nodes of different speeds work.** With a
+step count, every node does the same work and the slowest sets the pace. With a
+clock, every node stops at the same moment having done as many steps as it
+could, and the step counts differing becomes the normal case. Set both and
+whichever comes first closes the round.
+
+**`outer_combine` was decided by measurement.** A delta is already proportional
+to the work behind it, so weighting *again* by step count counts a fast node
+twice. On nodes drawing from the same distribution that is invisible;
+give each node its own data and `step_weighted` costs **45% more loss** than
+the default. Leave it on `mean` unless you have measured otherwise.
+
+**What it needs from the launcher.** Peer addresses and the job token come from
+torch's rendezvous store, so the ranks must have called `init_process_group` —
+`torchrun`, including across machines with `--rdzv-backend=c10d`. The process
+group is used for its *store* and never for the exchange, so a rank dying
+breaks a group nothing here touches; what it constrains is the start.
+
+**`RAVEX_EXCHANGE_ADDRESS` is required whenever the nodes are not on one
+network.** Behind NAT, nothing a process can ask its own kernel returns the
+address a peer dials. Set it to the address peers should reach this node at,
+optionally with a port.
+
+**What is not handled.** Floating-point buffers — batch-norm running statistics
+— are not exchanged; each node keeps its own, and it says so once at startup.
+`outer_save_dtype` shrinks a round and what that costs in convergence has not
+been measured, which is why it is off.
+
 ## Diagnostics
 
 One environment variable exists to make something measurable that is
