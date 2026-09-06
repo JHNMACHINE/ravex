@@ -231,6 +231,34 @@
   state does not pass through the optimizer hooks Ravex installs at all — a
   gap to close or a limit to declare, but not one this seam settles.
 
+### Fixed
+
+- **`@ravex.train_loop(storage={"path": ...})` crashed several frames from the
+  mistake.**
+
+  `storage` is the one option whose value is a *section* rather than a scalar,
+  and the decorator applied every override with a bare `setattr` — so the dict
+  replaced the `StorageConfig` dataclass and the failure surfaced later as
+  `AttributeError: 'dict' object has no attribute 'path'` from inside
+  `_normalize`, naming neither the option nor the decorator. A mapping is the
+  obvious thing to reach for, because it is exactly how `ravex.yaml` spells
+  that section.
+
+  Both ways in now go through one function, `RavexConfig.apply_storage`, which
+  accepts a mapping or a `StorageConfig` and leaves untouched keys at their
+  defaults. The two callers differ in one way, and it is the distinction the
+  rest of the module already makes: a config *file* must never stop a training
+  run, so a bad section there is recorded in `problems` and the defaults stand;
+  a decorator keyword is someone typing at the call site and raises, exactly as
+  an unknown top-level option already did.
+
+  Two smaller things fell out. An unknown key inside the section — `pth` for
+  `path` — was silently dropped by the YAML path and is now reported with the
+  valid names. And the field list is the dataclass's own rather than `hasattr`,
+  because `hasattr` accepts `is_remote`, which is a property with no setter:
+  `storage: {is_remote: true}` in a config file used to raise `AttributeError`
+  from somewhere with nothing to do with configuration.
+
 ### Changed
 
 - **`all_ranks_agree` asks the rendezvous store instead of the collectives
