@@ -209,6 +209,17 @@ def _activate(**overrides: object) -> None:
     for key, value in overrides.items():
         if not hasattr(config, key):
             raise TypeError(f"unknown configuration option {key!r}")
+        if key == "storage":
+            # Not `setattr`. `storage` is the one option whose value is a
+            # section rather than a scalar, and assigning a dict over the
+            # dataclass used to surface several frames later as
+            # `AttributeError: 'dict' object has no attribute 'path'` from
+            # inside `_normalize` — naming neither this option nor this
+            # decorator. `strict` because a keyword typed at the call site is
+            # the most specific thing that could have said so, exactly like
+            # the unknown-option check above.
+            config.apply_storage(value, strict=True)
+            continue
         setattr(config, key, value)
     config._normalize()
 

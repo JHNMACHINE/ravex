@@ -15,6 +15,7 @@ override a config file baked into the user's repository.
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -527,15 +528,65 @@ class RavexConfig:
         config._normalize()
         return config
 
+    def apply_storage(self, value: Any, *, strict: bool = False) -> None:
+        """Take a storage section from a mapping, or from a ``StorageConfig``.
+
+        One function for both ways in — the YAML file and the decorator's
+        keyword overrides — because they had drifted into being two, and the
+        second one was ``setattr(config, "storage", {...})``: the dict simply
+        replaced the dataclass, and the failure arrived several frames later as
+        ``AttributeError: 'dict' object has no attribute 'path'`` from inside
+        ``_normalize``, naming neither ``storage`` nor the decorator. A mapping
+        is the obvious thing to reach for, because that is exactly how
+        ``ravex.yaml`` spells this section.
+
+        ``strict`` is the difference between the two callers, and it is the
+        distinction the rest of this module already makes. A config *file* must
+        never stop a training run, so a bad section there is recorded in
+        :attr:`problems` and the defaults stand. A decorator argument is
+        someone typing at the call site — the most specific thing that could
+        have said so — and it raises, exactly as an unknown top-level option
+        already does.
+
+        Unknown keys are refused rather than dropped, and the field list is the
+        dataclass's own rather than ``hasattr``: ``is_remote`` is a property
+        with no setter and ``resolve_credentials`` is a method, so ``hasattr``
+        accepts both and then assigning to the first raises from a place that
+        has nothing to do with configuration.
+        """
+        if isinstance(value, StorageConfig):
+            self.storage = value
+            return
+
+        def refuse(message: str) -> None:
+            if strict:
+                raise TypeError(message)
+            self.problems.append(message)
+
+        if not isinstance(value, Mapping):
+            refuse(
+                "storage=%r is not a storage section; expected a mapping such "
+                "as {'path': './checkpoints'} or a StorageConfig" % (value,)
+            )
+            return
+
+        known = {f.name for f in fields(StorageConfig)}
+        for key, entry in value.items():
+            if key in known:
+                setattr(self.storage, key, entry)
+            else:
+                refuse(
+                    "unknown storage option %r; expected one of %s"
+                    % (key, ", ".join(sorted(known)))
+                )
+
     def _apply_mapping(self, data: Dict[str, Any]) -> None:
         if not data:
             return
 
         storage = data.pop("storage", None)
-        if isinstance(storage, dict):
-            for key, value in storage.items():
-                if hasattr(self.storage, key):
-                    setattr(self.storage, key, value)
+        if storage is not None:
+            self.apply_storage(storage)
 
         frameworks = data.pop("frameworks", None)
         if isinstance(frameworks, dict) and "auto_detect" in frameworks:
