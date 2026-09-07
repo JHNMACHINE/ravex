@@ -209,13 +209,22 @@ def adopt_outer_state(loop, exchange: "DeltaExchange", source: int, rank: int,
 
     Returns whether this node ended up holding the shared state.
     """
+    expected = _report.expectation(loop.outer)
     exchange.publish(loop.outer, SEED_ROUND, 0)
     if rank == source:
+        # **The source has to adopt its own state too**, whenever a
+        # ``save_dtype`` means the peers will read a cast of it. Otherwise the
+        # one node that did not go through the wire holds parameters a
+        # quantization apart from everyone else's — from the first instant,
+        # never touched again, which is precisely the failure this function
+        # exists to prevent, reintroduced by the thing that shrinks the round.
+        # Found by the end-to-end test, which is where it would have to be
+        # found: nothing raises, and the run trains.
+        loop.outer = exchange.as_published(loop.outer, SEED_ROUND, expected)
+        loop.write_back()
         return True
 
-    reports = exchange.gather(
-        [source], SEED_ROUND, _report.expectation(loop.outer), deadline
-    )
+    reports = exchange.gather([source], SEED_ROUND, expected, deadline)
     if not reports:
         return False
 
@@ -547,6 +556,13 @@ class DeltaExchange:
         way to see exactly what the peers will see — the per-tensor scales of
         the float8 path are moonclip's, and reimplementing them here to guess
         at the answer would be a second way to quantize a tensor.
+
+        **And with it, it costs nothing measurable either**, which is what let
+        ``outer_save_dtype`` default to a cast rather than to nothing:
+        ``bench/round_link_cost.py`` at ``--save-dtype bf16``, 2026-09-07, put
+        the publish at 0.34 s against 0.13 s uncast — and 0.24 s of that
+        difference is the ``_io_lock``, not this. The round it is part of spent
+        2.6 s on the network.
         """
         if not self.save_dtype:
             return delta

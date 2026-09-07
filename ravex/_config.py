@@ -458,8 +458,27 @@ class RavexConfig:
     outer_loop: bool = False
 
     #: Local optimizer steps per round. The whole saving over synchronous data
-    #: parallelism is this number, so it wants to be large — hundreds — and
-    #: what it costs in convergence has not been measured past 20.
+    #: parallelism is this number, so it wants to be large — hundreds.
+    #:
+    #: **Measured** (`bench/outer_convergence.py`, 2026-09-07, a byte-level
+    #: transformer on two contiguous shards, 2048 local steps per node). Held
+    #: out loss: H=1 **2.69**, H=8 1.51, H=64 **1.45**, H=512 1.78, against
+    #: 1.55 for one node given the same wall clock and 1.38 for one node given
+    #: the same tokens. Two things worth carrying:
+    #:
+    #: *Small H is not a safe direction.* H=1 is the worst arm by far, not the
+    #: closest thing to synchronous training. An outer step per inner step
+    #: compounds a Nesterov buffer at `outer_lr` thousands of times and
+    #: overwrites the inner optimizer's progress each time; the outer defaults
+    #: are calibrated for H in the hundreds and there is no small-H limit where
+    #: this becomes ordinary data parallelism.
+    #:
+    #: *The ceiling that bench can see is on rounds, not on H.* At equal tokens
+    #: a larger H is fewer exchanges, so H=512 there is four of them in the
+    #: whole run — which is what degraded, and a long run at H=512 gets
+    #: hundreds. So 500 stands: nothing measured argues it down, and what
+    #: should actually set it is the link (`bench/round_link_cost.py` reports
+    #: the H at which the network is a quarter of the round).
     outer_inner_steps: int = 500
 
     #: Close the round on the clock instead of, or as well as, on the count.
@@ -487,10 +506,29 @@ class RavexConfig:
     #: absence. Sized for the link — a round moves one model's worth of bytes.
     outer_deadline: int = 900
 
-    #: Cast the delta before it goes on the wire: `bf16` halves a round,
-    #: `fp8` quarters it. Measured in `ravex._dist.report`; what it costs in
-    #: convergence is not measured, so this is off by default.
-    outer_save_dtype: Optional[str] = None
+    #: Cast the delta before it goes on the wire. `none` turns it off.
+    #:
+    #: **On by default since the measurement, and it was off before it for
+    #: exactly the right reason** — nobody had looked at what a cast costs the
+    #: loss. `bench/outer_convergence.py`, 2026-09-07: at every H tried, the
+    #: held-out loss with bf16 and with fp8 sits inside ±0.005 of no cast at
+    #: all, which is less than the spread between neighbouring arms; fp8 comes
+    #: out marginally *ahead* at one of them, which is how you know it is
+    #: noise. The worry that a delta truncated the same way every round
+    #: accumulates its error instead of averaging it out does not show either:
+    #: 256 rounds of it at H=8, column flat.
+    #:
+    #: What it buys, on the link this is for (`bench/round_link_cost.py`, 7 MB/s
+    #: with 200 ms of round trip): the report went 15.8 MB to 11.7 MB and the
+    #: round's network 3.28 s to 2.61 s, **a fifth off every round**, for no
+    #: measurable change in publish time.
+    #:
+    #: `bf16` and not `fp8`, which measured just as free and is 4.84x rather
+    #: than 2.56x: the evidence is one small model, and bf16 keeps fp32's
+    #: exponent range and loses only mantissa — 0.14% of relative error per
+    #: element against fp8's 2.3%. The larger bet is available and is a setting
+    #: away, which is the right way round for a bet that size.
+    outer_save_dtype: Optional[str] = "bf16"
 
     #: Where round reports are staged. Defaults to `rounds/` beside the
     #: checkpoint store. Kept apart from the checkpoints deliberately: these
@@ -842,6 +880,31 @@ class RavexConfig:
                 f"{', '.join(_OUTER_COMBINE_MODES)}; using 'mean'"
             )
             self.outer_combine = "mean"
+        if self.outer_save_dtype is not None:
+            # Same check `_normalize_save_dtype` makes on the checkpoint one,
+            # and for the same reason: Moonclip refuses a bad target when the
+            # manager is built, which for a round store is inside the `except`
+            # that gives up on the outer loop and carries on training alone. A
+            # typo would cost the whole run's exchange and say one line about
+            # it. It matters more here than it did there now that the default
+            # is a dtype rather than nothing: `none` has to keep meaning off,
+            # however it arrives.
+            name = str(self.outer_save_dtype).strip().lower()
+            if name in ("", "none", "off"):
+                # Every spelling of "off", and it needs all of them now that
+                # the default is a dtype: unset no longer means uncast, so a
+                # user turning it back off must not have to guess which word
+                # this option takes. `compression` accepts the same three.
+                self.outer_save_dtype = None
+            elif name not in _SAVE_DTYPES:
+                self.problems.append(
+                    f"outer_save_dtype={self.outer_save_dtype!r} is not a dtype "
+                    f"Moonclip can store; sending the delta uncast. Use one of: "
+                    f"{', '.join(sorted(_SAVE_DTYPES))}"
+                )
+                self.outer_save_dtype = None
+            else:
+                self.outer_save_dtype = name
         if str(self.compression).strip().lower() in ("none", "off", ""):
             self.compression_level = 0
 

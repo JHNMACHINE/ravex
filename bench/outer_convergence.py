@@ -46,12 +46,82 @@ included. Two extra arms:
     step. The arm reproduces it to show what it was worth, and the spread column
     is where it shows — see ``DeltaExchange.as_published``.
 
+**The cast arms are the slow ones.** Each writes both nodes' deltas to a
+moonclip store and reads them back, every round — which is the point, since a
+cast simulated in torch is not the cast that crosses the wire, but it means an
+arm at H=8 pays a store round trip 256 times per node. Raise ``--dtype-min-h``
+to skip the small-H cast cells if a run has to fit in a coffee break.
+
     python bench/outer_convergence.py
     python bench/outer_convergence.py --steps 4000 --h 1 32 256 1024
 
 A small model on a small corpus: these are a direction, not a scaling law. What
 they are good for is the shape — where the curve turns over, and whether a cast
 costs a little or costs the run.
+
+**Measured**, 2026-09-07: 696 KB of this repository, contiguous shards, 2 nodes,
+0.48M parameters, 2048 local steps per node in every arm. Held-out cross
+entropy, nats per byte:
+
+======== ======== ======== ======== ==========
+H        none     bf16     fp8      fp8+ef
+======== ======== ======== ======== ==========
+1        2.6906   —        —        —
+8        1.5149   1.5100   1.5164   1.4948
+64       **1.4455**  1.4452   **1.4434**  1.4442
+512      1.7836   1.7836   1.7830   1.7841
+======== ======== ======== ======== ==========
+
+against ``untrained`` 5.6950, ``one node, same steps`` 1.5527, and ``one node,
+2x the steps`` — the same tokens the pair saw — 1.3805.
+
+**The cast costs nothing measurable, at any H.** Every dtype column sits inside
+±0.005 of ``none``, which is smaller than the gap between neighbouring arms of
+the same column; fp8 comes out marginally *ahead* at H=64, which is how you
+know you are reading noise. So the 2.56x of bf16 and the 4.84x of fp8 measured
+in :mod:`ravex._dist.report` are available, and the worry they were held back
+for is not there — including the specific one, that a delta truncated the same
+way every round accumulates its error rather than averaging it out. At H=8
+there are 256 rounds to accumulate over and the fp8 column is still flat, so
+**error feedback is not needed at these sizes**: ``fp8+ef`` neither helps nor
+hurts beyond noise.
+
+**H has an optimum, and both sides of it are real.** H=64 beats a single node
+given the same wall clock by 7% and lands most of the way to a single node
+given the same *tokens*, which is what the whole arrangement is for. H=512 is
+worse than doing nothing distributed at all.
+
+**But the H axis and the round-count axis are the same axis here, and that is a
+property of the question rather than of the bench.** At equal tokens seen —
+which is what makes the comparison fair — a larger H is fewer rounds: H=512 is
+four exchanges in the whole run. So what H=512 shows is not "H is too large",
+it is "four exchanges is too few", and a real run at H=512 for 200k steps gets
+390 of them. The ceiling this can honestly report is on **rounds**, not on H.
+
+**H=1 is the surprise, and it is mostly the outer learning rate.** 2.69 against
+1.45 at H=64. An outer step at every inner step compounds a Nesterov buffer at
+``outer_lr=0.7`` 2048 times and overwrites the inner AdamW's progress each time,
+and those defaults are DiLoCo's, calibrated for H in the hundreds. Re-run at
+``--outer-lr 0.1`` it comes back to 1.79 — most of the gap — **and still loses
+to the single node in the same run** (1.60). So the conclusion survives the
+retune, and it is worth knowing because "set H low and it degrades gracefully
+toward synchronous training" is the natural assumption and it is false: there
+is no small-H limit where this becomes ordinary data parallelism.
+
+**What the ``own delta exact`` arm cost, and where it did not show.** At H=64
+with fp8: loss 1.4100 against 1.4104 with the fix — indistinguishable, and both
+perfectly healthy models. The ``spread`` column is the whole story:
+**3.42e-02** against 0.00e+00. Nothing about the loss curve, the round reports,
+or the models themselves would tell you that the two nodes had stopped training
+one model; only the invariant does. Which is why the test that guards it uses
+``torch.equal`` and not ``allclose``.
+
+**One caveat that is this bench's own fault.** The corpus is the repository, so
+editing the repository changes the corpus — three runs in one afternoon read
+696, 705 and 710 KB, and their baselines moved by 0.05 with it. Arms *within* a
+run are comparable because the corpus is loaded once; numbers from different
+runs are not, and every comparison above is within a run. ``--text`` pins a
+corpus if that matters.
 """
 
 import argparse
@@ -385,7 +455,7 @@ def main():
              args.nodes, parameters / 1e6))
     print("%d local steps per node in every arm, %d x %d tokens per step"
           % (args.steps, args.batch, args.block))
-    print()
+    print(flush=True)
 
     rows = []
 
@@ -394,7 +464,10 @@ def main():
         gap = spread(models) if models else 0.0
         rows.append({"arm": label, "loss": loss, "spread": gap,
                      "seconds": seconds})
-        print("%-34s %9.4f %11.2e %8.0fs" % (label, loss, gap, seconds))
+        # Flushed per arm: the cast arms take minutes each, and a run whose
+        # output only appears at the end is a run you cannot tell from a hang.
+        print("%-34s %9.4f %11.2e %8.0fs" % (label, loss, gap, seconds),
+              flush=True)
 
     print("%-34s %9s %11s %9s" % ("", "loss", "spread", "took"))
 

@@ -424,3 +424,32 @@ def test_the_decorator_takes_a_storage_mapping(tmp_path, monkeypatch):
         return get_runtime().config.storage.path
 
     assert train() == str(tmp_path / "here")
+
+
+def test_outer_save_dtype_defaults_to_a_cast_and_can_be_turned_off():
+    """GPU-118 moved this default, so `none` has to keep meaning off.
+
+    It arrives three ways — the dataclass default, a YAML value, an environment
+    variable — and before the default was a dtype, "off" was just "unset". Now
+    a user who wants the delta uncast has to be able to say so.
+    """
+    assert RavexConfig().outer_save_dtype == "bf16"
+
+    for spelling in ("none", "NONE", ""):
+        config = RavexConfig()
+        config.outer_save_dtype = spelling
+        config._normalize()
+        assert config.outer_save_dtype is None, spelling
+        assert not config.problems, config.problems
+
+
+def test_an_unusable_outer_save_dtype_is_caught_at_load():
+    """Moonclip refuses a bad target when the round store is *built*, which is
+    inside the except that gives up on the outer loop and trains alone. A typo
+    would cost the whole run's exchange and say one line about it."""
+    config = RavexConfig()
+    config.outer_save_dtype = "bfloat16ish"
+    config._normalize()
+
+    assert config.outer_save_dtype is None
+    assert any("outer_save_dtype" in problem for problem in config.problems)

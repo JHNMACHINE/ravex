@@ -38,8 +38,19 @@ targets, automatic uncast on load, all of it in Rust. The 4.84x of fp8 comes
 with a few percent of relative error on every element, which moonclip is
 explicit about being wrong for a checkpoint a run resumes from. An outer delta
 is not that: it is averaged across nodes and then scaled by an outer learning
-rate. Whether it survives that is a convergence measurement nobody has taken
-yet, and it is not claimed here.
+rate.
+
+**And it survives that.** Measured, 2026-09-07, `bench/outer_convergence.py`:
+a byte-level transformer on this repository's prose, two nodes on contiguous
+shards, 2048 local steps each. Held-out loss with the cast and without it sits
+inside ±0.005 at every H tried — smaller than the spread between neighbouring
+arms, and fp8 lands marginally *ahead* at H=64, which is how you know it is
+noise. The specific worry, that quantization error is not independent between
+rounds and so accumulates instead of averaging out, does not show either: at
+H=8 there are 256 rounds to accumulate over and the column is still flat.
+A small model, so this is a direction and not a scaling law — but the reduction
+is available and the argument for holding it back is now the measured one
+rather than the cautious one.
 
 **Deltas against a base, and a manifest that skips what the peer already has.**
 Both are the replication path's machinery, and both apply unchanged.

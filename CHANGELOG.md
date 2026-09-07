@@ -53,6 +53,33 @@
   included; there is an error-feedback arm because quantization error is not
   independent between rounds.
 
+  Held-out loss, 2 nodes, 2048 local steps each, against 1.55 for one node
+  given the same wall clock and 1.38 for one node given the same *tokens*:
+
+  | H | none | bf16 | fp8 | fp8+ef |
+  | --- | --- | --- | --- | --- |
+  | 1 | 2.69 | — | — | — |
+  | 8 | 1.51 | 1.51 | 1.52 | 1.49 |
+  | 64 | **1.45** | 1.45 | **1.44** | 1.44 |
+  | 512 | 1.78 | 1.78 | 1.78 | 1.78 |
+
+  - **The cast costs nothing measurable, at any H.** Every dtype column is
+    within ±0.005 of `none` — less than the spread between neighbouring arms —
+    and fp8 lands marginally *ahead* at H=64, which is how you know it is
+    noise. So the 2.56x of bf16 and the 4.84x of fp8 are available. The
+    specific worry does not show either: quantization error is not independent
+    between rounds, and at H=8 there are 256 rounds to accumulate over with the
+    column still flat. **Error feedback is not needed at these sizes.**
+  - **H has an optimum with both sides real**, but the H axis and the
+    round-count axis are the same axis at equal tokens seen — H=512 is four
+    exchanges in the whole run, so what degraded is *few rounds*, not large H.
+    The ceiling this can honestly report is on rounds.
+  - **H=1 is the worst arm, not the safest.** An outer step per inner step
+    compounds a Nesterov buffer at `outer_lr=0.7` two thousand times and
+    overwrites the inner optimizer each time. There is no small-H limit where
+    this degrades gracefully into ordinary data parallelism, which is the
+    natural assumption and is false.
+
 - **`outer_loop`: training across the internet, reached from `@ravex.train_loop`
   (GPU-116, under GPU-113).**
 
@@ -301,6 +328,23 @@
   real sockets at `save_dtype="bf16"` now end four rounds bit-identical; the
   test fails without the fix.
 
+  **The same mistake was a floor lower, in the seed round**, and turning the
+  default on is what surfaced it: the peers adopt what came down the wire,
+  which under a cast is not what the source wrote, so the one node that did not
+  go through the wire started a quantization away from everyone else — from the
+  first instant, never touched again. That is the exact failure
+  `adopt_outer_state` exists to prevent, reintroduced by the setting that
+  shrinks the round. The source now adopts its own published state too. Found
+  by the end-to-end test, which is the only place it could be found: nothing
+  raises, and the run trains.
+
+  What the defect was worth, measured (`bench/outer_convergence.py`, H=64,
+  fp8): loss 1.4100 against 1.4104 with the fix — indistinguishable, and both
+  perfectly healthy models. The spread between the two nodes' parameters:
+  **3.4e-02** against **0**. Nothing about the loss, the round reports or the
+  models themselves says the nodes have stopped training one model; only the
+  invariant does, which is why the tests use `torch.equal` and not `allclose`.
+
 - **A replication round over the collectives crashed on an install without
   NumPy.**
 
@@ -356,6 +400,24 @@
   from somewhere with nothing to do with configuration.
 
 ### Changed
+
+- **`outer_save_dtype` now defaults to `bf16` (GPU-118).**
+
+  It was `null` before, and for the right reason: nobody had looked at what a
+  cast costs the loss. Now somebody has, and it costs nothing measurable —
+  within ±0.005 at every H tried, less than the spread between neighbouring
+  arms. What it buys on the link this exists for is **a fifth off every
+  round**: 15.8 MB to 11.7 MB on the wire, 3.28 s to 2.61 s of network, with no
+  measurable change in publish time even though a cast makes each node read its
+  own report back before averaging it.
+
+  `fp8` measured just as free and is 4.84x rather than 2.56x; it is not the
+  default because the evidence is one small model, and bf16 keeps fp32's
+  exponent range and loses only mantissa — 0.14% of relative error per element
+  against fp8's 2.3%. The larger bet is one setting away, which is the right
+  way round for a bet that size. `outer_save_dtype: none` sends the delta
+  uncast, and an unusable value now lands in `problems` at load rather than
+  inside the `except` that gives up on the outer loop mid-run.
 
 - **`all_ranks_agree` asks the rendezvous store instead of the collectives
   (GPU-111).**

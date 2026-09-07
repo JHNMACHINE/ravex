@@ -334,3 +334,58 @@ def test_the_round_report_says_where_its_seconds_went(tmp_path):
         # The wait is a part of the gather and not a second span next to it.
         assert report["gather_wait_seconds"] <= report["gather_seconds"] + 1e-6
         assert report["publish_wait_seconds"] <= report["publish_seconds"] + 1e-6
+
+
+def test_the_seed_round_leaves_one_model_even_when_the_report_is_cast(tmp_path):
+    """``save_dtype`` must not put the source node a quantization from the rest.
+
+    The peers adopt what came down the wire, which under a cast is not what the
+    source wrote. If the source keeps its own uncast copy, the one node that
+    did not go through the wire starts a quantization away from everybody else
+    — from the first instant, and never touched again, because an outer round
+    only ever applies the *same* averaged gradient to whatever each node holds.
+    Which is the exact failure ``adopt_outer_state`` exists to prevent,
+    reintroduced by the setting that shrinks the round.
+
+    ``torch.equal`` and not ``allclose``: the whole claim is that they are one
+    model, and a tolerance is how the previous version of this passed.
+    """
+    from ravex._dist.exchange import adopt_outer_state
+
+    store = FakeStore()
+    models = [a_model(seed=3), a_model(seed=11)]
+    exchanges, errors = [], []
+    loops = []
+    for rank in range(2):
+        exchange = DeltaExchange(
+            rank, store, root=os.path.join(str(tmp_path), "r%d" % rank),
+            node="n%d" % rank, patience=15.0, save_dtype="bf16",
+        )
+        assert exchange.start()
+        exchanges.append(exchange)
+        loops.append(OuterLoop(models[rank], inner_steps=10, node="n%d" % rank))
+
+    def seed(rank):
+        try:
+            assert adopt_outer_state(
+                loops[rank], exchanges[rank], 0, rank, time.monotonic() + 30
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=seed, args=(rank,), daemon=True)
+               for rank in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(60)
+    for exchange in exchanges:
+        exchange.close()
+    if errors:
+        raise errors[0]
+
+    for name, value in loops[0].outer.items():
+        assert torch.equal(value, loops[1].outer[name]), name
+    left = dict(models[0].named_parameters())
+    for name, right in models[1].named_parameters():
+        assert torch.equal(left[name], right), name
