@@ -699,11 +699,25 @@ class RavexRuntime:
                 self._outer_peers,
                 time.monotonic() + self.config.outer_deadline,
             )
+            # The split, not just the total. On loopback this line read
+            # "took 0.0s" every time, which is the one number the whole
+            # architecture is chosen around and it was never observed - see
+            # `close_round` and GPU-117. `network` is what a slower link makes
+            # bigger; the rest is the model's size, not the link's speed.
             logger.info(
-                "Outer round %d took %.1fs over %d node(s).",
+                "Outer round %d took %.1fs over %d node(s): %.1fs network "
+                "(%.1fs of it waiting for a peer to reach the round), "
+                "%.1fs delta, %.1fs publish (%.1fs waiting on a fetch), "
+                "%.1fs outer step.",
                 report["round"],
                 time.monotonic() - started,
                 report["nodes"],
+                report.get("gather_seconds", 0.0),
+                report.get("gather_wait_seconds", 0.0),
+                report.get("delta_seconds", 0.0),
+                report.get("publish_seconds", 0.0),
+                report.get("publish_wait_seconds", 0.0),
+                report.get("apply_seconds", 0.0),
             )
         except Exception as exc:
             logger.warning("Outer round failed: %s", exc)

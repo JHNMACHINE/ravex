@@ -61,13 +61,14 @@ def nodes(store, tmp_path):
     """Two started exchanges, closed however the test ends."""
     made = []
 
-    def make(rank):
+    def make(rank, save_dtype=None):
         exchange = DeltaExchange(
             rank,
             store,
             root=os.path.join(str(tmp_path), "rank%d" % rank),
             node="n%d" % rank,
             patience=5.0,
+            save_dtype=save_dtype,
         )
         assert exchange.start(), "rank %d could not open its listener" % rank
         made.append(exchange)
@@ -289,6 +290,39 @@ def test_the_exchange_survives_several_rounds_on_one_listener(nodes):
         assert len(got) == 1
         assert got[0].round_number == round_number
         assert got[0].steps == 20 + round_number
+
+
+def test_without_a_cast_a_node_averages_exactly_what_it_wrote(nodes):
+    """No ``save_dtype``, no read back: the delta is its own wire form."""
+    zero = nodes(0)
+    delta = a_delta()
+    publish(zero, delta, 0, 10)
+
+    assert zero.as_published(delta, 0, _report.expectation(delta)) is delta
+
+
+def test_a_cast_delta_is_averaged_as_the_peers_will_read_it(nodes):
+    """The one thing that keeps every node taking the *same* outer step.
+
+    With ``save_dtype`` the report on the wire is a cast of the delta, so a
+    node that averaged the one it computed would be combining a different set
+    from everybody else — and the nodes would part by a quantization error per
+    round while every log line said the round closed over both of them.
+    """
+    zero, one = nodes(0, save_dtype="bf16"), nodes(1)
+    delta = a_delta()
+    expected = _report.expectation(delta)
+    publish(zero, delta, 0, 10)
+
+    mine = zero.as_published(delta, 0, expected)
+    theirs = one.gather([0], 0, expected, time.monotonic() + 10)
+
+    assert len(theirs) == 1
+    for name in delta:
+        # The cast really happened - otherwise this test would pass on a
+        # function that returned its argument.
+        assert not torch.equal(mine[name], delta[name]), name
+        assert torch.equal(mine[name], theirs[0].delta[name]), name
 
 
 def test_closing_twice_is_not_an_error(store, tmp_path):

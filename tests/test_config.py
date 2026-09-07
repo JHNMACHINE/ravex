@@ -424,3 +424,33 @@ def test_the_decorator_takes_a_storage_mapping(tmp_path, monkeypatch):
         return get_runtime().config.storage.path
 
     assert train() == str(tmp_path / "here")
+
+
+def test_outer_save_dtype_is_off_by_default_and_says_off_three_ways():
+    """It ships off (GPU-118), and every spelling of "off" has to work anyway.
+
+    A user who turns it on for a while and then wants the delta uncast again
+    should not have to guess which word this option takes — `compression`
+    accepts the same three, and an option that only understands one of them is
+    how a setting gets left on by accident.
+    """
+    assert RavexConfig().outer_save_dtype is None
+
+    for spelling in ("none", "NONE", ""):
+        config = RavexConfig()
+        config.outer_save_dtype = spelling
+        config._normalize()
+        assert config.outer_save_dtype is None, spelling
+        assert not config.problems, config.problems
+
+
+def test_an_unusable_outer_save_dtype_is_caught_at_load():
+    """Moonclip refuses a bad target when the round store is *built*, which is
+    inside the except that gives up on the outer loop and trains alone. A typo
+    would cost the whole run's exchange and say one line about it."""
+    config = RavexConfig()
+    config.outer_save_dtype = "bfloat16ish"
+    config._normalize()
+
+    assert config.outer_save_dtype is None
+    assert any("outer_save_dtype" in problem for problem in config.problems)

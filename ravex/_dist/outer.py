@@ -87,13 +87,22 @@ def float_buffers(model) -> List[str]:
     of this is "known, not solved": averaging them is defensible for batch norm
     and wrong for a counter, and picking one silently is how a model converges
     slightly worse for a reason nobody can find.
+
+    **Only the buffers a checkpoint carries.** A non-persistent buffer is not
+    in the state dict, which is the module's own way of saying it is derived
+    and not state — a causal attention mask is the common one, and it is
+    identical on every node by construction. Warning about those means every
+    transformer built the ordinary way gets a line about parameters drifting
+    apart that names something that cannot drift, and a warning that cries wolf
+    on the usual case is worse than no warning at all.
     """
     import torch
 
+    carried = set(model.state_dict())
     return [
         name
         for name, buf in model.named_buffers()
-        if buf is not None and torch.is_floating_point(buf)
+        if buf is not None and torch.is_floating_point(buf) and name in carried
     ]
 
 

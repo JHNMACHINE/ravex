@@ -364,6 +364,31 @@ def _wire_tensor(block: bytes):
         return torch.frombuffer(block, dtype=torch.uint8)
 
 
+def _wire_buffer(size: int):
+    """Room for ``size`` incoming bytes, as a tensor **and** as a buffer.
+
+    Both names point at one allocation: ``torch.frombuffer`` over a writable
+    ``bytearray`` shares its memory, so a ``recv`` into the tensor is a write
+    into the bytes, and the bytes can then go straight to anything taking a
+    buffer.
+
+    **This is what keeps NumPy out of the collectives road.** The previous
+    spelling received into ``torch.empty`` and converted back with
+    ``.numpy()``, which is not a conversion torch always has: torch does not
+    require NumPy, and on an install without it every one of those lines raises
+    "Numpy is not available" — after the wire work is done, so it is a crash
+    rather than something a caller can fall back from. ``ravex._dist``
+    ``collectives`` already replaced torch's object collectives for exactly
+    that reason and had to spell the decode ``bytes(tensor.tolist())``, which
+    is correct and builds a Python list per megabyte. Receiving into memory
+    Python already owns needs neither: no NumPy, and no copy either.
+    """
+    import torch
+
+    block = bytearray(size)
+    return torch.frombuffer(block, dtype=torch.uint8), block
+
+
 class RingLink:
     """This rank's two connections around the replication ring, kept open.
 
@@ -809,9 +834,9 @@ def _exchange_over_collectives(
         blob_tensor = _wire_tensor(existing_blob)
         handle = dist.isend(blob_tensor, dst=receive_from, group=group)
     if sending and incoming_blob_len:
-        blob_buffer = torch.empty(incoming_blob_len, dtype=torch.uint8)
+        blob_buffer, blob_bytes = _wire_buffer(incoming_blob_len)
         dist.recv(blob_buffer, src=send_to, group=group)
-        peer_existing = dict(_parse_manifest(blob_buffer.numpy().tobytes()))
+        peer_existing = dict(_parse_manifest(bytes(blob_bytes)))
     if handle is not None:
         handle.wait()
 
@@ -873,12 +898,14 @@ def _exchange_over_collectives(
 
             if writer is not None and index < their_chunks:
                 expected = min(chunk, incoming - index * chunk)
-                buffer = torch.empty(expected, dtype=torch.uint8)
+                buffer, block = _wire_buffer(expected)
                 dist.recv(buffer, src=receive_from, group=group)
-                # `.numpy()` shares the tensor's memory; `tobytes()` used to
-                # copy it. A fresh buffer is allocated every iteration, so the
-                # writer is never handed memory that is about to be reused.
-                writer.feed(buffer.numpy())
+                # The tensor and the block are one allocation, so the recv
+                # above already wrote into what is handed over here - no copy
+                # and no `.numpy()`, which torch does not always have. A fresh
+                # one per iteration, so the writer is never given memory that
+                # is about to be reused.
+                writer.feed(block)
 
             if handle is not None:
                 handle.wait()

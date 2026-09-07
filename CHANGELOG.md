@@ -1,8 +1,84 @@
 # Changelog
 
-## Unreleased
+## 0.1.0 — 2026-09-07
 
 ### Added
+
+- **A round says where its seconds went, and `bench/round_link_cost.py`
+  measures them on a link that is slow on purpose (GPU-117, under GPU-113).**
+
+  Everything the outer loop is built out of had only ever run on loopback,
+  where the network is free: every round printed `took 0.0s`, so the number the
+  whole architecture is chosen around had never been observed. The round report
+  now carries `delta_seconds`, `publish_seconds`, `publish_wait_seconds`,
+  `gather_seconds`, `gather_wait_seconds` and `apply_seconds`, and the runtime
+  logs the split rather than a total. The two waits are what a total cannot
+  tell apart: a round that took minutes is a link to pay for, a peer to stop
+  waiting for, or a lock to stop holding.
+
+  The bench puts a fixed-rate, fixed-latency TCP relay in front of each node's
+  listener — no `tc`, no privileges, runnable anywhere — and walks the bands.
+  At 7 MB/s and 200 ms of round trip, on a 15.8 MB report:
+
+  - **The transport gets 76% of the link.** 2.26 s of bytes, 2.97 s of round,
+    the rest decode and store. Extrapolated, a 1B model's bf16 delta is about
+    **375 s per round**, against the 429 s per *step* GPU-113 computed for
+    synchronous training. The premise holds and the saving really is H.
+  - **The rendezvous is not the problem.** A node twice as slow costs its peer
+    0.08–0.19 s of extra waiting, not the 0.3 s their compute differs by: the
+    slow node also starts earlier, so a constant speed difference is absorbed
+    within a round. Under every arm there is a 0.31 s floor, which is the dial
+    and the round trip, and it does not grow with the link.
+  - **The publish lock is the problem**, and the comment claiming it was close
+    to free was written from loopback timings. With both nodes on one link it
+    is never contended. Throttle one node only and its publish blocks
+    **2.2–2.3 s** waiting for a peer's fetch to drain, against a round whose
+    own transfer is 0.30 s. Recorded on `DeltaExchange._io_lock`, and filed.
+  - **The deadline bounds a slow transfer, not just an absent peer**, which is
+    a case it had never been shown. Cut at 0.85 s of a 1 s deadline having
+    moved 3 of 15.8 MB, both nodes closed the round over themselves alone and
+    carried on; the next round came back to two nodes and re-sent the abandoned
+    snapshot as well as the new one. A cut fetch costs a resend, not a run.
+
+- **`bench/outer_convergence.py`: what H and `save_dtype` cost the loss
+  (GPU-118, under GPU-113).**
+
+  `bench/outer_loop.py` answers "does the mechanism work" on a four-feature
+  regression, which converges whatever you do to it and so cannot tell H=20
+  from H=500. This is the same outer loop on a byte-level transformer over this
+  repository's own prose, with contiguous shards so the nodes really do see
+  different data, at equal tokens seen, against single-node baselines. The
+  quantization arms go through moonclip rather than through `.to(bfloat16)`,
+  so what is measured is what crosses the wire, per-tensor float8 scales
+  included; there is an error-feedback arm because quantization error is not
+  independent between rounds.
+
+  Held-out loss, 2 nodes, 2048 local steps each, against 1.55 for one node
+  given the same wall clock and 1.38 for one node given the same *tokens*:
+
+  | H | none | bf16 | fp8 | fp8+ef |
+  | --- | --- | --- | --- | --- |
+  | 1 | 2.69 | — | — | — |
+  | 8 | 1.51 | 1.51 | 1.52 | 1.49 |
+  | 64 | **1.45** | 1.45 | **1.44** | 1.44 |
+  | 512 | 1.78 | 1.78 | 1.78 | 1.78 |
+
+  - **The cast costs nothing measurable, at any H.** Every dtype column is
+    within ±0.005 of `none` — less than the spread between neighbouring arms —
+    and fp8 lands marginally *ahead* at H=64, which is how you know it is
+    noise. So the 2.56x of bf16 and the 4.84x of fp8 are available. The
+    specific worry does not show either: quantization error is not independent
+    between rounds, and at H=8 there are 256 rounds to accumulate over with the
+    column still flat. **Error feedback is not needed at these sizes.**
+  - **H has an optimum with both sides real**, but the H axis and the
+    round-count axis are the same axis at equal tokens seen — H=512 is four
+    exchanges in the whole run, so what degraded is *few rounds*, not large H.
+    The ceiling this can honestly report is on rounds.
+  - **H=1 is the worst arm, not the safest.** An outer step per inner step
+    compounds a Nesterov buffer at `outer_lr=0.7` two thousand times and
+    overwrites the inner optimizer each time. There is no small-H limit where
+    this degrades gracefully into ordinary data parallelism, which is the
+    natural assumption and is false.
 
 - **`outer_loop`: training across the internet, reached from `@ravex.train_loop`
   (GPU-116, under GPU-113).**
@@ -233,6 +309,70 @@
 
 ### Fixed
 
+- **With `outer_save_dtype` set, no two nodes took the same outer step
+  (GPU-118).**
+
+  A cast report is what the *peers* read, and a node was averaging the delta it
+  had computed instead — so every node combined a different set from the same
+  round. That is not a rounding detail: an outer step applies the same averaged
+  pseudo-gradient to whatever outer parameters a node holds, so a difference
+  between them is never touched again by anything. The nodes part by a
+  quantization error per round, forever, and from the outside the run looks
+  healthy — the loss falls and every round closes over everybody. It is the
+  same failure the seed round of GPU-116 exists to prevent, arriving through
+  another door.
+
+  `DeltaExchange.as_published` now reads back what was written whenever
+  `save_dtype` is set, so a node averages its own report in the form its peers
+  will see. Without a cast it is the identity and costs nothing. Two nodes over
+  real sockets at `save_dtype="bf16"` now end four rounds bit-identical; the
+  test fails without the fix.
+
+  **The same mistake was a floor lower, in the seed round**, and turning the
+  default on is what surfaced it: the peers adopt what came down the wire,
+  which under a cast is not what the source wrote, so the one node that did not
+  go through the wire started a quantization away from everyone else — from the
+  first instant, never touched again. That is the exact failure
+  `adopt_outer_state` exists to prevent, reintroduced by the setting that
+  shrinks the round. The source now adopts its own published state too. Found
+  by the end-to-end test, which is the only place it could be found: nothing
+  raises, and the run trains.
+
+  What the defect was worth, measured (`bench/outer_convergence.py`, H=64,
+  fp8): loss 1.4100 against 1.4104 with the fix — indistinguishable, and both
+  perfectly healthy models. The spread between the two nodes' parameters:
+  **3.4e-02** against **0**. Nothing about the loss, the round reports or the
+  models themselves says the nodes have stopped training one model; only the
+  invariant does, which is why the tests use `torch.equal` and not `allclose`.
+
+- **A replication round over the collectives crashed on an install without
+  NumPy.**
+
+  `RuntimeError: Numpy is not available`, from `exchange_stores` — twice: once
+  reading a peer's manifest, once handing each received chunk to the store
+  writer. Torch does not require NumPy and Ravex depends on PyYAML and nothing
+  else, so an image with neither is a configuration to keep working, and CI's
+  is one. Both raised *after* the bytes had already crossed the wire, which
+  makes it a crash rather than something a caller can fall back from — the same
+  reason `_all_gather_object` replaced torch's object collectives.
+
+  The fix is not a NumPy-free spelling of the same conversion but the absence
+  of a conversion: `_wire_buffer` receives into a `bytearray` and hands the
+  same allocation to torch as a tensor and to the writer as a buffer. No
+  NumPy, and no copy either — where `bytes(tensor.tolist())`, which is what
+  `collectives` had to use, builds a Python list per megabyte. A test runs both
+  roads with `tensor.numpy()` taken away and asserts they still leave the same
+  replica; it fails without the fix, with CI's error.
+
+- **Every transformer got a warning about a buffer that cannot drift.**
+
+  `float_buffers` reported all floating-point buffers, and a causal attention
+  mask is one — registered non-persistently, identical on every node by
+  construction, and named in a warning about parameters drifting apart. Only
+  buffers a checkpoint carries are reported now, which is the module's own way
+  of separating state from derived state. A warning that cries wolf on the
+  usual case is worse than no warning at all.
+
 - **`@ravex.train_loop(storage={"path": ...})` crashed several frames from the
   mistake.**
 
@@ -260,6 +400,24 @@
   from somewhere with nothing to do with configuration.
 
 ### Changed
+
+- **`outer_save_dtype` is measured now, and still off (GPU-118).**
+
+  It was `null` because nobody had looked at what a cast costs the loss.
+  Somebody has: nothing measurable, within ±0.005 at every H tried, and on the
+  link this exists for it takes **a fifth off every round** — 15.8 MB to
+  11.7 MB on the wire, 3.28 s to 2.61 s of network. So the reason it still
+  ships off is no longer "unmeasured". It is that turning it on is what
+  surfaced the seed-round defect below, and that the evidence is one 0.48M
+  model on one box, where a release changing what a run puts on the wire wants
+  a two-machine run behind it. Set it and take the fifth; `bf16` is the smaller
+  bet of the two that measured free.
+
+  What did change: an unusable value now lands in `problems` at load rather
+  than inside the `except` that gives up on the outer loop mid-run, and
+  `none`, `off` and the empty string all turn it off — `compression` accepts
+  the same three, and an option that understands only one of them is how a
+  setting gets left on by accident.
 
 - **`all_ranks_agree` asks the rendezvous store instead of the collectives
   (GPU-111).**

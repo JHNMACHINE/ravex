@@ -323,7 +323,8 @@ and nothing in `_interop` is imported by anything outside it except `_runtime`.
 | `src/` | The Rust core: `reshard.rs` is the planner, `transport.rs` frames and moves a store, `python.rs` is the only file that knows an interpreter exists |
 | `.forgejo/workflows/` | `checks.yml` on branches; `ci.yml` on main adds the moonclip backend and both integration jobs |
 
-As of 0.0.5 that is about 10.5k lines across 23 modules.
+As of 0.1.0 that is about 13k lines across 26 Python modules, plus 2.7k of
+Rust, against 12k lines of tests.
 
 ## Development
 

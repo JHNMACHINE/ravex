@@ -57,6 +57,31 @@ def _manifest(path):
     return sorted(store_files(path))
 
 
+def _forbid_numpy():
+    """Make ``tensor.numpy()`` raise what torch raises without NumPy.
+
+    Not a hypothetical: torch does not require NumPy and Ravex depends on
+    PyYAML and nothing else, so an image with neither is a supported
+    configuration — and the CI image is one. Every ``.numpy()`` on the
+    collective road raised "Numpy is not available" there, *after* the wire
+    work was done, which makes it a crash rather than something a caller can
+    fall back from.
+
+    Patched in the worker rather than the test because the roads run in spawned
+    processes, and set by an environment variable for the same reason — it is
+    the only channel a spawned process inherits without being handed one.
+    """
+    if not os.environ.get("RAVEX_TEST_NO_NUMPY"):
+        return
+
+    import torch
+
+    def unavailable(self, *args, **kwargs):
+        raise RuntimeError("Numpy is not available")
+
+    torch.Tensor.numpy = unavailable
+
+
 def _both_roads_worker(rank, port, root, out):
     """Rank 0 sends its store to rank 1, once each way, and the two are compared.
 
@@ -64,6 +89,7 @@ def _both_roads_worker(rank, port, root, out):
     different store or a different moment.
     """
     try:
+        _forbid_numpy()
         import torch.distributed as dist
 
         from ravex._dist.replication import RingLink, exchange_stores
@@ -236,6 +262,29 @@ def test_both_roads_leave_the_same_replica(tmp_path):
     names = {name for name, _size in results[1]["sockets"]}
     assert "empty.bin" in names, "a zero-length file is created by being reached"
     assert ".ravex-replica-ok" in names
+
+
+def test_both_roads_work_on_an_install_without_numpy(tmp_path, monkeypatch):
+    """The same pair of roads, with ``tensor.numpy()`` taken away.
+
+    Torch does not require NumPy and Ravex depends on PyYAML and nothing else,
+    so an image with neither is a configuration to keep working — and one of
+    ours is exactly that, which is where this was found. The collective road
+    used ``.numpy()`` twice, to read a peer's manifest and to hand each
+    received chunk to the store writer, and both raised after the bytes had
+    already crossed.
+
+    The same claim as the test above, so the assertions are the same: the two
+    roads still leave the same replica. What is different is only what the
+    process is allowed to call.
+    """
+    monkeypatch.setenv("RAVEX_TEST_NO_NUMPY", "1")
+    results = _run(_both_roads_worker, tmp_path)
+
+    assert results[0]["ok_collectives"] is True
+    assert results[1]["ok_collectives"] is True
+    assert results[1]["sockets"] == results[1]["collectives"]
+    assert results[1]["shard"] == 40_000
 
 
 def test_the_ring_runs_backwards_for_a_recovery(tmp_path):

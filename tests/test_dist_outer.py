@@ -88,6 +88,29 @@ def test_float_buffers_are_reported_not_averaged(caplog):
     assert "not exchanged between rounds" in caplog.text
 
 
+def test_a_buffer_no_checkpoint_carries_is_not_something_to_warn_about():
+    """A causal attention mask is the common case, and it cannot drift.
+
+    Non-persistent buffers are not in the state dict, which is the module's own
+    way of saying they are derived rather than state. Warning about them means
+    every transformer built the ordinary way gets a line about parameters
+    parting company that names the one thing in the model that is identical on
+    every node by construction.
+    """
+
+    class Masked(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(3, 3)
+            self.register_buffer("mask", torch.zeros(3, 3), persistent=False)
+            self.register_buffer("carried", torch.zeros(3))
+
+    model = Masked()
+    reported = float_buffers(model)
+    assert "mask" not in reported
+    assert "carried" in reported
+
+
 # --------------------------------------------------------------------------
 # the pseudo-gradient, whose sign is the whole trick
 

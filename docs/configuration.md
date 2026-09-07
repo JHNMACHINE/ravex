@@ -552,7 +552,7 @@ outer_lr: 0.7
 outer_momentum: 0.9
 outer_combine: mean          # mean | normalized | step_weighted
 outer_deadline: 900
-outer_save_dtype: null       # bf16 halves a round
+outer_save_dtype: null       # bf16 takes a fifth off a round
 outer_root: null             # defaults to <storage.path>/rounds
 ```
 
@@ -564,7 +564,20 @@ because the worst it does is write a checkpoint. This changes what the run
 **A node dying does not stop the round.** Reports are pulled over Ravex's own
 sockets, each with its own deadline, and the round closes over whoever
 answered. There is no collective to hang in. `outer_deadline` is that deadline:
-running out of it is the answer, not a failure.
+running out of it is the answer, not a failure. It bounds a transfer that is
+merely *slow* as well as one that never starts: a fetch cut halfway leaves the
+round closed over fewer nodes and costs a resend on the next one, not the run.
+
+**What a round costs, measured.** Every round logs where its seconds went —
+network, of which the part spent waiting for a peer to reach the round; the
+delta; the publish, of which the part spent waiting for a peer's fetch; and the
+outer step. On a link throttled to 7 MB/s with 200 ms of round trip, a 15.8 MB
+report takes 2.97 s to move, against the 2.26 s the bytes alone are worth: the
+transport gets about **76% of the link**, and the rest is decode and store.
+Extrapolated, a 1B model's bf16 delta is roughly **375 s per round** — set
+`outer_deadline` above that, and `outer_inner_steps` high enough that it is a
+small share of the round. `bench/round_link_cost.py` runs that measurement on
+any machine, with no privileges and no second box.
 
 **`outer_round_seconds` is what makes nodes of different speeds work.** With a
 step count, every node does the same work and the slowest sets the pace. With a
@@ -589,10 +602,39 @@ network.** Behind NAT, nothing a process can ask its own kernel returns the
 address a peer dials. Set it to the address peers should reach this node at,
 optionally with a port.
 
+**What `outer_inner_steps` costs the loss, measured.** A byte-level transformer
+on two contiguous shards, 2048 local steps per node, held-out loss: H=1 **2.69**,
+H=8 1.51, H=64 **1.45**, H=512 1.78 — against 1.55 for one node given the same
+wall clock and 1.38 for one node given the same *tokens*. Two things to take
+from it. **Small H is not the safe direction**: H=1 is the worst arm, because an
+outer step per inner step compounds the Nesterov buffer at `outer_lr` thousands
+of times and overwrites the inner optimizer each time. There is no small-H limit
+where this becomes ordinary data parallelism. And **H=512 degrading is about
+rounds, not about H**: at equal tokens a larger H is fewer exchanges, and 512
+there was four of them in the whole run. Pick H from the link —
+`bench/round_link_cost.py` reports the H at which the network is a quarter of
+the round — and make sure the run gets more than a handful of rounds at it.
+
+**`outer_save_dtype` is measured now, and still `null`.** Same bench: every
+dtype column within ±0.005 of no cast at every H, with fp8 marginally ahead at
+H=64 — noise, in other words. Including the
+specific worry, that a delta truncated the same way every round accumulates its
+error instead of averaging it out: at H=8 there are 256 rounds to accumulate
+over and the column is flat. On the link this is for, bf16 took the report from
+15.8 MB to 11.7 MB and the round's network from 3.28 s to 2.61 s — **a fifth
+off every round** — for no measurable change in publish time, even though a cast
+makes each node read its own report back before averaging it (local disk, not
+network).
+
+So it stays off not because nobody has looked, but because turning it on is what
+surfaced a defect in the seed round, and because the evidence is one 0.48M model
+on one box. Set `outer_save_dtype: bf16` and take the fifth — it is the smaller
+of the two bets that measured free, keeping fp32's exponent range and losing
+only mantissa (0.14% of relative error per element against fp8's 2.3%). `none`,
+`off` and an empty value all turn it off again.
+
 **What is not handled.** Floating-point buffers — batch-norm running statistics
 — are not exchanged; each node keeps its own, and it says so once at startup.
-`outer_save_dtype` shrinks a round and what that costs in convergence has not
-been measured, which is why it is off.
 
 ## Diagnostics
 
