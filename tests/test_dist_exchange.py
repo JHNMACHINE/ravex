@@ -372,3 +372,98 @@ def test_leaving_does_not_outlive_a_peer_that_will_never_fetch(nodes):
     elapsed = time.monotonic() - started
 
     assert 0.8 < elapsed < 5, "linger ran %.1fs for a peer that never comes" % elapsed
+
+
+def test_a_publish_does_not_wait_for_a_fetch_in_flight(nodes, monkeypatch):
+    """GPU-119, and it is the whole issue in one assertion.
+
+    Until each round got its own directory a lock stood between writing this
+    node's report and serving it, because one store held every round and
+    moonclip renames its manifest into place. A peer draining a slow link
+    therefore held a publish for the length of a transfer — 2.2-2.3 s against a
+    round whose own transfer was 0.30 s, and worse as nodes were added, because
+    the same lock serialised two peers fetching from one node.
+
+    The send is stubbed to be slow rather than throttled for real: what is
+    under test is whether anything blocks, not how fast a socket is.
+    """
+    import ravex._dist.exchange as exchange_module
+
+    zero, one = nodes(0), nodes(1)
+    delta = a_delta()
+    publish(zero, delta, 0, 10)
+
+    serving = threading.Event()
+
+    class SlowCore:
+        @staticmethod
+        def prestage_send(fileno, source, chunk):
+            serving.set()
+            time.sleep(2.0)
+            return 0
+
+        @staticmethod
+        def prestage_receive(fileno, destination):
+            return False
+
+    monkeypatch.setattr(exchange_module, "_rust_core", lambda: SlowCore)
+
+    fetching = threading.Thread(
+        target=one.gather,
+        args=([0], 0, _report.expectation(delta), time.monotonic() + 10),
+        daemon=True,
+    )
+    fetching.start()
+    assert serving.wait(5), "the serve never started, so nothing is in flight"
+
+    started = time.monotonic()
+    publish(zero, delta, 1, 11)
+    took = time.monotonic() - started
+
+    assert took < 0.5, (
+        "publishing round 1 waited %.2fs for a fetch of round 0 that is still "
+        "in flight" % took
+    )
+    assert zero.publish_wait < 0.5
+    fetching.join(10)
+
+
+def test_retention_does_not_delete_a_round_that_is_on_a_socket(nodes):
+    """The one race a lock used to cover, and now the only one left.
+
+    Nothing writes a published round any more, so the sole way a directory can
+    vanish under a reader is retention. It asks — with a set lookup, not a lock
+    held across a transfer.
+    """
+    zero = nodes(0)
+    delta = a_delta()
+
+    for round_number in range(6):
+        publish(zero, delta, round_number, 10)
+
+    kept = sorted(_report.rounds_present(zero.mine_path))
+    assert kept == [3, 4, 5], kept
+
+    # Round 3 goes on a socket, then four more rounds are published.
+    zero._hold(3)
+    for round_number in range(6, 10):
+        publish(zero, delta, round_number, 10)
+
+    assert _report.round_is_complete(zero.mine_path, 3), (
+        "retention deleted a round that was being served"
+    )
+
+    zero._release(3)
+    publish(zero, delta, 10, 10)
+    assert not _report.round_is_complete(zero.mine_path, 3)
+
+
+def test_a_round_is_not_servable_until_its_marker_lands(nodes, tmp_path):
+    """A directory without the marker is a publish in progress, not a report."""
+    root = str(tmp_path / "half-written")
+    os.makedirs(_report.round_path(root, 7), exist_ok=True)
+
+    assert not _report.round_is_complete(root, 7)
+
+    _report.publish_round(root, 7, a_delta(), 3, "n0")
+    assert _report.round_is_complete(root, 7)
