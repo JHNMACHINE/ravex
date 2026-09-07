@@ -59,7 +59,8 @@ def train(model, x, y, steps, start, optimizer):
 class Node(threading.Thread):
     """One participant: a model, a shard, a listener, and its own clock."""
 
-    def __init__(self, rank, store, shard, rounds, inner, world, root, dies_after=None):
+    def __init__(self, rank, store, shard, rounds, inner, world, root,
+                 dies_after=None, save_dtype=None):
         super().__init__(daemon=True)
         self.rank = rank
         self.store = store
@@ -71,7 +72,7 @@ class Node(threading.Thread):
         self.model = a_model()
         self.exchange = DeltaExchange(
             rank, store, root=os.path.join(root, "rank%d" % rank),
-            node="n%d" % rank, patience=15.0,
+            node="n%d" % rank, patience=15.0, save_dtype=save_dtype,
         )
         self.loop = None
         self.reports = []
@@ -278,3 +279,58 @@ def test_nodes_that_start_from_different_weights_end_up_on_one_model(tmp_path):
     finally:
         for exchange in exchanges:
             exchange.close()
+
+
+def test_a_cast_round_still_leaves_every_node_on_one_model(tmp_path):
+    """``save_dtype`` shrinks the report without splitting the nodes.
+
+    The wire form of a delta is a cast of it, and each node has to average the
+    cast one — including its own — or every node takes a slightly different
+    outer step from the same round. That failure is the one
+    ``adopt_outer_state`` exists to prevent, arriving through the other door:
+    nothing raises, the loss falls, every round closes over both nodes, and the
+    models drift apart by a quantization error per round for the rest of the
+    run. bf16 rather than fp8 so the tolerance below is a real bound and not a
+    formality.
+    """
+    store = FakeStore()
+    x, y = a_problem()
+    half = len(x) // 2
+    nodes = [
+        Node(rank, store,
+             (x[rank * half : (rank + 1) * half], y[rank * half : (rank + 1) * half]),
+             4, 15, 2, str(tmp_path), save_dtype="bf16")
+        for rank in range(2)
+    ]
+
+    for node in nodes:
+        node.start()
+    for node in nodes:
+        node.join(180)
+        if node.error is not None:
+            raise node.error
+
+    assert loss_of(nodes[0].model, x, y) < loss_of(a_model(), x, y) / 2
+
+    left = dict(nodes[0].model.named_parameters())
+    for name, right in nodes[1].model.named_parameters():
+        assert torch.equal(left[name], right), name
+
+
+def test_the_round_report_says_where_its_seconds_went(tmp_path):
+    """GPU-117: the split is in the report a real run produces.
+
+    Not a bench's business alone. Until this existed the only place a round's
+    network cost was ever printed was a loopback run, where it was 0.0 — so the
+    number the whole architecture is chosen around had never been looked at.
+    """
+    nodes, _ = run_nodes(str(tmp_path), world=2, rounds=2, inner=10)
+
+    for report in nodes[0].reports:
+        for key in ("delta_seconds", "publish_seconds", "publish_wait_seconds",
+                    "gather_seconds", "gather_wait_seconds", "apply_seconds"):
+            assert key in report, key
+            assert report[key] >= 0.0, key
+        # The wait is a part of the gather and not a second span next to it.
+        assert report["gather_wait_seconds"] <= report["gather_seconds"] + 1e-6
+        assert report["publish_wait_seconds"] <= report["publish_seconds"] + 1e-6

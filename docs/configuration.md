@@ -564,7 +564,20 @@ because the worst it does is write a checkpoint. This changes what the run
 **A node dying does not stop the round.** Reports are pulled over Ravex's own
 sockets, each with its own deadline, and the round closes over whoever
 answered. There is no collective to hang in. `outer_deadline` is that deadline:
-running out of it is the answer, not a failure.
+running out of it is the answer, not a failure. It bounds a transfer that is
+merely *slow* as well as one that never starts: a fetch cut halfway leaves the
+round closed over fewer nodes and costs a resend on the next one, not the run.
+
+**What a round costs, measured.** Every round logs where its seconds went —
+network, of which the part spent waiting for a peer to reach the round; the
+delta; the publish, of which the part spent waiting for a peer's fetch; and the
+outer step. On a link throttled to 7 MB/s with 200 ms of round trip, a 15.8 MB
+report takes 2.97 s to move, against the 2.26 s the bytes alone are worth: the
+transport gets about **76% of the link**, and the rest is decode and store.
+Extrapolated, a 1B model's bf16 delta is roughly **375 s per round** — set
+`outer_deadline` above that, and `outer_inner_steps` high enough that it is a
+small share of the round. `bench/round_link_cost.py` runs that measurement on
+any machine, with no privileges and no second box.
 
 **`outer_round_seconds` is what makes nodes of different speeds work.** With a
 step count, every node does the same work and the slowest sets the pace. With a

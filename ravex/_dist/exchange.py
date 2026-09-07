@@ -115,23 +115,67 @@ def close_round(loop, exchange: "DeltaExchange", peers, deadline: float):
     returns peers only — so that "did this node average itself in twice" has
     exactly one place to be answered.
 
-    Returns whatever :meth:`ravex._dist.outer.OuterLoop.apply` returns, and
-    that report is the honest record of the round: how many nodes were in it,
-    and how far apart their step counts were.
+    Returns whatever :meth:`ravex._dist.outer.OuterLoop.apply` returns, plus
+    where the round's seconds went. The first half is the honest record of the
+    round — how many nodes were in it, and how far apart their step counts
+    were; the second half is GPU-117, and it is in the report a real run
+    produces rather than only in a bench, because the seconds a round spends on
+    the network is the number that decides H and until now the only place it
+    was ever printed was a loopback run, where it was 0.0.
+
+    Four spans, and they answer different questions:
+
+    ``delta_seconds``
+        subtracting the round's parameters. Compute, not network, and the one
+        line here that scales with the model rather than with the link.
+    ``publish_seconds``
+        writing this node's report to its store, and reading back what the
+        peers will see of it (:meth:`DeltaExchange.as_published`, free unless
+        ``save_dtype`` is set). ``publish_wait_seconds`` is the part of it
+        spent waiting for a peer's in-flight fetch to let go of the manifest —
+        see ``DeltaExchange._io_lock``, whose cost was argued to be near zero
+        on the strength of loopback timings, and is not.
+    ``gather_seconds``
+        the network, and the rendezvous: fetching every peer's report. Of
+        which ``gather_wait_seconds`` is the part before the slowest peer's
+        first byte — the dial, the round trip, and that peer still finishing
+        the round it is in. The remainder is bytes moving, and a round that
+        took minutes is a link to pay for or a peer to stop waiting for
+        depending on which of the two it was.
+    ``apply_seconds``
+        combining and the outer step.
     """
     from ravex._dist.outer import Contribution
 
+    started = time.monotonic()
     mine = loop.contribution()
     expected = _report.expectation(mine.delta)
+    subtracted = time.monotonic()
     exchange.publish(mine.delta, loop.round_number, mine.steps)
+    # What the peers will average, which under `save_dtype` is not what was
+    # just handed over. See `DeltaExchange.as_published`.
+    mine.delta = exchange.as_published(mine.delta, loop.round_number, expected)
+    published = time.monotonic()
     reports = exchange.gather(peers, loop.round_number, expected, deadline)
-    return loop.apply(
+    gathered = time.monotonic()
+    report = loop.apply(
         [mine]
         + [
             Contribution(delta=r.delta, steps=r.steps, node=r.node)
             for r in reports
         ]
     )
+    report.update(
+        {
+            "delta_seconds": subtracted - started,
+            "publish_seconds": published - subtracted,
+            "publish_wait_seconds": exchange.publish_wait,
+            "gather_seconds": gathered - published,
+            "gather_wait_seconds": exchange.gather_wait,
+            "apply_seconds": time.monotonic() - gathered,
+        }
+    )
+    return report
 
 
 #: The round number the starting parameters are published under. Training
@@ -300,6 +344,10 @@ class DeltaExchange:
         self.peers_path = os.path.join(root, "peers")
         os.makedirs(self.mine_path, exist_ok=True)
         os.makedirs(self.peers_path, exist_ok=True)
+        #: Kept, and not only handed to the store: it decides whether this
+        #: node's own contribution has to be read back before it can be
+        #: averaged. See :meth:`as_published`.
+        self.save_dtype = save_dtype
         self.mine = _report.open_store(
             self.mine_path,
             compression_level=compression_level,
@@ -314,12 +362,51 @@ class DeltaExchange:
         #: a round failing to publish, the node's round number not advancing,
         #: and the peers quietly drifting out of alignment with it.
         #:
-        #: What it costs is that publishing waits for an in-flight fetch. That
-        #: is close to free where it lands: publish and gather both happen at
-        #: the round boundary, so the node was about to wait on the network
-        #: anyway. It is taken *after* the wait for the round, never before, or
-        #: a peer waiting for a round would hold the lock the publish needs.
+        #: What it costs is that publishing waits for an in-flight fetch, and
+        #: **the first version of this comment said that was close to free.**
+        #: It is, on loopback, where a fetch is over in milliseconds and both
+        #: nodes reach the round boundary together. Measured on a throttled
+        #: link (`bench/round_link_cost.py`, 2026-09-07, a 15.8 MB report on
+        #: the wire, 200 ms round trip) the claim does not survive contact with
+        #: a link that is slower in one direction than the other:
+        #:
+        #: ==================== ============= ==============
+        #: link                 publish       of which lock
+        #: ==================== ============= ==============
+        #: both at 7 MB/s       0.13 s        0.00 s
+        #: one node throttled   0.83 s        **0.72 s**
+        #: after a cut fetch    0.87 s        0.76 s
+        #: ==================== ============= ==============
+        #:
+        #: With both nodes on the same link they cannot get ahead of each
+        #: other — each waits for the other's report anyway, so the lock is
+        #: never contended and the original reasoning holds exactly there.
+        #: Where it fails is the case this system is *for*: a peer whose uplink
+        #: is slower, whose fetch is still draining when this node comes round
+        #: again. Worst single round observed 2.34 s, against a round whose own
+        #: transfer was 0.30 s. A report directory per round would take the
+        #: lock off the critical path; GPU-119 is that, filed rather than done
+        #: here because what GPU-117 owed was the number.
+        #: It is taken *after* the wait for the round, never before, or a peer
+        #: waiting for a round would hold the lock the publish needs.
         self._io_lock = threading.Lock()
+
+        #: Seconds the most recent :meth:`publish` spent waiting for that lock.
+        #: Measured rather than argued about (GPU-117): "close to free" was
+        #: reasoned from loopback, where a fetch is over in milliseconds, and
+        #: the claim only becomes a claim on a link where a fetch lasts as long
+        #: as a model transfer. It rides out in the round report so a real run
+        #: says whether the lock is free or whether reports need a directory
+        #: per round.
+        self.publish_wait = 0.0
+
+        #: Seconds the most recent :meth:`gather` spent before a peer's first
+        #: byte of report — the dial, the round trip, and the peer finishing
+        #: the round it is still in. The rest of the gather is bytes moving,
+        #: and telling the two apart is what says whether a slow round is a
+        #: link to pay for or a peer to stop waiting for.
+        self.gather_wait = 0.0
+        self._waits: Dict[int, float] = {}
 
         self._round = -1
         #: The newest round each peer has actually taken from this node. Not
@@ -432,11 +519,49 @@ class DeltaExchange:
         is to catch up from the current outer state rather than to be handed
         history one round at a time.
         """
+        asked = time.monotonic()
         with self._io_lock:
+            self.publish_wait = time.monotonic() - asked
             _report.write(self.mine, delta, round_number, steps, self.node)
         with self._lock:
             self._round = max(self._round, int(round_number))
             self._lock.notify_all()
+
+    def as_published(self, delta, round_number: int, expected):
+        """This node's delta **as its peers will read it**, which is not always
+        the one it wrote.
+
+        With ``save_dtype`` set, the report on the wire is a cast of this
+        node's delta and the peers combine *that*. If this node combined its
+        own uncast one instead, every node would take a slightly different
+        outer step from the same round — and that is not a rounding detail, it
+        is the failure :func:`adopt_outer_state` exists to prevent, arriving by
+        another door. The nodes' parameters separate by a quantization error
+        per round, nothing ever brings them back together, and from the outside
+        the run looks healthy: the loss falls and every round closes over
+        everybody.
+
+        Without ``save_dtype`` it is the identity and costs nothing, which is
+        why the read is behind the check rather than done unconditionally.
+        The read is of this node's own disk, not a network, and it is the only
+        way to see exactly what the peers will see — the per-tensor scales of
+        the float8 path are moonclip's, and reimplementing them here to guess
+        at the answer would be a second way to quantize a tensor.
+        """
+        if not self.save_dtype:
+            return delta
+        try:
+            return _report.read(self.mine, round_number, expected).delta
+        except Exception as exc:
+            logger.warning(
+                "Could not read back this node's own round %d report (%s), so "
+                "it is averaged uncast while the peers average the cast one. "
+                "This node's parameters will part from theirs by the "
+                "quantization error of one round.",
+                round_number,
+                exc,
+            )
+            return delta
 
     # -- fetching ---------------------------------------------------------
 
@@ -453,11 +578,19 @@ class DeltaExchange:
         whoever answered — never padded, never waited past. The caller adds its
         own contribution; this returns peers only, so that a node cannot
         average itself in twice by a mistake made in one place.
+
+        Leaves :attr:`gather_wait` behind: of the seconds this took, how many
+        went on the *slowest peer's* rendezvous rather than on bytes. The two
+        are different problems with the same symptom — a round that took
+        minutes is a link to pay for or a peer to wait less for, and which one
+        it is cannot be read off a total (GPU-117).
         """
         if not peers:
+            self.gather_wait = 0.0
             return []
 
         answered: Dict[int, _report.Report] = {}
+        self._waits = {}
         found = threading.Lock()
         threads = []
         for peer in peers:
@@ -473,6 +606,10 @@ class DeltaExchange:
             remaining = deadline - time.monotonic()
             if remaining > 0:
                 thread.join(remaining)
+
+        # The slowest peer's, not the sum: the fetches run at once, so what the
+        # round waited for is the last peer to arrive.
+        self.gather_wait = max(self._waits.values()) if self._waits else 0.0
 
         # Keyed by peer rather than by the name in the payload: who answered is
         # a fact this node knows, and a report's own ``node`` field is written
@@ -512,6 +649,7 @@ class DeltaExchange:
 
         host, _, port = address.rpartition(":")
         connection = None
+        dialled = time.monotonic()
         try:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -533,6 +671,11 @@ class DeltaExchange:
                 return None
             connection.settimeout(remaining)
             head = _recv_exactly(connection, RESPONSE.size, deadline)
+            # The peer answers the greeting only once it holds the round asked
+            # for, so everything up to here is the dial, the round trip and the
+            # peer's own round - and everything after it is bytes. See
+            # `gather_wait`.
+            self._waits[peer] = time.monotonic() - dialled
             acknowledgement, status, length = RESPONSE.unpack(head)
 
             expect = RingLink._acknowledgement(self.secret, self.rank)
