@@ -29,11 +29,13 @@ from __future__ import annotations
 
 from typing import Any, Dict, Tuple
 
-# Imported eagerly, and this is the one place in the package where that is not a
-# startup-cost mistake. `ravex/__init__.py` is run in every interpreter on the
-# machine once the autoloader is installed, so nothing it touches may be
-# expensive — but `_dist` is reached only from the resume path, and by then a
-# checkpoint is already being opened.
+# Imported eagerly, and it is fine here for a reason that outlived the rule it
+# was written under. Until 0.1.0 the rule was hard: `ravex/__init__.py` ran in
+# every interpreter on the machine, because the autoloader put it there, so
+# nothing it touched could be expensive. The autoloader is gone and the import
+# is now paid only by whoever imports Ravex on purpose — but this module is
+# still reached only from the resume path, and by then a checkpoint is already
+# being opened, so the cost lands where it cannot be noticed either way.
 from ravex._core import (
     ReshardUnsupported,
     check_covered,
