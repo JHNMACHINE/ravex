@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.0 — 2026-09-07
 
 ### Added
 
@@ -401,23 +401,23 @@
 
 ### Changed
 
-- **`outer_save_dtype` now defaults to `bf16` (GPU-118).**
+- **`outer_save_dtype` is measured now, and still off (GPU-118).**
 
-  It was `null` before, and for the right reason: nobody had looked at what a
-  cast costs the loss. Now somebody has, and it costs nothing measurable —
-  within ±0.005 at every H tried, less than the spread between neighbouring
-  arms. What it buys on the link this exists for is **a fifth off every
-  round**: 15.8 MB to 11.7 MB on the wire, 3.28 s to 2.61 s of network, with no
-  measurable change in publish time even though a cast makes each node read its
-  own report back before averaging it.
+  It was `null` because nobody had looked at what a cast costs the loss.
+  Somebody has: nothing measurable, within ±0.005 at every H tried, and on the
+  link this exists for it takes **a fifth off every round** — 15.8 MB to
+  11.7 MB on the wire, 3.28 s to 2.61 s of network. So the reason it still
+  ships off is no longer "unmeasured". It is that turning it on is what
+  surfaced the seed-round defect below, and that the evidence is one 0.48M
+  model on one box, where a release changing what a run puts on the wire wants
+  a two-machine run behind it. Set it and take the fifth; `bf16` is the smaller
+  bet of the two that measured free.
 
-  `fp8` measured just as free and is 4.84x rather than 2.56x; it is not the
-  default because the evidence is one small model, and bf16 keeps fp32's
-  exponent range and loses only mantissa — 0.14% of relative error per element
-  against fp8's 2.3%. The larger bet is one setting away, which is the right
-  way round for a bet that size. `outer_save_dtype: none` sends the delta
-  uncast, and an unusable value now lands in `problems` at load rather than
-  inside the `except` that gives up on the outer loop mid-run.
+  What did change: an unusable value now lands in `problems` at load rather
+  than inside the `except` that gives up on the outer loop mid-run, and
+  `none`, `off` and the empty string all turn it off — `compression` accepts
+  the same three, and an option that understands only one of them is how a
+  setting gets left on by accident.
 
 - **`all_ranks_agree` asks the rendezvous store instead of the collectives
   (GPU-111).**

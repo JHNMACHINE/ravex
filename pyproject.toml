@@ -65,7 +65,19 @@ dependencies = ["PyYAML>=5.1"]
 #            method". The same release also made a write over 5 GiB reach S3
 #            at all, which `sharded_checkpoints: gather` produces on its own
 #            for a model of any size.
-moonclip = ["moonclip>=0.0.9"]
+#   >=0.1.0  `describe()`, and this move is the round exchange rather than the
+#            checkpoint. `_dist/report.py` checks a peer's report — its names,
+#            shapes and dtypes — off the manifest before materialising a single
+#            tensor, and it calls `describe()` unguarded because there is no
+#            sensible fallback for "look at the payload before allocating it".
+#            On 0.0.9 that is an AttributeError inside the `except Exception`
+#            that treats a peer as unreadable: every round then closes with
+#            zero contributors, each node trains its own model, and the log
+#            says the round closed. `_backends.py` uses the same release's
+#            `load_tensors` and `describe_state_dict` and *can* do without
+#            them, so it asks `hasattr`; the exchange cannot, so the floor is
+#            where it has to be caught.
+moonclip = ["moonclip>=0.1.0"]
 dev = ["pytest>=7", "numpy"]
 
 [project.urls]

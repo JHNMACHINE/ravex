@@ -426,14 +426,15 @@ def test_the_decorator_takes_a_storage_mapping(tmp_path, monkeypatch):
     assert train() == str(tmp_path / "here")
 
 
-def test_outer_save_dtype_defaults_to_a_cast_and_can_be_turned_off():
-    """GPU-118 moved this default, so `none` has to keep meaning off.
+def test_outer_save_dtype_is_off_by_default_and_says_off_three_ways():
+    """It ships off (GPU-118), and every spelling of "off" has to work anyway.
 
-    It arrives three ways — the dataclass default, a YAML value, an environment
-    variable — and before the default was a dtype, "off" was just "unset". Now
-    a user who wants the delta uncast has to be able to say so.
+    A user who turns it on for a while and then wants the delta uncast again
+    should not have to guess which word this option takes — `compression`
+    accepts the same three, and an option that only understands one of them is
+    how a setting gets left on by accident.
     """
-    assert RavexConfig().outer_save_dtype == "bf16"
+    assert RavexConfig().outer_save_dtype is None
 
     for spelling in ("none", "NONE", ""):
         config = RavexConfig()

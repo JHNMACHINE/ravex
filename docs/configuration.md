@@ -552,7 +552,7 @@ outer_lr: 0.7
 outer_momentum: 0.9
 outer_combine: mean          # mean | normalized | step_weighted
 outer_deadline: 900
-outer_save_dtype: bf16       # or fp8, or none
+outer_save_dtype: null       # bf16 takes a fifth off a round
 outer_root: null             # defaults to <storage.path>/rounds
 ```
 
@@ -615,9 +615,9 @@ there was four of them in the whole run. Pick H from the link —
 `bench/round_link_cost.py` reports the H at which the network is a quarter of
 the round — and make sure the run gets more than a handful of rounds at it.
 
-**`outer_save_dtype` is `bf16` by default, and it was `null` before this was
-measured.** Same bench: every dtype column within ±0.005 of no cast at every H,
-with fp8 marginally ahead at H=64 — noise, in other words. Including the
+**`outer_save_dtype` is measured now, and still `null`.** Same bench: every
+dtype column within ±0.005 of no cast at every H, with fp8 marginally ahead at
+H=64 — noise, in other words. Including the
 specific worry, that a delta truncated the same way every round accumulates its
 error instead of averaging it out: at H=8 there are 256 rounds to accumulate
 over and the column is flat. On the link this is for, bf16 took the report from
@@ -626,11 +626,12 @@ off every round** — for no measurable change in publish time, even though a ca
 makes each node read its own report back before averaging it (local disk, not
 network).
 
-`fp8` measured just as free and is 4.84x rather than 2.56x. It is not the
-default because the evidence is one small model and bf16 is the smaller bet: it
-keeps fp32's exponent range and loses only mantissa, 0.14% of relative error per
-element against fp8's 2.3%. Set `outer_save_dtype: none` to send the delta
-uncast.
+So it stays off not because nobody has looked, but because turning it on is what
+surfaced a defect in the seed round, and because the evidence is one 0.48M model
+on one box. Set `outer_save_dtype: bf16` and take the fifth — it is the smaller
+of the two bets that measured free, keeping fp32's exponent range and losing
+only mantissa (0.14% of relative error per element against fp8's 2.3%). `none`,
+`off` and an empty value all turn it off again.
 
 **What is not handled.** Floating-point buffers — batch-norm running statistics
 — are not exchanged; each node keeps its own, and it says so once at startup.

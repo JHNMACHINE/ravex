@@ -42,7 +42,7 @@ from typing import Any, Callable, Optional, TypeVar
 #: the wheel from. Two places, because maturin has no equivalent of setuptools'
 #: ``dynamic = {attr = ...}``; ``tests/test_version_is_single.py`` fails if they
 #: ever disagree.
-__version__ = "0.0.5"
+__version__ = "0.1.0"
 
 __all__ = [
     "checkpoint",

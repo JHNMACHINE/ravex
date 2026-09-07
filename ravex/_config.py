@@ -506,29 +506,30 @@ class RavexConfig:
     #: absence. Sized for the link — a round moves one model's worth of bytes.
     outer_deadline: int = 900
 
-    #: Cast the delta before it goes on the wire. `none` turns it off.
+    #: Cast the delta before it goes on the wire: `bf16` is 2.56x smaller,
+    #: `fp8` 4.84x (measured in `ravex._dist.report`). `none` turns it off.
     #:
-    #: **On by default since the measurement, and it was off before it for
-    #: exactly the right reason** — nobody had looked at what a cast costs the
-    #: loss. `bench/outer_convergence.py`, 2026-09-07: at every H tried, the
-    #: held-out loss with bf16 and with fp8 sits inside ±0.005 of no cast at
-    #: all, which is less than the spread between neighbouring arms; fp8 comes
-    #: out marginally *ahead* at one of them, which is how you know it is
-    #: noise. The worry that a delta truncated the same way every round
-    #: accumulates its error instead of averaging it out does not show either:
-    #: 256 rounds of it at H=8, column flat.
+    #: **Measured, and still off.** `bench/outer_convergence.py`, 2026-09-07:
+    #: at every H tried, the held-out loss with bf16 and with fp8 sits inside
+    #: ±0.005 of no cast at all — less than the spread between neighbouring
+    #: arms, and fp8 comes out marginally *ahead* at one of them, which is how
+    #: you know it is noise. The worry that a delta truncated the same way
+    #: every round accumulates its error instead of averaging it out does not
+    #: show either: 256 rounds of it at H=8, column flat. On the link this is
+    #: for (`bench/round_link_cost.py`, 7 MB/s, 200 ms round trip) it took the
+    #: report from 15.8 MB to 11.7 MB and the round's network from 3.28 s to
+    #: 2.61 s — **a fifth off every round** — for no measurable change in
+    #: publish time.
     #:
-    #: What it buys, on the link this is for (`bench/round_link_cost.py`, 7 MB/s
-    #: with 200 ms of round trip): the report went 15.8 MB to 11.7 MB and the
-    #: round's network 3.28 s to 2.61 s, **a fifth off every round**, for no
-    #: measurable change in publish time.
-    #:
-    #: `bf16` and not `fp8`, which measured just as free and is 4.84x rather
-    #: than 2.56x: the evidence is one small model, and bf16 keeps fp32's
-    #: exponent range and loses only mantissa — 0.14% of relative error per
-    #: element against fp8's 2.3%. The larger bet is available and is a setting
-    #: away, which is the right way round for a bet that size.
-    outer_save_dtype: Optional[str] = "bf16"
+    #: So the reason it is still `None` is no longer "unmeasured". It is that
+    #: **turning it on is what surfaced the seed-round defect** — the source
+    #: node was keeping its own uncast parameters while every peer adopted the
+    #: cast ones, and nothing raised — and that the evidence is one 0.48M
+    #: model on one box, where a release that changes what a run puts on the
+    #: wire wants a two-machine run behind it. Set it, and take the fifth: the
+    #: measurement says it is there. It defaults off because the default is a
+    #: promise made to people who did not read this comment.
+    outer_save_dtype: Optional[str] = None
 
     #: Where round reports are staged. Defaults to `rounds/` beside the
     #: checkpoint store. Kept apart from the checkpoints deliberately: these
