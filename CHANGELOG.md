@@ -1,5 +1,59 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Ravex performs the elastic rebuild itself (GPU-110, under GPU-107).**
+
+  `ravex._dist.elastic` stopped at the group and rendezvous layer, and said in
+  its own docstring why: ravex is only ever handed an already-constructed
+  model, so it had no factory to rebuild one from. `@ravex.train_loop` wraps
+  the function the model is born inside, which *is* that factory, and the half
+  that was missing is now `regroup()`.
+
+  It captures the full model **and optimizer** state through the same
+  `gather_sharded_state` the `sharded_checkpoints: gather` path already uses —
+  one way to unshard state, not two — tears the group down, brings it up at the
+  new world size, and loads the state into a freshly built model under the new
+  mesh. The Adam moments travelling with the weights are what make it a
+  continuation and not a restart from a good place, and the test now fails if
+  they come back empty.
+
+  A rank that is **joining** passes no model and needs nothing shipped to it
+  out of band: the state reaches it in the broadcast that happens once the new
+  group is up, which is why the order is capture, destroy, init, share,
+  rebuild. `tests/test_dist_elastic_remesh.py` covers a real 2 → 3 change and
+  no longer carries the `multiprocessing.Queue` it used to need.
+
+  Two mistakes that are silent in torch now raise `RegroupError` instead:
+  capturing after `destroy_process_group()` (which returns wrong bytes and
+  surfaces much later as `narrow unexpectedly changed concrete size`), and
+  broadcasting from a source that holds nothing (which would put every rank
+  back on random weights with nothing failing).
+
+  `elastic=True` on the decorator still raises: what is missing is no longer
+  the rebuild but re-entry — your loop holds `model` and `optimizer` in its own
+  locals, and a regroup returns new objects ravex cannot assign into your
+  frame. The message it raises says so.
+
+### Changed
+
+- **`agree_on_step` asks the store, not the collectives (GPU-111).**
+
+  The second of the two gathers in that family to move, after
+  `all_ranks_agree`. Same question, same answer, and the same difference in the
+  same direction: a rank that never votes ends the call with its number in the
+  log, where the collective ended it by timing out the whole group.
+
+  Silence collapses the answer to `NOTHING_TO_RESUME` rather than to the
+  minimum of whoever replied — a rank left out of that minimum would restore a
+  different moment in training than the others, which is the one outcome this
+  function exists to prevent. It is the same vote a rank with an empty store
+  already casts, so it lands in a branch `_resume.py` already had.
+
+  Not here for the microseconds: this one is asked once per resume.
+
 ## 0.1.0 — 2026-09-07
 
 ### Added

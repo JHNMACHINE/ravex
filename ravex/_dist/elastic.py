@@ -66,11 +66,14 @@ fresh under the new mesh. That is still real: it skips the OS process exit,
 the CUDA context re-init, and re-importing torch/moonclip that a genuine
 restart pays for. It is not a live reshape of a running module, and nothing
 downstream should be built on the assumption that it is. Verified bit-exact
-across an actual world_size change in ``tests/test_dist_elastic_remesh.py``; ravex
-itself does not perform the rebuild, because ravex is only ever handed an
-already-constructed model — it has no factory to rebuild one from, which is
-why this module stops at the group/rendezvous layer and leaves the module
-rebuild to whoever owns the model's construction.
+across an actual world_size change in ``tests/test_dist_elastic_remesh.py``.
+
+**Ravex performs that rebuild since GPU-110** — see :func:`regroup` at the
+bottom of this module. It could not before, and the reason was written here:
+ravex is only ever handed an already-constructed model, so it had no factory
+to rebuild one from. ``@ravex.train_loop`` wraps the function the model is
+born inside, which is exactly that factory, and this module no longer stops
+at the group/rendezvous layer.
 
 **Two rules for whoever calls ``full_tensor()`` around a regroup, found the
 hard way in ``tests/test_dist_elastic_grow_end_to_end.py`` while composing all
@@ -239,3 +242,191 @@ def prestage_receive(sock, destination: str) -> bool:
     can carry the next one.
     """
     return _core.prestage_receive(sock.fileno(), destination)
+
+
+# --------------------------------------------------------------------------
+# The rebuild — GPU-110. Everything above this line stops at the group and
+# rendezvous layer; this is the half the module docstring said ravex could not
+# do, and the reason it could not is gone.
+
+
+class RegroupError(RuntimeError):
+    """A regroup that would corrupt rather than fail, refused up front.
+
+    Its own class because both mistakes it names are *silent* in torch: one
+    desynchronises a counter and surfaces as an unrelated timeout much later,
+    the other returns wrong bytes and surfaces as ``narrow unexpectedly changed
+    concrete size``. Neither points at the caller. This does.
+    """
+
+
+def capture_for_regroup(model, optimizers):
+    """Everything the new group has to be handed, taken **before the teardown**.
+
+    **Collective, and every rank must call it** — including any rank that is
+    about to leave. It is the first of the two rules in this module's
+    docstring, and it is not enforceable from here: a rank that skips this call
+    does not fail near the mistake, it desynchronises ``torch.distributed``'s
+    group-naming counter and surfaces later as a timeout somewhere unrelated.
+
+    The second rule *is* enforced. Called after ``destroy_process_group()``,
+    this raises :class:`RegroupError` instead of reading parameters that are
+    still meshed against a world size that no longer exists — which does not
+    fail cleanly, it corrupts.
+
+    **It is the checkpoint path, deliberately.** ``gather_sharded_state`` is
+    what ``sharded_checkpoints: gather`` already uses, so a regroup captures
+    exactly what a checkpoint would, in the same shape, through the same code.
+    Two ways to unshard state would mean two answers to every question about
+    what survives, and the second answer would be the one nobody tested.
+
+    It also brings the **optimizer** with it, which a hand-rolled
+    ``full_tensor()`` over ``named_parameters()`` does not. Weights alone make
+    a regroup a restart from a good place; the Adam moments are what make it a
+    continuation, which is the whole promise Ravex is built on.
+
+    **What comes back is full on rank 0 and empty everywhere else**, and that
+    is the trap this function exists to name. ``gather_sharded_state`` is the
+    *writing* half of the checkpoint path, and only rank 0 writes — measured
+    here on three ranks: rank 0 got 4 model keys and 2 optimizer keys, ranks 1
+    and 2 got nothing at all. The restore, ``apply_sharded_state``, needs the
+    opposite, and says so in its own docstring: every rank passes the full
+    state. A resume satisfies that without anyone noticing, because every rank
+    reads the same bytes off the same checkpoint. A regroup has no checkpoint
+    to read, so it has to :func:`share_captured` — and getting that wrong does
+    not raise, it deadlocks the ranks against each other inside a scatter,
+    which is how it was found.
+    """
+    from ravex._dist import collectives
+
+    dist = collectives._dist()
+    if dist is None or not dist.is_initialized():
+        raise RegroupError(
+            "capture_for_regroup() needs the group the model is still meshed "
+            "against. Called with no process group, the parameters would be "
+            "read against a world size that no longer exists - which does not "
+            "raise, it returns wrong bytes and surfaces later as 'narrow "
+            "unexpectedly changed concrete size'. Capture before the teardown."
+        )
+    return collectives.gather_sharded_state(model, list(optimizers))
+
+
+def share_captured(captured, src: int = 0):
+    """Give every rank of the **current** group the full captured state.
+
+    Called once the new group is up, never before: a rank that is joining was
+    in no group to receive anything on. That ordering is what spares a grow
+    from shipping state out of band — the joiner needs no queue, no pre-staged
+    store and no checkpoint, only the broadcast it is now a member of.
+
+    ``src`` must be a rank that survived the regroup and therefore holds the
+    capture. Rank 0 by convention, and checked rather than assumed: a source
+    holding nothing would broadcast nothing, every rank would restore an empty
+    state onto a freshly built model, and the run would carry on from random
+    weights looking like one that merely converges badly.
+    """
+    from ravex._dist import collectives
+
+    dist = collectives._dist()
+    if dist is None or not dist.is_initialized():
+        raise RegroupError("share_captured() needs the new group to be up")
+
+    if dist.get_rank() == src:
+        model_state, _ = captured
+        if not model_state:
+            raise RegroupError(
+                "rank %d is the source of the regroup broadcast and holds no "
+                "captured state. The source has to be a rank that was in the "
+                "old group; a rank that has just joined has nothing to share, "
+                "and broadcasting nothing would put every rank back on random "
+                "weights without anything failing." % src
+            )
+
+    holder = [captured if dist.get_rank() == src else None]
+    dist.broadcast_object_list(holder, src=src)
+    return holder[0]
+
+
+def rebuild_after_regroup(build, captured):
+    """Build the model and optimizers again under the new mesh, and load state.
+
+    ``build`` is the factory — a callable returning ``(model, optimizers)``,
+    already wrapped however this run wraps them, exactly as the training
+    function would construct them. **Ravex does not shard for you**: it does
+    not know whether this run wants ``fully_shard``, DDP, or neither, and
+    guessing would be a second opinion about the model's construction.
+
+    That callable is what ``@ravex.train_loop`` finally makes available.
+    ``fully_shard()`` refuses to wrap a module twice and there is no API to
+    move a materialised ``DTensor`` to another ``DeviceMesh``, so a regroup has
+    always had to mean *rebuild*; what was missing was something to rebuild
+    from. Ravex is handed a constructed model, never a way to construct one —
+    until the decorator holds the function the model is born inside.
+
+    Must be called **after** the new group is up, and it says so rather than
+    scattering state onto a mesh that is still the old one.
+    """
+    from ravex._dist import collectives
+
+    dist = collectives._dist()
+    if dist is None or not dist.is_initialized():
+        raise RegroupError(
+            "rebuild_after_regroup() needs the new process group to be up: "
+            "the fresh model is sharded against whatever mesh exists when it "
+            "is built, and there is nothing to scatter onto without one."
+        )
+
+    model, optimizers = build()
+    optimizers = list(optimizers)
+    model_state, optimizer_state = captured
+    collectives.apply_sharded_state(model, optimizers, model_state, optimizer_state)
+    return model, optimizers
+
+
+def regroup(build, base_store, generation, rank, world_size, *,
+            model=None, optimizers=(), backend="gloo", timeout_seconds=60):
+    """Capture, tear the group down, rebuild it at ``world_size``, reload.
+
+    The whole dance in the order the rules require, so that a caller cannot get
+    it wrong by writing the steps out again. Returns the new
+    ``(model, optimizers)``.
+
+    A rank already in the group passes ``model`` and ``optimizers``; a rank
+    joining passes neither, because it has nothing to capture from. **It needs
+    nothing else either** — the state reaches it in the broadcast that happens
+    once the new group is up, which is why the order here is capture, destroy,
+    init, share, rebuild, and not the more obvious one where the values are
+    shipped to the newcomer first.
+
+    What this buys over a real restart is worth stating plainly, because the
+    name oversells it: the OS process does not exit, the CUDA context is not
+    re-initialised, and torch and moonclip are not re-imported. It is **not** a
+    module changing shape while training continues, and nothing downstream
+    should be built as though it were.
+    """
+    import datetime
+
+    from ravex._dist import collectives
+
+    captured = ({}, {})
+    if model is not None:
+        captured = capture_for_regroup(model, optimizers)
+
+    dist = collectives._dist()
+    if dist is None:
+        raise RegroupError(
+            "regroup() needs torch.distributed, and this interpreter has no "
+            "usable one. Said here rather than three lines down, where the "
+            "same absence would surface as an AttributeError on None and read "
+            "like a bug in ravex instead of a missing backend."
+        )
+    if dist.is_initialized():
+        dist.destroy_process_group()
+    dist.init_process_group(
+        backend,
+        store=generation_store(base_store, generation),
+        rank=rank,
+        world_size=world_size,
+        timeout=datetime.timedelta(seconds=timeout_seconds),
+    )
+    return rebuild_after_regroup(build, share_captured(captured))

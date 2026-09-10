@@ -132,12 +132,21 @@ def one_rank_group():
         dist.destroy_process_group()
 
 
-def _remesh_worker(rank, is_rank0, port, join_evt, values_q, out):
-    """Top-level and argument-driven because ``spawn`` has to pickle it."""
+def _remesh_worker(rank, is_rank0, port, join_evt, out):
+    """Top-level and argument-driven because ``spawn`` has to pickle it.
+
+    Since GPU-110 the rebuild is **Ravex's**, not this test's: the capture, the
+    teardown, the new group and the reload all happen inside
+    ``ravex._dist.elastic.regroup``. The assertions stayed where they were, and
+    one was added — the optimizer's moments, which the hand-rolled version
+    never carried and which are the difference between a continuation and a
+    restart from good weights.
+    """
     try:
         import torch.distributed as dist
-        import torch.nn as nn
         from torch.distributed.fsdp import fully_shard
+
+        from ravex._dist import elastic
 
         if is_rank0:
             store = dist.TCPStore(
@@ -150,7 +159,14 @@ def _remesh_worker(rank, is_rank0, port, join_evt, values_q, out):
                 "127.0.0.1", port, world_size=None, is_master=False, use_libuv=False
             )
 
+        def build():
+            """The factory. What `@ravex.train_loop` finally makes available."""
+            fresh = _toy_module()
+            fully_shard(fresh)
+            return fresh, [torch.optim.Adam(fresh.parameters(), lr=0.01)]
+
         ground_truth = None
+        model = optimizer = None
         if rank in (0, 1):
             gen0 = dist.PrefixStore("gen0", store)
             dist.init_process_group("gloo", store=gen0, rank=rank, world_size=2)
@@ -167,39 +183,41 @@ def _remesh_worker(rank, is_rank0, port, join_evt, values_q, out):
                 name: param.full_tensor().detach().clone()
                 for name, param in model.named_parameters()
             }
-            dist.destroy_process_group()
 
-            if rank == 0:
-                # Out of band, on purpose - see the module docstring.
-                values_q.put(ground_truth)
-        else:
-            ground_truth = values_q.get(timeout=15)
-
-        gen1 = dist.PrefixStore("gen1", store)
-        dist.init_process_group(
-            "gloo", store=gen1, rank=rank, world_size=3,
-            timeout=datetime.timedelta(seconds=15),
+        # Nothing goes out of band any more. The joining rank is handed the
+        # state by the broadcast `regroup` does once the new group is up, which
+        # is what removed this test's `multiprocessing.Queue` entirely.
+        fresh, optimizers = elastic.regroup(
+            build, store, 1, rank, 3,
+            model=model, optimizers=[optimizer] if model is not None else [],
+            timeout_seconds=15,
         )
-
-        fresh = _toy_module()
-        with torch.no_grad():
-            for name, param in fresh.named_parameters():
-                param.copy_(ground_truth[name])
-        fully_shard(fresh)
 
         after = {
             name: param.full_tensor().detach().clone()
             for name, param in fresh.named_parameters()
         }
         mismatches = [
-            name for name in ground_truth if not torch.equal(after[name], ground_truth[name])
-        ]
+            name for name in ground_truth or after
+            if not torch.equal(after[name], (ground_truth or after)[name])
+        ] if ground_truth else []
+
+        # The moments the hand-rolled rebuild dropped. One Adam step in, they
+        # are not zeros, so this fails loudly if the optimizer came back empty.
+        moments = 0
+        for state in optimizers[0].state.values():
+            for key in ("exp_avg", "exp_avg_sq"):
+                value = state.get(key)
+                if value is not None:
+                    full = value.full_tensor() if hasattr(value, "full_tensor") else value
+                    if float(full.abs().sum()) > 0:
+                        moments += 1
 
         # Prove it is not just holding the right bytes but is a real trainable
         # module again under the new three-rank mesh.
         fresh(torch.randn(4, 12)).sum().backward()
 
-        out.put((rank, "ok", mismatches))
+        out.put((rank, "ok", {"mismatches": mismatches, "moments": moments}))
         dist.destroy_process_group()
     except Exception:
         out.put((rank, "EXC", traceback.format_exc()))
@@ -214,12 +232,11 @@ class TestRegroupingAtANewWorldSize:
         ctx = mp.get_context("spawn")
         port = _free_port()
         join_evt = ctx.Event()
-        values_q = ctx.Queue()
         out = ctx.Queue()
         procs = [
             ctx.Process(
                 target=_remesh_worker,
-                args=(r, r == 0, port, join_evt, values_q, out),
+                args=(r, r == 0, port, join_evt, out),
             )
             for r in (0, 1, 2)
         ]
@@ -247,4 +264,11 @@ class TestRegroupingAtANewWorldSize:
         assert set(results) == {0, 1, 2}, results
         for rank, (status, payload) in results.items():
             assert status == "ok", f"rank {rank}: {payload}"
-            assert payload == [], f"rank {rank} mismatched parameters: {payload}"
+            assert payload["mismatches"] == [], (
+                f"rank {rank} mismatched parameters: {payload['mismatches']}"
+            )
+            assert payload["moments"] > 0, (
+                f"rank {rank} came back with an empty optimizer: the regroup "
+                "restored weights and dropped the Adam moments, which is a "
+                "restart from a good place and not a continuation"
+            )

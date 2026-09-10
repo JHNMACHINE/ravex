@@ -278,10 +278,16 @@ class ResumeManager:
 
         Both collectives here are unconditional. A rank that returned early
         because its own store was empty would strand the others waiting on it,
-        so "nothing here" is a value (-1) that travels through the agreement
-        like any other and makes the answer -1 for everybody.
+        so "nothing here" is a value (``NOTHING_TO_RESUME``) that travels
+        through the agreement like any other and makes the answer that for
+        everybody. Since GPU-111 it is also what the agreement returns when a
+        rank never answers at all, which lands in the same branch below.
         """
-        from ravex._dist.collectives import agree_on_step, all_ranks_agree
+        from ravex._dist.collectives import (
+            NOTHING_TO_RESUME,
+            agree_on_step,
+            all_ranks_agree,
+        )
 
         # Before anything else, because at a different world size "this rank's
         # own store" is not this rank's own history: after a shrink `rank_5`
@@ -292,7 +298,7 @@ class ResumeManager:
             return self._resume_resharded(defer_rng)
 
         local = self.backend.latest_step()
-        step = agree_on_step(local if local is not None else -1)
+        step = agree_on_step(local if local is not None else NOTHING_TO_RESUME)
 
         resumed = False
         try:
