@@ -265,13 +265,34 @@ def combine(contributions: List[Contribution], mode: str = "mean") -> ParamMap:
     # holds one model" provable with ``torch.equal``.
     contributions = sorted(contributions, key=lambda c: (c.node or "", c.steps))
 
+    # **Which parameters, not in which order** (GPU-122). This compared
+    # ``list(...)`` against ``list(...)``, so two contributions covering exactly
+    # the same parameters were rejected for disagreeing about their order — and
+    # they normally do. A node's own delta is built by ``pseudo_gradient`` in
+    # ``named_parameters()`` order and never round-trips; a peer's has been
+    # written to a moonclip store and read back, and comes back in the store's
+    # order. On a toy model the two coincide, which is why every test and every
+    # loopback run passed. On a model with 96 parameters they do not, and then
+    # **every round raises here**, is caught by ``_close_outer_round``,
+    # abandoned with a warning, and every node trains alone for the rest of the
+    # run while the loss keeps falling. Found by the two-machine bench for
+    # GPU-120 before any machine was rented.
+    #
+    # The check still earns its place: a peer training a *different* model is
+    # what it is for, and averaging the intersection of two parameter sets
+    # would build one outer step out of two models. That is a question about
+    # membership of the set, and it is asked as one.
     names = list(contributions[0].delta)
+    wanted = set(names)
     for other in contributions[1:]:
-        if list(other.delta) != names:
+        if set(other.delta) != wanted:
+            missing = sorted(wanted - set(other.delta))[:3]
+            extra = sorted(set(other.delta) - wanted)[:3]
             raise KeyError(
                 "the contribution from %r covers different parameters than the "
                 "first one. Averaging the intersection would build one outer "
-                "step out of two different models" % (other.node or "?")
+                "step out of two different models (missing here: %s; only "
+                "there: %s)" % (other.node or "?", missing or "none", extra or "none")
             )
 
     # Every mode is ``scale / denominator * sum(weight_i * delta_i)``, and the

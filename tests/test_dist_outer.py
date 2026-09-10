@@ -199,6 +199,33 @@ def test_contributions_covering_different_models_do_not_get_intersected():
         combine([mine, theirs])
 
 
+def test_the_same_parameters_in_a_different_order_are_the_same_parameters():
+    """GPU-122, and it cost every round of a real run before it was found.
+
+    A node's own delta is built in ``named_parameters()`` order and never
+    round-trips; a peer's has been written to a store and read back, and comes
+    back in the store's order. On a two-parameter model the two coincide, which
+    is why every test here passed while a 96-parameter model abandoned **every**
+    round - caught, warned about, and left with each node training alone as the
+    loss kept falling.
+    """
+    mine = Contribution(
+        delta={"a": torch.ones(1), "b": torch.ones(1) * 3},
+        steps=1, node="0",
+    )
+    theirs = Contribution(
+        delta={"b": torch.ones(1) * 5, "a": torch.ones(1) * 3},
+        steps=1, node="1",
+    )
+
+    combined = combine([mine, theirs])
+
+    # Averaged by name and not by position: getting this wrong would pair "a"
+    # with "b" and produce numbers that look plausible.
+    assert combined["a"].item() == pytest.approx(2.0)
+    assert combined["b"].item() == pytest.approx(4.0)
+
+
 def test_a_round_where_nobody_stepped_is_refused_under_the_weighted_modes():
     idle = [contribution([0.0], steps=0), contribution([0.0], steps=0)]
     with pytest.raises(ValueError, match="nobody took a step"):
