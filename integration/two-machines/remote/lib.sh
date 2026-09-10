@@ -98,6 +98,31 @@ export PYTHONUNBUFFERED=1
 
 section() { printf '\n\033[1m-- %s --------------------------------\033[0m\n' "$1"; }
 
+# **Where a phase says what it is doing, while it is doing it** - appended, on
+# the box, one timestamped line at a time. `on-both.sh` only hands its output
+# back when the command ends, so until this existed the difference between "the
+# phase is working" and "the phase is wedged" could only be settled by guessing
+# and then by `ps`. `watch.sh` from the laptop tails this file on both boxes.
+PHASE_LOG="$OUT/phase.log"
+
+progress() {
+    local line
+    line="$(date -u +%H:%M:%S) node$NODE_RANK $*"
+    echo "$line" >> "$PHASE_LOG"
+    echo "  $line"
+}
+
+# Announce the phase and leave a marker, so a tail that starts late still knows
+# which phase it is looking at.
+phase_begin() {
+    echo "$*" > "$PHASE_LOG.current"
+    progress "BEGIN $*"
+}
+
+phase_end() {
+    progress "END $*"
+}
+
 # One workspace per phase. Ravex finds its config by walking up from the
 # working directory, and a fresh store means the phase pays for a full first
 # checkpoint instead of inheriting one.

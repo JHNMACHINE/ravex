@@ -226,6 +226,36 @@ def test_the_same_parameters_in_a_different_order_are_the_same_parameters():
     assert combined["b"].item() == pytest.approx(4.0)
 
 
+def test_the_outer_state_can_be_kept_off_the_accelerator():
+    """GPU-124, and the honest note about what this test can and cannot prove.
+
+    A round report is a moonclip snapshot and moonclip reads host memory, so an
+    outer state living on the accelerator is not publishable at all: with the
+    model on CUDA the outer loop raised before the seed round, Ravex said so,
+    and the run carried on training locally - two boxes holding two models
+    rather than a degraded one. The cause was ``_build_outer_loop`` never
+    passing ``device``, so the snapshot was born wherever the model was.
+
+    **This test cannot reproduce that**, and neither can any other test in this
+    repository: there is no GPU here, so ``device=None`` and ``device="cpu"``
+    are the same thing and always were. That is exactly why nothing caught it.
+    What it does pin is the property the fix relies on - the snapshot and the
+    contribution follow ``device`` rather than the model - and the proof that
+    it works on an accelerator is the rented pair of Blackwell boxes on
+    2026-09-10: four rounds closed over two machines with ``device cuda``, at
+    0.78-0.85 s of network each, indistinguishable from the same run on CPU.
+    """
+    model = torch.nn.Linear(4, 4)
+    loop = OuterLoop(model, inner_steps=1, device="cpu", node="a")
+
+    assert all(value.device.type == "cpu" for value in loop.outer.values())
+
+    loop.record_step()
+    delta = loop.contribution().delta
+    assert delta, "a contribution over no parameters is not a contribution"
+    assert all(value.device.type == "cpu" for value in delta.values())
+
+
 def test_a_round_where_nobody_stepped_is_refused_under_the_weighted_modes():
     idle = [contribution([0.0], steps=0), contribution([0.0], steps=0)]
     with pytest.raises(ValueError, match="nobody took a step"):

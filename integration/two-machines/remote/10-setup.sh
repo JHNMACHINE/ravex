@@ -24,7 +24,13 @@ set -euo pipefail
 # box.env; the default keeps this runnable by hand.
 KIT_ROOT="${KIT_ROOT:-/root}"
 
-MOONCLIP_SPEC="${MOONCLIP_SPEC:-moonclip==0.0.9}"
+# **A floor, not a pin** (found on the rented boxes, 2026-09-10). This said
+# `==0.0.9`, and ravex 0.1.0 asks moonclip for `describe`, which 0.0.9 does not
+# have: the seed round failed with `'MoonclipManager' object has no attribute
+# 'describe'`, every node fell back to training alone, and the phase looked
+# like a network problem. An exact pin ages into a floor that is below the
+# code being measured; a floor does not.
+MOONCLIP_SPEC="${MOONCLIP_SPEC:-moonclip>=0.1.0}"
 
 # vast.ai keeps torch in a venv that only an interactive shell gets on its
 # PATH. Every phase here arrives as `ssh host '...'` — not a login shell — so

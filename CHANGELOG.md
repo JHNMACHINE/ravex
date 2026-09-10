@@ -78,6 +78,27 @@
 
 ### Fixed
 
+- **The outer loop runs on a GPU (GPU-124).** It never had.
+
+  With the model on CUDA, `outer_loop: true` raised before the seed round —
+  *"tensor '0.weight' is on device 'cuda'; move it to CPU first — Moonclip
+  reads host memory directly"* — and Ravex, having said correctly that this is
+  "not a degraded mode, it is a different run", carried on training locally.
+  Two boxes, two models, no failure.
+
+  `OuterLoop` already took a `device`, and `snapshot` already documented why it
+  exists; `_build_outer_loop` simply never passed one, so the outer state was
+  born wherever the model was. It is now on the host always — not a preference:
+  a report *is* a moonclip snapshot, so an outer state in VRAM cannot be
+  published at all. Two fewer copies of the parameters in VRAM come with it,
+  which is what that docstring was already promising.
+
+  Every test and bench here is on CPU, where `device=None` and `device="cpu"`
+  are the same thing, which is why nothing caught it. Proven on two rented
+  Blackwell boxes on 2026-09-10: four rounds closed over two machines with the
+  model on CUDA, 0.78–0.85 s of network each — indistinguishable from the same
+  run on CPU, so the host-device transfer costs nothing measurable.
+
 - **A round is over the same parameters, not the same parameter *order*
   (GPU-122).** On any model bigger than a toy, every outer round was abandoned.
 

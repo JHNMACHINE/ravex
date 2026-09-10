@@ -663,6 +663,21 @@ class RavexRuntime:
             lr=self.config.outer_lr,
             momentum=self.config.outer_momentum,
             combine_mode=self.config.outer_combine,
+            # **On the host, and it is not a preference** (GPU-124). A round
+            # report is a moonclip snapshot and moonclip reads host memory, so
+            # an outer state in VRAM is not publishable at all: with the model
+            # on CUDA this raised before the seed round, Ravex said so, and the
+            # run carried on training locally - which is two boxes holding two
+            # models, not a degraded one. Left unpassed, the snapshot was born
+            # wherever the model was, and every test and bench in this
+            # repository is on CPU, so nothing ever exercised the other case.
+            #
+            # `snapshot` already documented the second reason: two extra copies
+            # of the parameters live here, and keeping them off the accelerator
+            # is the difference between a model fitting on a cheap box and not.
+            # The cost is one host-device transfer per round, against a round
+            # measured in seconds of network.
+            device="cpu",
             node=str(rank),
         )
 
