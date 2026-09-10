@@ -36,10 +36,10 @@ one of us" — and answering it twice is how two answers end up differing.
 
 **The bytes are moonclip's, and so is the format.** A report is written as a
 moonclip snapshot and moved with the same Rust framing the replication ring
-uses (``_core.prestage_send`` / ``prestage_receive``), manifest and skip list
-included — so a peer only ever receives the rounds it does not already hold.
-Nothing here invents a way to write a tensor down; :mod:`ravex._dist.report`
-says why that matters and what it buys.
+uses (``_core.prestage_send`` / ``prestage_receive``), manifest included. One
+directory per round on both sides, so a transfer carries exactly one report and
+nothing has to be skipped. Nothing here invents a way to write a tensor down;
+:mod:`ravex._dist.report` says why that matters and what it buys.
 
 **A deadline needs SO_RCVTIMEO, not settimeout, and this is not a style
 choice.** ``socket.settimeout`` puts the descriptor into non-blocking mode with
@@ -102,6 +102,12 @@ MAX_HANDLERS = 256
 #: Bytes moved per socket call.
 CHUNK = 1 << 20
 
+#: Round directories a node keeps. A report is worth holding for about as long
+#: as a peer might still be fetching it, and retention never deletes one that
+#: is on a socket - see `DeltaExchange._serving`. Three, so a slow peer has a
+#: round or two of slack before it is told the round is gone.
+KEEP_ROUNDS = 3
+
 
 def close_round(loop, exchange: "DeltaExchange", peers, deadline: float):
     """Publish this node's report, collect the peers', take the outer step.
@@ -131,10 +137,10 @@ def close_round(loop, exchange: "DeltaExchange", peers, deadline: float):
     ``publish_seconds``
         writing this node's report to its store, and reading back what the
         peers will see of it (:meth:`DeltaExchange.as_published`, free unless
-        ``save_dtype`` is set). ``publish_wait_seconds`` is the part of it
-        spent waiting for a peer's in-flight fetch to let go of the manifest —
-        see ``DeltaExchange._io_lock``, whose cost was argued to be near zero
-        on the strength of loopback timings, and is not.
+        ``save_dtype`` is set). ``publish_wait_seconds`` is whatever that span
+        was *not* writing the report — near zero since GPU-119 gave each round
+        its own directory, and kept as a sentinel for the day something
+        serialises a publish against a reader again.
     ``gather_seconds``
         the network, and the rendezvous: fetching every peer's report. Of
         which ``gather_wait_seconds`` is the part before the slowest peer's
@@ -344,10 +350,10 @@ class DeltaExchange:
         self.secret: Optional[bytes] = None
         self.address: Optional[str] = None
 
-        #: This node's reports, and one directory per peer for theirs. The peer
-        #: directories persist across rounds on purpose: the transport's
-        #: manifest skips what is already there, so after the first round only
-        #: the new snapshot's files cross the link.
+        #: This node's reports and the peers', **one directory per round on
+        #: both sides** — see :func:`ravex._dist.report.round_path` for why.
+        #: The short version: what is served is then never what is being
+        #: written, so no lock has to stand between a publish and a transfer.
         self.root = root
         self.mine_path = os.path.join(root, "mine")
         self.peers_path = os.path.join(root, "peers")
@@ -357,27 +363,22 @@ class DeltaExchange:
         #: node's own contribution has to be read back before it can be
         #: averaged. See :meth:`as_published`.
         self.save_dtype = save_dtype
-        self.mine = _report.open_store(
-            self.mine_path,
-            compression_level=compression_level,
-            save_dtype=save_dtype,
-        )
+        self.compression_level = int(compression_level)
 
-        #: Held while this node's store is being written, and while it is being
-        #: read down a socket. **Windows needs this and it is not a Windows
-        #: quirk being papered over.** moonclip writes its manifest by renaming
-        #: a temporary file over the old one, and a rename onto a file another
-        #: handle has open fails there with "access denied" — which surfaced as
-        #: a round failing to publish, the node's round number not advancing,
-        #: and the peers quietly drifting out of alignment with it.
+        #: The rounds currently going down a socket, by round number. The only
+        #: thing that can still touch a directory somebody else is reading is
+        #: retention, so retention is the only thing that has to ask — and it
+        #: asks with a set lookup instead of a lock held across a transfer.
+        self._serving: Dict[int, int] = {}
+
+        #: Seconds the most recent :meth:`publish` spent waiting for anything.
         #:
-        #: What it costs is that publishing waits for an in-flight fetch, and
-        #: **the first version of this comment said that was close to free.**
-        #: It is, on loopback, where a fetch is over in milliseconds and both
-        #: nodes reach the round boundary together. Measured on a throttled
-        #: link (`bench/round_link_cost.py`, 2026-09-07, a 15.8 MB report on
-        #: the wire, 200 ms round trip) the claim does not survive contact with
-        #: a link that is slower in one direction than the other:
+        #: **It is zero by construction now, and that is the finding it
+        #: records.** Until GPU-119 a lock stood between writing this node's
+        #: report and serving it down a socket, because one store held every
+        #: round and moonclip renames its manifest into place. Measured on a
+        #: throttled link (`bench/round_link_cost.py`, 2026-09-07, a 15.8 MB
+        #: report, 200 ms round trip), that lock cost:
         #:
         #: ==================== ============= ==============
         #: link                 publish       of which lock
@@ -387,26 +388,17 @@ class DeltaExchange:
         #: after a cut fetch    0.87 s        0.76 s
         #: ==================== ============= ==============
         #:
-        #: With both nodes on the same link they cannot get ahead of each
-        #: other — each waits for the other's report anyway, so the lock is
-        #: never contended and the original reasoning holds exactly there.
-        #: Where it fails is the case this system is *for*: a peer whose uplink
-        #: is slower, whose fetch is still draining when this node comes round
-        #: again. Worst single round observed 2.34 s, against a round whose own
-        #: transfer was 0.30 s. A report directory per round would take the
-        #: lock off the critical path; GPU-119 is that, filed rather than done
-        #: here because what GPU-117 owed was the number.
-        #: It is taken *after* the wait for the round, never before, or a peer
-        #: waiting for a round would hold the lock the publish needs.
-        self._io_lock = threading.Lock()
-
-        #: Seconds the most recent :meth:`publish` spent waiting for that lock.
-        #: Measured rather than argued about (GPU-117): "close to free" was
-        #: reasoned from loopback, where a fetch is over in milliseconds, and
-        #: the claim only becomes a claim on a link where a fetch lasts as long
-        #: as a model transfer. It rides out in the round report so a real run
-        #: says whether the lock is free or whether reports need a directory
-        #: per round.
+        #: With both nodes on one link neither can get ahead of the other, so
+        #: the lock was never contended and the original reasoning held exactly
+        #: there. It failed in the case this system is *for*: a peer whose
+        #: uplink is slower, whose fetch is still draining when this node comes
+        #: round again — worst round observed 2.34 s, against a transfer of
+        #: 0.30 s. One directory per round removed the conflict instead of
+        #: serialising it.
+        #:
+        #: The field stays because a number that is zero *for a reason* is
+        #: worth keeping: it rides out in every round report, so the day
+        #: something serialises a publish again, a real run says so.
         self.publish_wait = 0.0
 
         #: Seconds the most recent :meth:`gather` spent before a peer's first
@@ -527,14 +519,36 @@ class DeltaExchange:
         that a peer is asking for a round it can no longer join, and the answer
         is to catch up from the current outer state rather than to be handed
         history one round at a time.
+
+        **Nothing here waits on a reader** (GPU-119). The round goes into its
+        own directory, so a peer draining an earlier one is reading files this
+        call never touches; retention runs after, and skips whatever is on a
+        socket right now.
         """
-        asked = time.monotonic()
-        with self._io_lock:
-            self.publish_wait = time.monotonic() - asked
-            _report.write(self.mine, delta, round_number, steps, self.node)
+        entered = time.monotonic()
+        began = time.monotonic()
+        _report.publish_round(
+            self.mine_path,
+            round_number,
+            delta,
+            steps,
+            self.node,
+            compression_level=self.compression_level,
+            save_dtype=self.save_dtype,
+        )
+        wrote = time.monotonic() - began
+
         with self._lock:
             self._round = max(self._round, int(round_number))
             self._lock.notify_all()
+            protect = tuple(self._serving)
+        _report.drop_rounds(self.mine_path, KEEP_ROUNDS, protect=protect)
+
+        # Everything this call spent *not* writing the report. That is the
+        # honest form of the old lock measurement: it is near zero because
+        # nothing here blocks on a reader any more, and it would grow again the
+        # day something did. A hardcoded zero could not say that.
+        self.publish_wait = max(0.0, (time.monotonic() - entered) - wrote)
 
     def as_published(self, delta, round_number: int, expected):
         """This node's delta **as its peers will read it**, which is not always
@@ -557,17 +571,16 @@ class DeltaExchange:
         the float8 path are moonclip's, and reimplementing them here to guess
         at the answer would be a second way to quantize a tensor.
 
-        **And with it, it costs nothing measurable either**, which is what let
-        ``outer_save_dtype`` default to a cast rather than to nothing:
+        **And with it, it costs nothing measurable either.**
         ``bench/round_link_cost.py`` at ``--save-dtype bf16``, 2026-09-07, put
         the publish at 0.34 s against 0.13 s uncast — and 0.24 s of that
-        difference is the ``_io_lock``, not this. The round it is part of spent
-        2.6 s on the network.
+        difference was the publish lock, which GPU-119 has since removed, not
+        this read. The round it is part of spent 2.6 s on the network.
         """
         if not self.save_dtype:
             return delta
         try:
-            return _report.read(self.mine, round_number, expected).delta
+            return _report.read_round(self.mine_path, round_number, expected).delta
         except Exception as exc:
             logger.warning(
                 "Could not read back this node's own round %d report (%s), so "
@@ -716,7 +729,7 @@ class DeltaExchange:
             # `create_connection` is cleared for the same reason.
             connection.settimeout(None)
             set_deadline(connection, max(1.0, deadline - time.monotonic()))
-            destination = self._peer_path(peer)
+            destination = self._peer_round_path(peer, round_number)
             _core = _rust_core()
             if not _core.prestage_receive(connection.fileno(), destination):
                 return None
@@ -743,6 +756,7 @@ class DeltaExchange:
             # prestaged store readable at all.
             theirs = _report.open_store(destination)
             report = _report.read(theirs, round_number, expected)
+            _report.drop_rounds(self._peer_path(peer), KEEP_ROUNDS)
         except _report.ReportError as exc:
             # Not "absent": absent is silence. This peer said something this
             # node will not act on, and that is worth a louder line, because it
@@ -755,8 +769,35 @@ class DeltaExchange:
             return None
         return report
 
+    def _hold(self, round_number: int) -> None:
+        """Say a round is on a socket, so retention leaves it alone."""
+        with self._lock:
+            self._serving[round_number] = self._serving.get(round_number, 0) + 1
+
+    def _release(self, round_number: int) -> None:
+        with self._lock:
+            left = self._serving.get(round_number, 0) - 1
+            if left > 0:
+                self._serving[round_number] = left
+            else:
+                self._serving.pop(round_number, None)
+
     def _peer_path(self, peer: int) -> str:
         path = os.path.join(self.peers_path, str(peer))
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def _peer_round_path(self, peer: int, round_number: int) -> str:
+        """Where one peer's one round lands.
+
+        Per round on this side too, and not only for symmetry: the sender now
+        offers a directory holding a single round, so a destination carrying
+        several would have the transport reconciling two different shapes. It
+        also means a fetch that was cut in half leaves its own directory behind
+        instead of a partial snapshot inside the one the next round needs -
+        which is what made a starved round cost a resend of everything.
+        """
+        path = _report.round_path(self._peer_path(peer), round_number)
         os.makedirs(path, exist_ok=True)
         return path
 
@@ -819,17 +860,30 @@ class DeltaExchange:
                     RESPONSE.pack(RingLink._acknowledgement(self.secret, peer), GONE, 0)
                 )
                 return
-            connection.sendall(
-                RESPONSE.pack(RingLink._acknowledgement(self.secret, peer), OK, 0)
-            )
-            # The descriptor goes to Rust from here, so the bound has to be the
-            # kernel's - see `set_deadline`.
-            connection.settimeout(None)
-            set_deadline(connection, SERVE_PATIENCE)
-            with self._io_lock:
-                _rust_core().prestage_send(
-                    connection.fileno(), self.mine_path, CHUNK
+
+            # Claimed *before* the OK goes out, so there is no window where the
+            # peer has been promised a round that retention could then delete.
+            # `_await_round` came first, so the directory is complete and this
+            # only has to stop it from disappearing.
+            self._hold(wanted)
+            try:
+                connection.sendall(
+                    RESPONSE.pack(RingLink._acknowledgement(self.secret, peer), OK, 0)
                 )
+                # The descriptor goes to Rust from here, so the bound has to be
+                # the kernel's - see `set_deadline`.
+                connection.settimeout(None)
+                set_deadline(connection, SERVE_PATIENCE)
+                # No lock (GPU-119): `wanted` is a directory nothing writes to
+                # any more, and the hold above is what keeps retention off it.
+                _rust_core().prestage_send(
+                    connection.fileno(),
+                    _report.round_path(self.mine_path, wanted),
+                    CHUNK,
+                )
+            finally:
+                self._release(wanted)
+
             # Recorded only after the last byte is out. "Published" and
             # "delivered" are different facts, and `close` waits on this one.
             with self._lock:
@@ -861,7 +915,7 @@ class DeltaExchange:
         """
         deadline = time.monotonic() + SERVE_PATIENCE
         while not self._stop.is_set():
-            if _report.snapshot_of_round(self.mine, wanted) is not None:
+            if _report.round_is_complete(self.mine_path, wanted):
                 return True
             with self._lock:
                 if wanted < self._round:

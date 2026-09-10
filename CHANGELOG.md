@@ -1,5 +1,45 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **One report directory per round, and the publish lock is gone (GPU-119).**
+
+  A publish used to wait for a peer's in-flight fetch. One store held every
+  round, moonclip renames its manifest into place, and on Windows a rename onto
+  a file another handle holds fails — so writing round N+1 while serving round
+  N had to be serialised. The lock was correct; what it cost had been argued
+  from loopback, where a fetch lasts milliseconds.
+
+  Measured, it cost more than the issue that filed it thought — because that
+  number was taken at two nodes, and `_serve` held the lock across the whole
+  send, so **two peers fetching from one node were serialised against each
+  other**. That cannot show at two nodes, where there is only ever one fetcher.
+  Three nodes, 7 MB/s, 200 ms round trip:
+
+  | arm | publish, was | of which lock | publish, is | lock, is |
+  | --- | --- | --- | --- | --- |
+  | both at 7 MB/s | 2.49 s | **2.40 s** | 0.13 s | **0.00 s** |
+  | one node slower | 1.07 s | 0.98 s | 0.10 s | 0.00 s |
+
+  Each round now goes into its own directory, marked complete by a file written
+  last. What is served is never what is being written, so a send takes no lock
+  at all; retention deletes whole directories and skips whatever is on a socket
+  right now, which is the one race a lock still had to cover. Publish and
+  network together went from 7.66 s to 5.20 s per round at three nodes. A
+  two-node round does not change — there the link is the bound either way, and
+  the seconds the lock hid show up as an honest wait on the peer instead.
+
+  It costs nothing on the wire: the single store kept three rounds and the
+  transport's skip list is what held the transfer to the newest one, so a
+  directory per round sends the same single snapshot with nothing to negotiate.
+  Measured at 7.4 MB per round either way, plus 3 ms for the extra manager.
+
+  `publish_wait_seconds` stays in the round report and now measures whatever a
+  publish spent *not* writing — near zero, and a sentinel for the day something
+  serialises a publish against a reader again.
+
 ## 0.1.0 — 2026-09-07
 
 ### Added

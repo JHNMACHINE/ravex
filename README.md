@@ -1,7 +1,9 @@
 # Ravex
 
-Transparent checkpoint and resume for PyTorch training. Your training script
-does not change — not one line, not one import.
+Checkpoint and resume for PyTorch training, from one decorator on the function
+that trains. Inside that function nothing changes — not one line — because
+Ravex notices the model, the optimizer, the scheduler, the AMP scaler and the
+dataloader as they are built.
 
 ```bash
 pip install ravex
@@ -20,7 +22,16 @@ ships wheels for the same platform — so `pip install "ravex[moonclip]"` is a
 Linux thing, and where it is unavailable Ravex falls back to `torch_save` on its
 own.
 
-Drop a `ravex.yaml` next to your code and run what you always ran:
+Decorate your entry point, drop a `ravex.yaml` next to your code, and run what
+you always ran:
+
+```python
+import ravex
+
+@ravex.train_loop(preemption_handler=True)
+def train():
+    ...            # unchanged
+```
 
 ```bash
 python train.py

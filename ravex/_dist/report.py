@@ -70,9 +70,19 @@ else is refused having cost a manifest read rather than an allocation.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional, Tuple
+import os
+import shutil
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 logger = logging.getLogger("ravex")
+
+#: Written last inside a round's directory, and its presence is the whole
+#: definition of "this round can be served". A directory that exists without it
+#: is one a publish is still filling in.
+ROUND_OK = ".ravex-round-ok"
+
+#: Round directories under a node's report root.
+ROUND_PREFIX = "round-"
 
 #: Metadata keys on a round snapshot. moonclip carries a ``Dict[str, str]``
 #: alongside the tensors, which is exactly the shape of what a report needs to
@@ -152,6 +162,126 @@ def open_store(
         keep_base_in_memory=False,
         async_save=False,
     )
+
+
+def round_path(root: str, round_number: int) -> str:
+    """Where one round's report lives. **One directory per round, and that is
+    the point** (GPU-119).
+
+    Until 0.1.0 every round went into one store, and a lock kept a publish from
+    writing it while a peer was reading it down a socket — because moonclip
+    renames its manifest into place, and on Windows a rename onto a file
+    another handle holds fails. The lock was correct and it was expensive: with
+    one node's uplink slower than the other's, a publish blocked **2.2-2.3 s**
+    waiting for a fetch to drain, against a round whose own transfer was
+    0.30 s.
+
+    A directory per round removes the conflict rather than serialising it: what
+    is served is never what is being written. A published round is immutable
+    from the moment its marker lands, so a send needs no lock at all, and
+    retention deletes whole directories instead of pruning a store somebody may
+    be reading.
+
+    It costs nothing on the wire. The single store held ``keep_rounds``
+    snapshots and the transport's skip list is what kept only the newest one
+    crossing; one round per directory sends exactly that same one snapshot,
+    with no skip list to negotiate. Measured on an 8 MB delta: 7.4 MB per round
+    either way, and +3 ms for the extra manager.
+
+    **And the lock cost more than the issue that filed it thought**, because
+    that number was taken at two nodes. ``_serve`` held it across the whole
+    send, so two peers fetching from one node were serialised against each
+    other — which does not show at two nodes, where there is only ever one
+    fetcher. Same bench, three nodes, 7 MB/s, 200 ms round trip:
+
+    ================ ============ ============ =========== ===========
+    arm              publish, was of which lock publish, is lock, is
+    ================ ============ ============ =========== ===========
+    both at 7 MB/s   2.49 s       **2.40 s**   0.13 s      **0.00 s**
+    one node slower  1.07 s       0.98 s       0.10 s      0.00 s
+    ================ ============ ============ =========== ===========
+
+    So the lock's cost grew with the node count and not only with an asymmetric
+    link. Publish and network together went from 7.66 s to 5.20 s per round at
+    three nodes. What did *not* change is a two-node round: there the link is
+    the bound either way, and the seconds the lock used to hide simply show up
+    as an honest wait on the peer.
+    """
+    return os.path.join(root, "%s%d" % (ROUND_PREFIX, int(round_number)))
+
+
+def publish_round(
+    root: str,
+    round_number: int,
+    delta: Dict[str, Any],
+    steps: int,
+    node: str,
+    *,
+    compression_level: int = 3,
+    save_dtype=None,
+) -> str:
+    """Write one round into its own directory, and mark it servable last.
+
+    The marker is written after the store, never before: a peer that finds the
+    directory without it is looking at a publish in progress, and
+    :func:`round_is_complete` is what keeps it from being served half-written.
+    """
+    path = round_path(root, round_number)
+    os.makedirs(path, exist_ok=True)
+    store = open_store(
+        path, compression_level=compression_level, save_dtype=save_dtype
+    )
+    write(store, delta, round_number, steps, node)
+    with open(os.path.join(path, ROUND_OK), "wb"):
+        pass
+    return path
+
+
+def round_is_complete(root: str, round_number: int) -> bool:
+    return os.path.exists(os.path.join(round_path(root, round_number), ROUND_OK))
+
+
+def read_round(root: str, round_number: int, expected) -> "Report":
+    """One round's report, out of the directory it arrived in."""
+    return read(open_store(round_path(root, round_number)), round_number, expected)
+
+
+def rounds_present(root: str) -> Iterable[int]:
+    """The round numbers this root holds, complete or not."""
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return []
+    found = []
+    for name in names:
+        if not name.startswith(ROUND_PREFIX):
+            continue
+        try:
+            found.append(int(name[len(ROUND_PREFIX):]))
+        except ValueError:
+            continue
+    return sorted(found)
+
+
+def drop_rounds(root: str, keep: int, protect: Iterable[int] = ()) -> None:
+    """Delete round directories past the newest ``keep``, except ``protect``.
+
+    ``protect`` is the rounds currently going down a socket. Retention is the
+    only thing left that can touch a directory somebody else is reading, so it
+    is the only thing that has to ask — and asking is a set lookup rather than
+    a lock held across a transfer, which is the whole trade this design makes.
+    """
+    held = sorted(rounds_present(root))
+    if len(held) <= keep:
+        return
+    keeping = set(held[-keep:]) | set(protect)
+    for number in held:
+        if number in keeping:
+            continue
+        try:
+            shutil.rmtree(round_path(root, number), ignore_errors=True)
+        except OSError as exc:  # pragma: no cover - best effort
+            logger.debug("Could not drop round %d: %s", number, exc)
 
 
 def write(store, delta: Dict[str, Any], round_number: int, steps: int, node: str) -> str:

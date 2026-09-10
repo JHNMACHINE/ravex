@@ -743,10 +743,12 @@ class RavexConfig:
         A config file is written by hand, or by a template, or by a job runner,
         and it arrives however it arrives. A truncated ``ravex.yaml`` - one
         interrupted write, one bad template - used to yield ``checkpoint_every:
-        None``, which crashed the runtime on construction. The autoloader
-        swallows that exception by design, so the result was Ravex silently not
-        starting: no log file, because logging is configured after the config
-        loads, and no checkpoints, on a run that had asked for them.
+        None``, which crashed the runtime on construction. That crash landed
+        somewhere nobody would look: the config is read before logging is
+        configured, so there was no log file to say so, on a run that had asked
+        for checkpoints and got none. (Under the autoloader, removed in 0.1.0,
+        it was worse still - the exception was swallowed by design and the run
+        carried on as though Ravex had never been asked for.)
 
         Bad values are replaced with defaults and recorded in ``problems``,
         which the runtime logs once it has somewhere to log to.
