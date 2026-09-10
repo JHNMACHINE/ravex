@@ -147,6 +147,13 @@ class RavexRuntime:
         self._outer: Any = None
         self._exchange: Any = None
         self._outer_peers: List[int] = []
+        #: Who is in the run, evaluated per round. None until the outer loop is
+        #: built, because it needs the rendezvous store the exchange takes its
+        #: addresses from.
+        self._membership: Any = None
+        #: Kept so the round boundary does not go looking for the store again
+        #: on a path that runs once per round.
+        self.store_for_joins: Any = None
         self._round_due = False
         self._shutdown_done = False
         self._lock = threading.RLock()
@@ -594,6 +601,7 @@ class RavexRuntime:
         from ravex._dist.agreement import rendezvous_store
         from ravex._dist.collectives import get_rank, get_world_size
         from ravex._dist.exchange import SEED_ROUND, DeltaExchange, adopt_outer_state
+        from ravex._dist.membership import Membership
         from ravex._dist.outer import OuterLoop
 
         models = self.registry.models
@@ -624,7 +632,14 @@ class RavexRuntime:
             raise RuntimeError("world size is %d; a round needs peers" % world)
 
         rank = get_rank()
-        self._outer_peers = [peer for peer in range(world) if peer != rank]
+        # The set this node exchanges with is now asked for **per round**
+        # rather than computed once (GPU-121). Computed once, a node that joins
+        # a run in progress appears in it nowhere and no amount of announcing
+        # helps; asked per round, membership is a function of the round number
+        # and every member computes the same answer for the same round.
+        self._membership = Membership(store, rank, world)
+        self.store_for_joins = store
+        self._outer_peers = self._membership.peers_at(0)
         root = self.config.outer_root or os.path.join(
             self.config.storage.path, "rounds", str(rank)
         )
@@ -688,11 +703,24 @@ class RavexRuntime:
         than a training script that stops because a peer's disk was full.
         """
         from ravex._dist.exchange import close_round
+        from ravex._dist.membership import MembershipError, serve_joins
 
         if not self._outer or self._exchange is None:
             return
         try:
             started = time.monotonic()
+            if self._membership is not None:
+                # At the boundary, before the round's own work: writing the
+                # outer parameters down for a candidate and taking in an
+                # announcement both have to happen at the round number every
+                # member agrees on, which is this one.
+                serve_joins(
+                    self.store_for_joins, self._exchange, self._outer,
+                    self._membership,
+                )
+                self._outer_peers = self._membership.peers_at(
+                    self._outer.round_number
+                )
             report = close_round(
                 self._outer,
                 self._exchange,
@@ -719,6 +747,14 @@ class RavexRuntime:
                 report.get("publish_wait_seconds", 0.0),
                 report.get("apply_seconds", 0.0),
             )
+        except MembershipError:
+            # **Not swallowed like the rest.** Every other failure here leaves
+            # this node's own parameters where its training put them and costs
+            # the run one round; this one says the averages have already
+            # differed between nodes, so there is no round to carry on to and
+            # the honest thing is to stop rather than keep training a second
+            # model that looks like the first.
+            raise
         except Exception as exc:
             logger.warning("Outer round failed: %s", exc)
             # Advance anyway. A node that stays on a number its peers have left
