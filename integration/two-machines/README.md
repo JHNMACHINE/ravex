@@ -54,6 +54,12 @@ over SSH with `scp` working. That is a shorter list than it sounds:
   first real operation with `no kernel image is available for execution on the
   device`. Blackwell (`sm_120`) against a torch built to `sm_90` is how that was
   found.
+- **Two boxes in one region are not two regions.** RunPod hands out different
+  `10.x` subnets to pods in the same cluster, so the private addresses look
+  reassuringly unrelated while the round trip is 0.29 ms. The mount tells the
+  truth: both pods on 2026-09-10 had `/workspace` on `mfs#euro.runpod.net`,
+  which is one European cluster. Check it before believing a latency number
+  means anything about continents.
 - **Local disk for the stores.** Some providers mount a network filesystem at
   the obvious writable path — measure a store written there and you have
   measured their storage, not this code. `KIT_ROOT` decides where everything
@@ -179,6 +185,21 @@ its own command line. Use the bracket trick you already use with `grep`:
 not that something is running — twice that ambiguity read as confirmation while
 the processes belonged to the previous phase.
 
+**A phase where a rank exits on purpose costs torchrun 300 seconds.** Not our
+code: the surviving box's elastic agent waits on
+`torchelastic/agent/terminal_state/last_member` for its own five-minute
+default, and only then gives up with a `DistStoreError`. Measured on
+2026-09-10, where it read exactly like a hang and took fifteen minutes and an
+`ssh` to tell apart from one. Budget for it, or expect to explain it again.
+
+**`bash watch.sh` answers "is it stuck?" without guessing.** `on-both.sh` hands
+its output back only when the command ends, so a phase in the middle of a long
+exchange and a phase that is wedged look identical from here. `watch.sh` prints,
+for each box, the phase it announced, how many processes are running, and the
+last timestamped progress lines — and `outer_run.py` beats every ten seconds
+while it waits, so a stall is not silence, it is the same line with a growing
+number.
+
 **Fetch after every phase, not at the end.** A rented box can be preempted, and
 anything that exists only there is a result that can be taken away.
 
@@ -190,6 +211,9 @@ anything that exists only there is a result that can be taken away.
 | `addrs.sh` | write `box.env` on each: its rank, its own address, its peer's |
 | `on-both.sh` | run one command on both at once, and wait for both |
 | `fetch.sh` | bring `$KIT_ROOT/out` home into `results/<tag>/` |
+| `watch.sh` | what both boxes are doing right now, and whether anything is running |
+| `remote/41-latency.sh` | round trip, three ways — what bandwidth does not imply |
+| `remote/100-outer.sh` | the outer loop over the link: base, bf16, a node killed, resume |
 | `remote/00-preflight.sh` | the go/no-go |
 | `remote/10-setup.sh` | install moonclip and this ravex, fix torch if the GPU needs it |
 | `remote/20-correctness.sh` | train, replicate, die like a preempted box, lose a machine, resume |
