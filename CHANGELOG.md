@@ -76,6 +76,29 @@
   locals, and a regroup returns new objects ravex cannot assign into your
   frame. The message it raises says so.
 
+### Fixed
+
+- **A round is over the same parameters, not the same parameter *order*
+  (GPU-122).** On any model bigger than a toy, every outer round was abandoned.
+
+  `combine` compared `list(delta)` against `list(delta)`, so two contributions
+  covering exactly the same parameters were rejected for disagreeing about
+  their order — and they normally do. A node's own delta is built by
+  `pseudo_gradient` in `named_parameters()` order and never round-trips;
+  a peer's has been written to a moonclip store and read back, and arrives in
+  the store's order. On the two-layer model every test and every loopback run
+  used, the two coincide. On a 48-layer one they do not, and then the check
+  raised every round, `_close_outer_round` caught it, `abandon_round` advanced
+  the counter, and **every node trained alone for the rest of the run** — loss
+  falling, nothing failing, one warning per round the only sign.
+
+  The check still earns its place, so it now asks the question it meant to ask:
+  membership of the set, with the offending parameter names in the message
+  rather than only the node's.
+
+  Found by the two-machine bench being written for GPU-120, before any machine
+  was rented.
+
 ### Changed
 
 - **One report directory per round, and the publish lock is gone (GPU-119).**
