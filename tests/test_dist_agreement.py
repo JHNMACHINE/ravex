@@ -162,6 +162,51 @@ def test_one_rank_asks_nobody():
     assert all_gather_scalar("q", True, 0, 1, store) == [True]
 
 
+# ─── agree_on_step, the other gather of the family ─────────────────
+
+
+def test_the_oldest_of_the_newest_steps_comes_back():
+    """The reduction is ``min``, and it is done on the same list everywhere."""
+    from ravex._dist import collectives
+
+    store = FakeStore()
+    answers = gather_from(store, {0: 8, 1: 6, 2: 11}, name="agree_on_step")
+
+    assert answers[0] == [8, 6, 11]
+    assert min(answers[0]) == 6 == collectives.NOTHING_TO_RESUME + 7
+
+
+def test_a_silent_rank_means_nothing_to_resume(monkeypatch, caplog):
+    """Not "resume from the minimum of whoever replied".
+
+    A rank left out of that minimum restores a different moment in training
+    than the others, which is the one outcome ``agree_on_step`` exists to
+    prevent. So silence collapses the whole answer to
+    ``NOTHING_TO_RESUME`` - the same vote a rank with an empty store casts -
+    and every rank starts from scratch together.
+    """
+    from ravex._dist import collectives
+
+    store = FakeStore()
+    monkeypatch.setattr(agreement, "default_patience", lambda: 0.2)
+    monkeypatch.setattr(agreement, "rendezvous_store", lambda: store)
+    monkeypatch.setattr(agreement, "wanted_transport", lambda: "store")
+    monkeypatch.setattr(collectives, "get_rank", lambda: 0)
+    monkeypatch.setattr(collectives, "get_world_size", lambda: 2)
+
+    # Rank 1 never writes its key.
+    assert collectives._newest_step_over_store(8) == collectives.NOTHING_TO_RESUME
+    assert "rank(s) 1" in caplog.text
+
+
+def test_the_store_road_is_skipped_when_the_config_says_collectives(monkeypatch):
+    """``None`` from the private half means "not asked", never "nobody said"."""
+    from ravex._dist import collectives
+
+    monkeypatch.setattr(agreement, "wanted_transport", lambda: "collectives")
+    assert collectives._newest_step_over_store(8) is None
+
+
 # ─── both roads, two real processes, a real store ───────────────────────────
 
 

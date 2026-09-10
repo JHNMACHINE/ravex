@@ -105,14 +105,22 @@ def train_loop(
     """
     if elastic:
         raise NotImplementedError(
-            "elastic=True is not implemented. Resuming onto a different world "
-            "size *with a process restart* does work today — set "
-            "reshard_on_resume=true and relaunch. What does not exist is the "
-            "regroup without the restart: it needs the model rebuilt under a "
-            "new mesh, because torch refuses fully_shard() twice on the same "
-            "module and has no way to move a DTensor to another DeviceMesh. "
-            "That is GPU-110, and this decorator is its prerequisite: it is "
-            "the first thing Ravex has ever had that can rebuild a model."
+            "elastic=True is not wired up yet, and what is missing is no "
+            "longer the rebuild. Since GPU-110 ravex._dist.elastic.regroup() "
+            "does the whole thing — capture the full model and optimizer "
+            "state, tear the group down, bring it up at the new world size, "
+            "and load the state into a freshly built model under the new "
+            "mesh, with a joining rank getting the state from the broadcast "
+            "rather than out of band. It is covered by "
+            "tests/test_dist_elastic_remesh.py across a real 2 -> 3 change. "
+            "What is missing is re-entry: your loop holds `model` and "
+            "`optimizer` in its own locals, and a regroup returns new objects "
+            "that ravex cannot assign into your frame. Doing this from the "
+            "decorator means calling your function again and restoring into "
+            "the objects it builds the second time - which is the resume path "
+            "ravex already has, pointed at a regroup instead of a checkpoint. "
+            "Until then: resuming onto a different world size *with* a process "
+            "restart does work — set reshard_on_resume=true and relaunch."
         )
 
     if preemption_handler is not None:

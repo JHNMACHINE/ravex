@@ -813,6 +813,53 @@ def apply_local_sharded_state(model, optimizers, model_state, optimizer_state) -
     )
 
 
+#: What :func:`agree_on_step` answers when there is nothing to resume from.
+#: ``_resume.py`` reaches it from the other direction too — a rank whose own
+#: store is empty votes ``-1`` rather than returning early — so the value is
+#: named here instead of written as a bare number in three places.
+NOTHING_TO_RESUME = -1
+
+
+def _newest_step_over_store(local_step: int) -> Optional[int]:
+    """:func:`agree_on_step` asked on the rendezvous store, or None.
+
+    ``None`` means the store road was not taken — turned off, or no store to
+    ask on — and never "nobody answered". Silence is answered here, and for
+    *this* question the answer is :data:`NOTHING_TO_RESUME`, which is the same
+    thing a rank with an empty store already votes. The alternative would be to
+    resume from the minimum of whoever happened to reply, and a rank left out
+    of that minimum is a rank restoring a different moment in training than the
+    others — the exact failure this function exists to prevent, arrived at by
+    the mechanism meant to prevent it.
+
+    The disagreement window is the one :func:`all_ranks_agree` already
+    accepts and it is worth naming rather than discovering: two ranks whose
+    deadlines expire either side of a straggler's write read different answers.
+    The deadline is ``default_patience()`` — the full process-group timeout, 30
+    minutes by default — so a rank landing inside that window is not slow, it
+    is gone.
+    """
+    from ravex._dist.agreement import (
+        all_gather_scalar,
+        rendezvous_store,
+        wanted_transport,
+    )
+
+    if wanted_transport() == "collectives":
+        return None
+
+    store = rendezvous_store()
+    if store is None:
+        return None
+
+    steps = all_gather_scalar(
+        "agree_on_step", int(local_step), get_rank(), get_world_size(), store
+    )
+    if steps is None:
+        return NOTHING_TO_RESUME
+    return min(int(step) for step in steps)
+
+
 def agree_on_step(local_step: int) -> int:
     """The newest step *every* rank has on disk. **Collective.**
 
@@ -821,10 +868,20 @@ def agree_on_step(local_step: int) -> int:
     6. Restoring those side by side would assemble a model out of two different
     moments in training, which is not a slightly stale model but a wrong one.
     The oldest of the newest is the last step every rank can actually produce.
+
+    **Two roads since GPU-111**, the store preferred where there is one, for
+    the same reason :func:`all_ranks_agree` prefers it: a rank that never
+    answers ends this call with a named rank in the log, where the collective
+    ended it by timing out the whole group. It is asked once per resume, so
+    unlike the rest of that family this one is not here for the microseconds.
     """
     dist = _dist()
     if dist is None or not dist.is_available() or not dist.is_initialized():
         return local_step
+
+    agreed = _newest_step_over_store(int(local_step))
+    if agreed is not None:
+        return agreed
 
     steps = _all_gather_object(dist, int(local_step))
     return min(int(step) for step in steps)
