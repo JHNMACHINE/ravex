@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 
 import torch
@@ -44,13 +45,65 @@ FIELDS = (
 )
 
 
+class Heartbeat:
+    """Says where the run is, every few seconds, while it is there.
+
+    **The thing whose absence cost a rented afternoon.** A gather can sit for
+    the whole deadline with nothing on stdout, and `on-both.sh` hands its output
+    back only when the command ends - so "working" and "wedged" looked
+    identical, and the only way to tell was to ssh in and read `ps`. This
+    writes one line to a file on the box that `watch.sh` tails from the laptop,
+    so the question is answered by looking rather than by guessing.
+
+    A daemon thread, so it can never be the reason the process does not exit.
+    """
+
+    def __init__(self, path, rank, every=10.0):
+        self.path = path
+        self.rank = rank
+        self.every = every
+        self.what = "starting"
+        self.since = time.time()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self._thread.start()
+        return self
+
+    def say(self, what):
+        """Mark a new stage. The heartbeat then reports how long it has lasted."""
+        self.what = what
+        self.since = time.time()
+        self._write("%s" % what)
+
+    def stop(self):
+        self._stop.set()
+
+    def _write(self, text):
+        line = "%s node%d %s" % (
+            time.strftime("%H:%M:%S", time.gmtime()), self.rank, text
+        )
+        try:
+            with open(self.path, "a") as handle:
+                handle.write(line + os.linesep)
+        except OSError:
+            pass
+        print("  " + line, flush=True)
+
+    def _run(self):
+        while not self._stop.wait(self.every):
+            self._write("... %s, %.0fs so far" % (self.what, time.time() - self.since))
+
+
 class Rounds(logging.Handler):
     """Every round's split, kept as numbers."""
 
-    def __init__(self):
+    def __init__(self, heartbeat=None):
         super().__init__()
         self.seen = []
         self.other = []
+        self.heartbeat = heartbeat
 
     def emit(self, record):
         message = record.msg if isinstance(record.msg, str) else ""
@@ -58,8 +111,16 @@ class Rounds(logging.Handler):
             entry = dict(zip(FIELDS, record.args))
             entry["at"] = time.time()
             self.seen.append(entry)
+            if self.heartbeat is not None:
+                self.heartbeat.say(
+                    "round %s closed over %s node(s) in %.2fs (%.2fs network)"
+                    % (entry["round"], entry["nodes"], entry["total_seconds"],
+                       entry["gather_seconds"])
+                )
         elif record.levelno >= logging.WARNING:
             self.other.append(record.getMessage())
+            if self.heartbeat is not None:
+                self.heartbeat._write("WARN " + record.getMessage()[:160])
 
 
 def build_model(target_params, hidden):
@@ -110,7 +171,10 @@ def main():
     dist.init_process_group("gloo", rank=rank, world_size=world)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    rounds = Rounds()
+    os.makedirs(args.out, exist_ok=True)
+    beat = Heartbeat(os.path.join(args.out, "phase.log"), rank).start()
+    beat.say("built the process group, device %s" % device.type)
+    rounds = Rounds(heartbeat=beat)
 
     import ravex
 
@@ -192,10 +256,15 @@ def main():
 
         wanted = args.inner * args.rounds
         done = 0
+        beat.say("training round 0 (%d steps per round)" % args.inner)
         for batch, target in loader:
             if done >= wanted:
                 break
             round_now = done // args.inner
+            if done % args.inner == 0 and done:
+                # Said before the round closes, so a long silence after this
+                # line is the exchange and not the training.
+                beat.say("training round %d" % round_now)
             if (args.die_at_round and rank == args.die_on_rank
                     and round_now == args.die_at_round
                     and done % args.inner == 0):
@@ -212,6 +281,8 @@ def main():
             done += 1
 
     train()
+    beat.say("done training; writing results")
+    beat.stop()
 
     payload = {
         "rank": rank,

@@ -70,6 +70,7 @@ export RAVEX_EXCHANGE_ADDRESS="${RAVEX_EXCHANGE_ADDRESS:-$SELF_ADDR}"
 run_outer() {
     local tag="$1"; shift
     mkdir -p "$DIR"
+    phase_begin "gpu120 $tag: $ROUNDS rounds x $INNER steps, params $OUTER_PARAMS"
     launch "$KIT_ROOT/kit/outer_run.py" \
         --rounds "$ROUNDS" --inner "$INNER" \
         --params "$OUTER_PARAMS" --hidden "$OUTER_HIDDEN" --batch "$BATCH" \
@@ -82,6 +83,7 @@ run_outer() {
         [ -e "$f" ] || continue
         mv -f "$f" "$OUT/gpu120.$tag.$(basename "$f")"
     done
+    phase_end "gpu120 $tag"
 }
 
 case "$ARM" in
