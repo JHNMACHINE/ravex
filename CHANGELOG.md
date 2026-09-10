@@ -4,6 +4,45 @@
 
 ### Added
 
+- **A node can join a run that is already going (GPU-121, under GPU-113).**
+
+  The other half of GPU-113's point 4. The death was proved; the arrival had
+  never been made to happen, and the two are not symmetric. A departure is safe
+  to notice late — the node that went away is missing from *everybody's* list of
+  reports at once. An arrival noticed by one node and not another is two nodes
+  applying different averages to the same parameters for the rest of the run,
+  with the loss falling on both and nothing raising.
+
+  So membership is now **a pure function of the round number**, in
+  `ravex._dist.membership`. A joiner writes one key holding the round it will
+  first contribute to; every member reads those keys at every boundary and
+  computes the peer set for round R as "the base ranks, plus every joiner whose
+  round is at most R". Two members reading the store at completely different
+  moments still get the same set for the same round, which a plain lookup does
+  not give. `_build_outer_loop` computed `range(world)` once, where a joiner
+  could appear nowhere.
+
+  **No source is elected**, which is what makes rank 0 being dead a non-event:
+  every member writes its outer parameters down at the boundary while a join is
+  pending, and the joiner takes them from whichever answers first. A member
+  that is gone is a connection that fails and the next name in the list.
+
+  **The state carries the outer momentum**, not only the parameters — the same
+  defect GPU-110 found with Adam's moments, one floor up. A node arriving with
+  an empty buffer applies a different update to the same gradient from its very
+  first round. Found by `torch.equal` failing on the joiner, by far more than a
+  last-place difference.
+
+  **An acknowledgement is what turns the last race into a wasted deadline.** A
+  joiner publishes nothing until every base member has recorded that it accepted
+  the announcement; short of that it stays silent, every member closes the round
+  without it, and they all close the *same* round. A known limit falls out of
+  that and is named rather than worked around: a run that has already lost a
+  member cannot take a new one, because the lost member never acknowledges.
+
+  The wire greeting gains a `kind` field, so a node can serve two different
+  things without a round number having to mean two things.
+
 - **Ravex performs the elastic rebuild itself (GPU-110, under GPU-107).**
 
   `ravex._dist.elastic` stopped at the group and rendezvous layer, and said in
@@ -74,6 +113,17 @@
   `publish_wait_seconds` stays in the round report and now measures whatever a
   publish spent *not* writing — near zero, and a sentinel for the day something
   serialises a publish against a reader again.
+
+- **The outer average is assembled in a canonical order (GPU-121).**
+
+  `combine` sorted nothing, so each node summed "mine first, then the peers that
+  answered" — a different order on every node for the same set. Floating-point
+  addition is not associative, so the averages differed in the last places, and
+  the difference is *applied to the parameters* rather than cancelling: it
+  accumulates round after round. The invariant the whole outer loop rests on
+  could therefore only be checked with a tolerance somebody had to guess.
+  Sorting by node name costs nothing at these lengths and makes "every node
+  holds one model" provable with `torch.equal`.
 
 - **`agree_on_step` asks the store, not the collectives (GPU-111).**
 

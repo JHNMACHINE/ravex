@@ -81,9 +81,20 @@ ADDRESS_ENV = "RAVEX_EXCHANGE_ADDRESS"
 
 #: Greeting and answer, both fixed length so neither side ever reads a length a
 #: stranger chose.
-REQUEST = struct.Struct("<8s32sII")
+#:
+#: The greeting carries a **kind** since GPU-121, because a node now serves two
+#: different things and the round number alone cannot say which. Spelling it as
+#: its own field rather than stealing a bit of the round number is deliberate:
+#: a reserved bit inside an integer is a convention that has to be remembered
+#: at four call sites, and the day someone forgets it the request still parses
+#: and asks for the wrong tree.
+REQUEST = struct.Struct("<8s32sIII")
 RESPONSE = struct.Struct("<64sBQ")
 REQUEST_MAGIC = b"RVXROUND"
+
+#: What a greeting is asking for.
+KIND_ROUND = 0  #: a round's delta report, the ordinary case
+KIND_STATE = 1  #: the outer parameters themselves, for a node joining (GPU-121)
 
 #: Response status bytes.
 OK = 0
@@ -107,6 +118,13 @@ CHUNK = 1 << 20
 #: is on a socket - see `DeltaExchange._serving`. Three, so a slow peer has a
 #: round or two of slack before it is told the round is gone.
 KEEP_ROUNDS = 3
+
+#: How many outer-state snapshots a node keeps for joiners. Two, not three:
+#: a joiner asks for one round by name and the only reason to hold the round
+#: before it is a joiner that read the store just as the boundary passed. Past
+#: that it is asking for a moment the run has left, and the answer is to read
+#: the store again rather than to be handed history.
+KEEP_STATE = 2
 
 
 def close_round(loop, exchange: "DeltaExchange", peers, deadline: float):
@@ -359,6 +377,18 @@ class DeltaExchange:
         self.peers_path = os.path.join(root, "peers")
         os.makedirs(self.mine_path, exist_ok=True)
         os.makedirs(self.peers_path, exist_ok=True)
+
+        #: The outer parameters, republished for a node that is joining
+        #: (GPU-121). **Its own tree, and that is the point.** A round report
+        #: is a delta and a joiner needs the parameters themselves, so the two
+        #: are different content under the same round numbers; sharing a tree
+        #: would put them in one retention window, where a join could push a
+        #: round a peer still needs out of the far end. Nothing here is written
+        #: unless somebody is actually joining.
+        self.state_path = os.path.join(root, "state")
+        self.peer_state_path = os.path.join(root, "peer-state")
+        os.makedirs(self.state_path, exist_ok=True)
+        os.makedirs(self.peer_state_path, exist_ok=True)
         #: Kept, and not only handed to the store: it decides whether this
         #: node's own contribution has to be read back before it can be
         #: averaged. See :meth:`as_published`.
@@ -668,8 +698,16 @@ class DeltaExchange:
         with found:
             answered[peer] = report
 
-    def fetch(self, peer: int, round_number: int, expected, deadline: float):
-        """One peer's report, or None if it did not arrive before ``deadline``."""
+    def fetch(self, peer: int, round_number: int, expected, deadline: float,
+              kind: int = KIND_ROUND):
+        """One peer's report, or None if it did not arrive before ``deadline``.
+
+        ``kind`` picks which of the two things this peer serves is being asked
+        for: its delta for a round (:data:`KIND_ROUND`), or the outer
+        parameters a joining node needs (:data:`KIND_STATE`, GPU-121). The two
+        land in different trees on this side as well, so a join in flight can
+        never evict a round a peer is still going to be asked for.
+        """
         from ravex._dist.replication import RingLink
 
         address = self._address_of(peer, deadline)
@@ -692,6 +730,7 @@ class DeltaExchange:
                     self.secret or b"",
                     self.rank,
                     int(round_number) & 0xFFFFFFFF,
+                    int(kind),
                 )
             )
 
@@ -729,7 +768,11 @@ class DeltaExchange:
             # `create_connection` is cleared for the same reason.
             connection.settimeout(None)
             set_deadline(connection, max(1.0, deadline - time.monotonic()))
-            destination = self._peer_round_path(peer, round_number)
+            destination = (
+                self._peer_state_round_path(peer, round_number)
+                if kind == KIND_STATE
+                else self._peer_round_path(peer, round_number)
+            )
             _core = _rust_core()
             if not _core.prestage_receive(connection.fileno(), destination):
                 return None
@@ -756,7 +799,10 @@ class DeltaExchange:
             # prestaged store readable at all.
             theirs = _report.open_store(destination)
             report = _report.read(theirs, round_number, expected)
-            _report.drop_rounds(self._peer_path(peer), KEEP_ROUNDS)
+            if kind == KIND_STATE:
+                _report.drop_rounds(self._peer_state_path(peer), KEEP_STATE)
+            else:
+                _report.drop_rounds(self._peer_path(peer), KEEP_ROUNDS)
         except _report.ReportError as exc:
             # Not "absent": absent is silence. This peer said something this
             # node will not act on, and that is worth a louder line, because it
@@ -784,6 +830,16 @@ class DeltaExchange:
 
     def _peer_path(self, peer: int) -> str:
         path = os.path.join(self.peers_path, str(peer))
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def _peer_state_path(self, peer: int) -> str:
+        path = os.path.join(self.peer_state_path, str(peer))
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def _peer_state_round_path(self, peer: int, round_number: int) -> str:
+        path = _report.round_path(self._peer_state_path(peer), round_number)
         os.makedirs(path, exist_ok=True)
         return path
 
@@ -847,12 +903,16 @@ class DeltaExchange:
             greeting = _recv_exactly(
                 connection, REQUEST.size, time.monotonic() + SERVE_PATIENCE
             )
-            magic, token, peer, wanted = REQUEST.unpack(greeting)
+            magic, token, peer, wanted, kind = REQUEST.unpack(greeting)
             if magic != REQUEST_MAGIC or token != (self.secret or b""):
                 # Silence rather than a message. Something that reached the
                 # port without the token is not owed an explanation, and a
                 # refusal that says which half was wrong is a hint.
                 logger.warning("Refused a connection without the job token.")
+                return
+
+            if kind == KIND_STATE:
+                self._serve_state(connection, peer, wanted)
                 return
 
             if not self._await_round(wanted):
@@ -898,6 +958,88 @@ class DeltaExchange:
                 connection.close()
             except OSError:
                 pass
+
+    def _serve_state(self, connection, peer: int, wanted: int) -> None:
+        """Hand a joining node the outer parameters for round ``wanted``.
+
+        Deliberately *not* a wait. A round fetch waits because the peer asking
+        is a member whose round is coming; a state fetch is asked by a node
+        that is not in the run yet, and the honest answer to "I do not have
+        that round's state written down" is ``GONE`` rather than holding a
+        handler for ten minutes on behalf of a stranger. The joiner reads the
+        round it should ask for off the store and comes back.
+        """
+        from ravex._dist.replication import RingLink
+
+        acknowledgement = RingLink._acknowledgement(self.secret, peer)
+        if not _report.round_is_complete(self.state_path, wanted):
+            connection.sendall(RESPONSE.pack(acknowledgement, GONE, 0))
+            return
+
+        connection.sendall(RESPONSE.pack(acknowledgement, OK, 0))
+        connection.settimeout(None)
+        set_deadline(connection, SERVE_PATIENCE)
+        _rust_core().prestage_send(
+            connection.fileno(),
+            _report.round_path(self.state_path, wanted),
+            CHUNK,
+        )
+
+    def publish_state(self, payload, round_number: int) -> None:
+        """Write what a joining node needs, as of the start of ``round_number``.
+
+        ``payload`` is built by :func:`ravex._dist.membership.state_payload`,
+        and it is **not** only the outer parameters: the outer optimizer's
+        momentum travels with them, because a node that arrives without it
+        applies a different update to the same gradient from its first round.
+
+        Called at a round boundary by every member while a join is pending, so
+        a joiner can take the state from whichever of them answers first —
+        which is what spares this protocol from having to elect a source, and
+        therefore from having to notice that rank 0 is dead.
+
+        ``steps`` is ``0`` on the wire: what is written here is not a round's
+        work, it is where the run has got to, and a number that looked like
+        step count would be averaged by anything that mistook this for a
+        report.
+        """
+        _report.publish_round(
+            self.state_path,
+            round_number,
+            payload,
+            0,
+            self.node,
+            compression_level=self.compression_level,
+            save_dtype=None,  # never a cast: a joiner adopting a quantized
+                              # copy is a node a rounding apart from the rest,
+                              # for the length of the run. See adopt_outer_state.
+        )
+        _report.drop_rounds(self.state_path, KEEP_STATE)
+
+    def fetch_state(self, peers: List[int], round_number: int, expected,
+                    deadline: float):
+        """The outer parameters for ``round_number`` from the first peer that has them.
+
+        Tried in order and one at a time, not in parallel: this runs once per
+        join and what it wants is *a* copy, so the second request is worth
+        making only when the first did not produce one. Every member publishes
+        the same state at the same boundary, so "the first that answers" needs
+        no tie-break — and a member that is gone is a connection that fails,
+        which is the next name in the list rather than a special case.
+        """
+        for peer in peers:
+            if time.monotonic() >= deadline:
+                break
+            try:
+                report = self.fetch(
+                    peer, round_number, expected, deadline, kind=KIND_STATE
+                )
+            except Exception as exc:
+                logger.info("No outer state from rank %s: %s", peer, exc)
+                continue
+            if report is not None:
+                return report
+        return None
 
     def _await_round(self, wanted: int) -> bool:
         """Whether this node can serve ``wanted``, waiting for it if it is coming.

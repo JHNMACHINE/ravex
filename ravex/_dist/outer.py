@@ -254,6 +254,17 @@ def combine(contributions: List[Contribution], mode: str = "mean") -> ParamMap:
             % (mode, ", ".join(COMBINE_MODES))
         )
 
+    # **Canonical order, so every node computes the same bits** (GPU-121).
+    # Floating-point addition is not associative, and each node assembles this
+    # list as "mine first, then the peers that answered" — a different order on
+    # every node, for the same set. The averages then differ in the last places
+    # and the difference is applied to the parameters, so it does not cancel:
+    # it accumulates, round after round, and the invariant the outer loop rests
+    # on can only ever be checked with a tolerance that has to be guessed.
+    # Sorting by node name costs nothing at these lengths and makes "every node
+    # holds one model" provable with ``torch.equal``.
+    contributions = sorted(contributions, key=lambda c: (c.node or "", c.steps))
+
     names = list(contributions[0].delta)
     for other in contributions[1:]:
         if list(other.delta) != names:

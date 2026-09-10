@@ -204,12 +204,19 @@ def test_a_connection_without_the_job_token_gets_nothing(nodes, caplog):
     publish(zero, a_delta(), 0, 10)
     host, _, port = zero.address.rpartition(":")
 
-    from ravex._dist.exchange import REQUEST, REQUEST_MAGIC, RESPONSE
+    from ravex._dist.exchange import (
+        KIND_ROUND,
+        REQUEST,
+        REQUEST_MAGIC,
+        RESPONSE,
+    )
 
     with caplog.at_level("WARNING", logger="ravex"):
         connection = _socket.create_connection((host, int(port)), timeout=5)
         try:
-            connection.sendall(REQUEST.pack(REQUEST_MAGIC, b"0" * 32, 1, 0))
+            connection.sendall(
+                REQUEST.pack(REQUEST_MAGIC, b"0" * 32, 1, 0, KIND_ROUND)
+            )
             connection.settimeout(2)
             assert connection.recv(RESPONSE.size) == b"", "a stranger was answered"
         finally:
