@@ -131,6 +131,34 @@ you how large `PARAMS` can be before a phase takes longer than the rental. The
 store each rank writes is roughly `params × 16 / world_size` bytes, and it has
 to cross the wire at whatever that measurement said.
 
+## What the preemption phase now has to show
+
+`46-gpu92-sigterm.sh` used to answer one question — did the survivor save too.
+Since 2026-09-13 it answers two more, and both are things only a link with a
+real round trip in it can be wrong about.
+
+**The announced step has to match on both machines.** The detection stopped
+being a collective per step (GPU-111): a preempted rank writes one key naming
+the step everybody saves at, and an ordinary step is a `check` on a key that is
+not there. On loopback that key is written and read in microseconds. Here the
+announcement has to cross a continent before the announced step arrives, and
+the two cadence checks of `ANNOUNCE_LEAD` are what buy it the time. Two
+machines printing *different* steps, or either of them printing `too late to
+join`, means the lead is too short for this link — and that is the number to
+change, not the protocol.
+
+**Per-machine detection will print nothing here, and that is the pass.** The
+channel is now one group per machine when the sharding stays on a machine and
+one group over the job when it does not (GPU-125). One GPU per box means
+`--nproc_per_node=1`, so the FSDP group spans both machines: the sharding
+crosses a machine, the wide group is correct, and the new branch is not
+reached. Its silence is the unchanged branch working.
+
+Reaching the new branch needs **two GPUs per box with FSDP inside each one**,
+which is a different rental. Worth one if the outer loop is ever run with
+sharding underneath it, because that configuration is the one the change was
+made for and nothing here has run it.
+
 ## The object collectives, which a stock image will not test
 
 Since 2026-08-30 every agreement between ranks — the step to resume from,
@@ -213,6 +241,8 @@ anything that exists only there is a result that can be taken away.
 | `fetch.sh` | bring `$KIT_ROOT/out` home into `results/<tag>/` |
 | `watch.sh` | what both boxes are doing right now, and whether anything is running |
 | `remote/41-latency.sh` | round trip, three ways — what bandwidth does not imply |
+| `remote/45-nccl-regroup.sh` | the group rebuilt without the rank that went away |
+| `remote/46-gpu92-sigterm.sh` | one rank preempted, every rank saving together |
 | `remote/100-outer.sh` | the outer loop over the link: base, bf16, a node killed, resume |
 | `remote/00-preflight.sh` | the go/no-go |
 | `remote/10-setup.sh` | install moonclip and this ravex, fix torch if the GPU needs it |
