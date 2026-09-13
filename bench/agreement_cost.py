@@ -21,9 +21,11 @@ private function, reached on purpose: without it this bench stops being able to
 answer "and what did it cost before", which is the question the next change will
 ask too.
 
-**store-check** - `store.check([missing])` on the rendezvous store: the whole
-cost of the announced-flag design in the common case, where nobody is asking
-for anything and the answer is the absence of one key.
+**store-check** - `store.check([missing])` on the rendezvous store. Since
+GPU-111 this is not a hypothetical arm but **what a step actually costs**: the
+alarm is announced on a key, and a run nobody is preempting spends its per-step
+budget discovering that the key is not there. Compare it against **signal**,
+which is what that step cost before.
 
 **+skew** - the same calls, with one rank arriving late on purpose, and the
 arms that keep the story honest in both directions. A key that is simply *not
@@ -38,6 +40,22 @@ the two is how a 1.7x becomes a claim of 20x.
 Gloo on loopback, so this is the floor: on a real fabric the collective's
 number grows with the fabric and the store's grows with the store server's
 latency, and the two do not grow together.
+
+Run on 2026-09-13, Windows, gloo on loopback, mean microseconds per call:
+
+    ranks   signal   gather   gather-collectives   store-check
+        2      458      332                  634            48
+        4      376      982                 1416            83
+        8      773     3305                 3097           162
+
+Two readings, and the second is the one that moved GPU-111. **`signal` is
+already the cheapest arm of its family** - 773 µs at 8 ranks against the 3305
+of the store gather that replaced `all_ranks_agree` - so porting it to a store
+*gather* would have been a 4x regression, growing with the rank count. What
+justifies the change is not the mean but the straggler: with 5 ms of skew on
+one rank, `signal+skew` reaches 5.8 ms on every other rank while
+`store-check+skew` stays at ~92 µs, because the absence of a key is answered
+without waiting for anybody and a gather never is.
 """
 
 import argparse
