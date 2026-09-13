@@ -79,6 +79,22 @@ SLOWEST_POLL = 0.05
 #: *n* is never racing a delete of round *n*.
 KEEP_ROUNDS = 2
 
+#: The emergency alarm: one key per job, written by whoever caught SIGTERM and
+#: never unset. Stamped with the issue like :data:`KEY`, so a store dump found
+#: by somebody else is readable.
+#:
+#: Never deleted, and it needs no cleanup: the rendezvous store lives inside
+#: rank 0's process for the lifetime of one ``init_process_group``, so a
+#: resumed run gets an empty one and cannot inherit a stale alarm.
+EMERGENCY_KEY = "ravex/gpu111/emergency/alarm"
+
+#: Cadence checks of slack between the alarm being written and the step every
+#: rank saves at. **Two, and the two is measured.** A probe at 4 ranks with
+#: 5 ms of skew on one of them, with a collective every step, saw every rank
+#: read the alarm within a single step of it being written; two leaves a whole
+#: further check of margin. See GPU-111.
+ANNOUNCE_LEAD = 2
+
 _rounds: Dict[Any, int] = {}
 _rounds_lock = threading.Lock()
 
@@ -268,3 +284,71 @@ def _await_all(store, keys, budget: float) -> Optional[List[bytes]]:
         time.sleep(wait)
         wait = min(SLOWEST_POLL, wait * 2)
     return [store.get(key) for key in keys]
+
+
+def announce_emergency(store, step: int, cadence: int, lead: int = ANNOUNCE_LEAD):
+    """Raise the alarm, naming the step every rank will save at. Returns it.
+
+    The alarm is not a bool. Its value is **a step number**, and that is the
+    whole of the protocol: "everybody saves at step R" is a rendezvous, where
+    "somebody wants to save" is only a fact that different ranks learn at
+    different moments. Two ranks that read this key three steps apart still
+    enter the collective save together, which is the one property the
+    synchronous `all_reduce` gave for free and any asynchronous road has to
+    earn back.
+
+    R is rounded up to a multiple of ``cadence`` because that is when the other
+    ranks look — a round announced between two checks is a round nobody
+    attends. ``lead`` is how many of their checks fall between this write and
+    R; see :data:`ANNOUNCE_LEAD` for why two.
+
+    **The rendezvous is in step numbers, so it holds exactly where the step
+    numbers do:** a job with a collective every step, which is DDP and FSDP and
+    is also the only shape where the emergency channel is on at all. Nodes that
+    train independently between rounds — `outer_loop: true` — drift, and a step
+    number then means something different on each of them. That is GPU-125 and
+    it is not this function's to fix; what this function must not do is look
+    like it covers it.
+
+    Returns ``None`` if the store refused the write, which the caller must read
+    as "no announcement was made" and not as "no emergency".
+    """
+    target = ((step // max(1, cadence)) + max(1, lead)) * max(1, cadence)
+    try:
+        store.set(EMERGENCY_KEY, json.dumps({"step": target}).encode("utf-8"))
+    except Exception as exc:
+        logger.warning(
+            "Could not announce the emergency checkpoint on the rendezvous "
+            "store (%s). This rank was preempted and the others will not be "
+            "told through this road; its own checkpoint is unaffected.",
+            exc,
+        )
+        return None
+    return target
+
+
+def announced_emergency(store):
+    """The step an emergency save was announced for, or ``None``. **Cheap.**
+
+    This is the call that runs every cadence step of every run, and in every
+    run that is not being preempted the answer is the absence of a key. That
+    is the entire reason this road exists: ``check`` on a missing key is
+    answered by the store server alone, so **no rank waits for any other**.
+    Measured on loopback: 48 µs at 2 ranks, 83 at 4, 162 at 8, against 458 /
+    376 / 773 for the `all_reduce` it replaces — and, the number that actually
+    decides it, 92 µs against 5.8 ms with 5 ms of skew on one rank, because a
+    gather pays the straggler and this does not (GPU-111,
+    `bench/agreement_cost.py`).
+
+    A failure to reach the store is reported as ``None`` — no alarm — for the
+    same reason the caller treats every other failure on this path that way:
+    the channel is best effort, and a job whose emergency road broke has to
+    behave like a job that never had one.
+    """
+    try:
+        if not store.check([EMERGENCY_KEY]):
+            return None
+        payload = json.loads(store.get(EMERGENCY_KEY).decode("utf-8"))
+        return int(payload["step"])
+    except Exception:
+        return None

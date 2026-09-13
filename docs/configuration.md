@@ -43,6 +43,7 @@ ravex status
 | `emergency_coordination` | `RAVEX_EMERGENCY_COORDINATION` | `true` | For sharded models split across more than one machine only: wait for every rank to notice a SIGTERM before attempting the collective save FSDP checkpointing needs. No effect on a replicated (DDP) job or a single machine. See [Emergency checkpoint on preemption](#emergency-checkpoint-on-preemption-sharded-models). |
 | `emergency_check_every` | `RAVEX_EMERGENCY_CHECK_EVERY` | `1` | Optimizer steps between checks for a SIGTERM on any rank. Only spent when `emergency_coordination` is active for this run (sharded, multi-machine). |
 | `emergency_timeout` | `RAVEX_EMERGENCY_TIMEOUT` | `20` | Seconds before the SIGTERM-detection channel gives up, if the rank that raised it disappears before the others get there. Isolated from the main process group's own timeout — see the section below. |
+| `emergency_transport` | `RAVEX_EMERGENCY_TRANSPORT` | `auto` | How the ranks learn one of them was preempted: `store` announces the step everybody saves at on the rendezvous store, `collectives` asks with an `all_reduce` every step, `auto` takes the store where there is one. See [What a step of a run nobody preempts pays for this](#what-a-step-of-a-run-nobody-preempts-pays-for-this). |
 | `fallback_on_error` | `RAVEX_FALLBACK_ON_ERROR` | `true` | On an unexpected error, log it and let training continue; the checkpoint is retried at the next one. Set `false` to raise instead. |
 | `log_file` | `RAVEX_LOG_FILE` | `null` | Log destination. Unset means stderr, WARNING and above only. |
 | `log_level` | `RAVEX_LOG_LEVEL` | `INFO` | |
@@ -532,6 +533,45 @@ Only the rank that actually received SIGTERM terminates afterward. Every
 other rank that entered the save together goes back to ordinary training,
 exactly as after any periodic checkpoint — a false alarm costs one
 out-of-cadence checkpoint, not a stopped job.
+
+### What a step of a run nobody preempts pays for this
+
+The channel used to ask its question with a collective: an `all_reduce(MAX)`
+of one int32 on the isolated group, once per `emergency_check_every` steps.
+Perfect agreement, and a collective on every step of a run that will almost
+certainly never be preempted at all. Measured on loopback: **376 µs at 4
+ranks, 773 at 8** — and 5.8 ms on every rank when one of them is 5 ms late,
+because a gather waits for the slowest whatever carries it.
+
+`emergency_transport` (`auto` by default, `store` or `collectives` to pin it)
+moves the common case off that collective. The preempted rank writes one key
+on the rendezvous store, and the key does not say *whether* — it says **which
+step everybody saves at**:
+
+- an ordinary step is now `check` on a key that is not there: **83 µs at 4
+  ranks, 162 at 8**, and 92 µs rather than 5.8 ms with a straggler, since
+  the absence of a key is answered by the store alone and no rank waits for
+  another;
+- the collective has not gone away, it has moved to the announced step, where
+  it is what proves every rank arrived. A rank that never read the alarm never
+  posts it, the others run out of `emergency_timeout`, and nobody saves. That
+  matters: without the proof, a rank that missed the alarm would leave the
+  others inside a *sharded* collective on the main process group, whose
+  timeout is thirty minutes of billed idle GPUs;
+- a rank that reads the alarm after the announced step has missed it and does
+  not reschedule. Announcing a second round would put the ranks back into
+  disagreement, which is the one thing this is for. The fallback is a job with
+  the channel off: the last periodic checkpoint stands.
+
+**The announced step is a step number, so it means the same thing on every
+rank only where a collective every step keeps the counters together.** That is
+DDP and FSDP, which is also the only shape where this channel is on. It is not
+true of nodes training independently between outer rounds — see
+`outer_loop` below, and GPU-125.
+
+`collectives` is the road back, and it is not deprecated: a job that would
+rather pay per step than have its preemption path depend on a key-value store
+asks for it by name.
 
 ## Training across the internet
 

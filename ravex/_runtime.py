@@ -114,6 +114,17 @@ class RavexRuntime:
     #: own to be safe to branch on.
     _emergency_active: Optional[bool] = None
     _emergency_group = None
+    #: The rendezvous store the alarm is announced on, once asked for. `False`
+    #: is "asked and could not be had", the same distinction `_ring_link`
+    #: makes above; `None` at class level so a `__new__`-built runtime asks.
+    _emergency_store = None
+    #: The step every rank has agreed to save at, once one has been announced.
+    _emergency_round: Optional[int] = None
+    #: Set once the announced round is behind this rank, whether it attended
+    #: it or read the alarm too late to. Both mean the same thing to
+    #: `_emergency_round_has_come`: there is nothing further to do on this
+    #: road, and a second attempt would be a rendezvous nobody announced.
+    _emergency_settled = False
 
     def __init__(self, config: Optional[RavexConfig] = None):
         self.config = config or RavexConfig.load()
@@ -148,6 +159,9 @@ class RavexRuntime:
         self._emergency_requested = False
         self._emergency_active: Optional[bool] = None
         self._emergency_group = None
+        self._emergency_store: Any = None
+        self._emergency_round: Optional[int] = None
+        self._emergency_settled = False
         #: The outer loop and its transport (GPU-113), built on the first step
         #: that wants them. `False` means it was tried and could not be had —
         #: not the same as "not tried yet", and not retried every step, the
@@ -1723,6 +1737,136 @@ class RavexRuntime:
             )
         return self._emergency_active
 
+    def _emergency_store_road(self):
+        """The store to announce the emergency round on, or None.
+
+        Decided once, and `False` is remembered as "asked and could not be
+        had" — the same distinction `_ring_link` and `_outer` make, and for
+        the same reason: a job with no rendezvous must not retry, and log,
+        every step of the run.
+
+        No store means the collective road, which is what this channel has
+        always been and is not a degraded version of anything. It is also what
+        `emergency_transport: collectives` asks for explicitly, for a job that
+        would rather pay a collective per step than depend on a key-value
+        store for its preemption path.
+        """
+        if self._emergency_store is False:
+            return None
+        if self._emergency_store is not None:
+            return self._emergency_store
+
+        wanted = str(self.config.emergency_transport)
+        if wanted == "collectives":
+            self._emergency_store = False
+            return None
+
+        from ravex._dist.agreement import rendezvous_store
+
+        store = rendezvous_store()
+        if store is None:
+            if wanted == "store":
+                logger.warning(
+                    "emergency_transport=store, but there is no rendezvous "
+                    "store to announce on. Falling back to the detection "
+                    "collective, which is what this channel did before "
+                    "GPU-111 and is not a degraded mode."
+                )
+            self._emergency_store = False
+            return None
+        self._emergency_store = store
+        return store
+
+    def _emergency_round_has_come(self) -> bool:
+        """Whether this is the step the ranks agreed to save at.
+
+        **The asynchronous half of GPU-111, and the design is one sentence:**
+        the alarm is not "somebody wants to save", it is "everybody saves at
+        step R". Different ranks learn it at different moments and still act
+        at the same one, which is the property the per-step `all_reduce` gave
+        for free and is the only thing that has to be earned back.
+
+        What that buys is the common case. A run that is not being preempted —
+        which is every step of almost every run — now pays one `check` on a
+        key that is not there, answered by the store server with nobody
+        waiting for anybody: 83 µs at 4 ranks against the collective's 376,
+        and 92 µs against 5.8 ms when one rank is 5 ms late. A gather pays the
+        straggler on any medium; the absence of a key does not.
+
+        **The collective is not removed, it is moved to the one step where it
+        is worth its cost.** At R it is what proves every rank arrived. A rank
+        that never saw the alarm never posts it, the others run out of
+        `emergency_timeout` — seconds, on the isolated group — and nobody
+        enters the save. Without that proof, a rank that missed the alarm
+        would leave the others inside a *sharded* collective on the default
+        group, whose timeout is thirty minutes of billed and idle GPUs.
+
+        **A rank that reads the alarm after R has missed it, and does not
+        reschedule.** Announcing a second round would put the ranks back in
+        disagreement, which is the whole thing this protocol exists to avoid.
+        The fallback is exactly the behaviour of a job with the channel off:
+        the periodic checkpoint stands and the preempted rank still flushes
+        before it dies.
+
+        **The rendezvous is a step number, so it holds where step numbers hold
+        — a job with a collective every step.** That is DDP and FSDP, and it is
+        also the only shape where this channel is on at all, since it needs
+        `has_sharded_models()`. Nodes that train independently between rounds
+        drift, and there a step number is not a meeting point: GPU-125, which
+        is a larger problem than this one and is about the group's membership
+        rather than its transport.
+        """
+        if self._emergency_settled:
+            return False
+
+        if self._emergency_round is None:
+            from ravex._dist.agreement import announce_emergency, announced_emergency
+
+            store = self._emergency_store_road()
+            cadence = self.config.emergency_check_every
+            if self._emergency_requested:
+                self._emergency_round = announce_emergency(
+                    store, self.registry.step_count, cadence
+                )
+            else:
+                self._emergency_round = announced_emergency(store)
+            if self._emergency_round is None:
+                return False
+
+            if self._emergency_round < self.registry.step_count:
+                # Read too late to attend. Said as a warning rather than
+                # swallowed: this rank is about to *not* take part in a save
+                # the others are attempting, and a silent non-participation is
+                # the failure that looks like nothing happening.
+                self._emergency_settled = True
+                logger.warning(
+                    "An emergency checkpoint was announced for step %d and "
+                    "this rank only read the announcement at step %d. Too "
+                    "late to join it: no coordinated save here, and the last "
+                    "periodic checkpoint stands.",
+                    self._emergency_round,
+                    self.registry.step_count,
+                )
+                return False
+
+            logger.warning(
+                "SIGTERM reported on this job: every rank saves together at "
+                "step %d, and this rank is at %d.",
+                self._emergency_round,
+                self.registry.step_count,
+            )
+
+        if self.registry.step_count < self._emergency_round:
+            return False
+
+        # The announced step, reached once. Settled before the collective
+        # rather than after it, because "we tried and it timed out" and "we
+        # tried and it worked" are the same answer to the question of whether
+        # to try again: no. Retrying would be a second rendezvous that nobody
+        # announced and that the ranks which already saved are not attending.
+        self._emergency_settled = True
+        return True
+
     def _check_emergency_signal(self) -> None:
         """Look for a SIGTERM on any rank; save together if one landed.
 
@@ -1757,6 +1901,14 @@ class RavexRuntime:
                 # transport: retrying every cadence would just repeat the
                 # same failure and the same log line for the rest of the run.
                 self._emergency_active = False
+                return
+
+        if self._emergency_store_road() is not None:
+            # The cheap half. On every step of every run that is not being
+            # preempted this is one `check` on a key that is not there, and
+            # the function below returns False without any rank having waited
+            # for any other. The collective under it is reached once per run.
+            if not self._emergency_round_has_come():
                 return
 
         try:

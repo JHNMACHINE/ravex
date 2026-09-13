@@ -4,6 +4,69 @@
 
 ### Added
 
+- **The preemption channel stops asking every rank every step, and announces a
+  step instead (GPU-111).**
+
+  The SIGTERM detection channel asked its question with a collective: an
+  `all_reduce(MAX)` of one int32 on the isolated short-timeout group, once per
+  `emergency_check_every` steps, which is every step by default. The agreement
+  that produces is perfect — it is the same collective on every rank — and it
+  is paid on every step of every run, including the overwhelming majority that
+  are never preempted at all.
+
+  **The measurement came first, and it reversed the premise this issue was
+  opened on.** `bench/agreement_cost.py`, gloo on loopback:
+
+  | ranks | `signal` (per-step) | `gather` on the store | `gather` collective | `store-check` |
+  | -- | -- | -- | -- | -- |
+  | 2 | 458 µs | 332 | 634 | 48 |
+  | 4 | 376 µs | 982 | 1416 | 83 |
+  | 8 | 773 µs | 3305 | 3097 | 162 |
+
+  `signal` was already the *cheapest* arm of its family, not the most
+  expensive: porting it to a store **gather** the way `all_ranks_agree` went
+  would have been a 4x regression at 8 ranks, growing with the rank count. So
+  what justifies the change is not the mean. It is the straggler: with 5 ms of
+  skew on one rank, every other rank pays 5.8 ms for the collective and 92 µs
+  for a store check, because a gather waits for the slowest on any medium and
+  the absence of a key does not wait for anyone.
+
+  **The alarm is a step number, not a bool.** A preempted rank writes one key
+  saying *everybody saves at step R*, rounded up to a multiple of the cadence
+  so it lands on a step the others look at. Ranks that read it three steps
+  apart still act at the same one — which is the property the collective gave
+  for free and is the only thing an asynchronous road has to earn back. An
+  ordinary step is now a `check` on a key that is not there.
+
+  **The collective did not go away, it moved to the one step where it is worth
+  its cost.** At R it is what proves every rank arrived. A rank that never read
+  the alarm never posts it, the others run out of `emergency_timeout` — seconds
+  — and nobody saves. Without that proof a rank that missed the alarm would
+  leave the others inside a *sharded* collective on the main process group,
+  whose timeout is thirty minutes of billed and idle GPUs. A rank that reads
+  the alarm after R has missed it and does not reschedule: a second announced
+  round is a second disagreement.
+
+  `tests/test_emergency_checkpoint.py` runs four ranks with one of them 5 ms
+  late on every step, because a straggler is the normal case on this project's
+  hardware. They agree on the same save step; the collective is posted **once**
+  over twenty steps instead of twenty times; and a run nobody preempts posts
+  **none**. The same plan with `emergency_transport: collectives` posts twenty,
+  which is what says those counts are measuring the protocol and not the
+  harness.
+
+  `emergency_transport` (`auto`, `store`, `collectives`) is the knob, and the
+  road back is kept for a job that would rather pay per step than have its
+  preemption path depend on a key-value store.
+
+  **The limit, named rather than discovered later.** The announced step is a
+  step number, so it means the same thing on every rank only where a collective
+  every step keeps the counters together — DDP and FSDP, which is also the only
+  shape where this channel is on. A probe with no collective between steps, the
+  shape `outer_loop: true` exists to produce, had one rank read the alarm five
+  steps after the announced round. That topology has a larger problem than its
+  transport and it is GPU-125.
+
 - **A node can join a run that is already going (GPU-121, under GPU-113).**
 
   The other half of GPU-113's point 4. The death was proved; the arrival had

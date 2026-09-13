@@ -442,6 +442,28 @@ class RavexConfig:
     #: would kill otherwise-healthy runs.
     emergency_timeout: int = 20
 
+    #: How the ranks learn that one of them was preempted: ``"store"``,
+    #: ``"collectives"``, or ``"auto"``.
+    #:
+    #: ``"collectives"`` is what this channel was built as: an
+    #: ``all_reduce(MAX)`` of one int32, every step, on the short-timeout
+    #: group. The agreement it produces is perfect — it is the same collective
+    #: on every rank — and it costs a collective on every step of a run that
+    #: is almost never being preempted.
+    #:
+    #: ``auto`` takes the store where there is a rendezvous: a preempted rank
+    #: writes one key naming **the step everybody saves at**, and the ordinary
+    #: step becomes a ``check`` on a key that is not there. 83 µs at 4 ranks
+    #: against 376, and — the number that decides it — 92 µs against 5.8 ms
+    #: when one rank is 5 ms late, because a gather pays the straggler and the
+    #: absence of a key does not (GPU-111, `bench/agreement_cost.py`).
+    #:
+    #: The collective does not disappear on that road, it moves: it is posted
+    #: **once**, at the announced step, where it is what proves every rank
+    #: arrived before any of them enters a sharded save the others would never
+    #: join. What the store removes is the per-step cost, not the agreement.
+    emergency_transport: str = "auto"
+
     # ─── the outer loop, GPU-113 ────────────────────────────────────────
     #
     #: Train across nodes that communicate once every `outer_inner_steps`
@@ -672,6 +694,8 @@ class RavexConfig:
             self.replication_transport = value
         if (value := get("AGREEMENT_TRANSPORT")) is not None:
             self.agreement_transport = value
+        if (value := get("EMERGENCY_TRANSPORT")) is not None:
+            self.emergency_transport = value
         if (value := get("KEEP_BASE_IN_MEMORY")) is not None:
             self.keep_base_in_memory = _as_bool(value, self.keep_base_in_memory)
         if (value := get("ASYNC_SAVE")) is not None:
@@ -810,6 +834,7 @@ class RavexConfig:
             "sharded_checkpoints",
             "replication_transport",
             "agreement_transport",
+            "emergency_transport",
         ):
             value = getattr(self, name)
             if not isinstance(value, str):
@@ -860,6 +885,13 @@ class RavexConfig:
                 "'auto', 'store' or 'collectives'; using 'auto'"
             )
             self.agreement_transport = "auto"
+
+        if self.emergency_transport not in ("auto", "store", "collectives"):
+            self.problems.append(
+                f"emergency_transport={self.emergency_transport!r} is not "
+                "'auto', 'store' or 'collectives'; using 'auto'"
+            )
+            self.emergency_transport = "auto"
 
         if self.checkpoint_every < 1:
             self.checkpoint_every = 1
