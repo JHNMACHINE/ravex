@@ -44,7 +44,13 @@ class TestTheDetectionRoundDegradesCleanly:
         runtime._emergency_group = None
         runtime._emergency_active = True
         runtime._emergency_requested = False
-        runtime.registry = type("R", (), {"step_count": 0})()
+        runtime.registry = type(
+            "R",
+            (),
+            # `sharded_groups` since GPU-125: the group build asks which ranks
+            # share a model before it decides how wide to make itself.
+            {"step_count": 0, "sharded_groups": staticmethod(lambda: [])},
+        )()
         return runtime
 
     def test_a_group_that_cannot_be_built_turns_coordination_off(self, monkeypatch):
@@ -56,7 +62,8 @@ class TestTheDetectionRoundDegradesCleanly:
         runtime.checkpoint = lambda *a, **k: calls.append((a, k)) or True
 
         monkeypatch.setattr(
-            "ravex._dist.collectives.emergency_group", lambda timeout: (False, None)
+            "ravex._dist.collectives.emergency_group",
+            lambda timeout, partition=None: (False, None),
         )
 
         runtime._check_emergency_signal()
@@ -652,7 +659,13 @@ def _announced_worker(rank, world, port, plan, out):
         runtime._emergency_store = None
         runtime._emergency_round = None
         runtime._emergency_settled = False
-        runtime.registry = type("R", (), {"step_count": 0})()
+        runtime.registry = type(
+            "R",
+            (),
+            # `sharded_groups` since GPU-125: the group build asks which ranks
+            # share a model before it decides how wide to make itself.
+            {"step_count": 0, "sharded_groups": staticmethod(lambda: [])},
+        )()
 
         saved = []
         runtime.checkpoint = lambda *a, **k: (
@@ -813,4 +826,186 @@ class TestTheAnnouncedRoundUnderDelay:
             assert saved and saved[0] == BASE_PLAN["preempt_at"], (
                 "rank %d saved at %s, not at the step the flag went up"
                 % (rank, saved)
+            )
+
+
+# ─── GPU-125: how wide the detection channel is allowed to be ──────────────
+
+
+def _partition_worker(rank, world, port, plan, out):
+    """One rank deciding how wide its SIGTERM channel should be.
+
+    Two machines are simulated with `GROUP_RANK`, which is what torchrun sets
+    and what `machine_key` reads. `shard_group_ranks` is replaced rather than
+    driven through real FSDP: what is under test is the partition and the
+    group built from it, and standing up FSDP on gloo to obtain a process
+    group whose ranks are already known would be testing torch.
+    """
+    import time
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    os.environ["GROUP_RANK"] = str(rank // plan["per_node"])
+    os.environ["LOCAL_WORLD_SIZE"] = str(plan["per_node"])
+
+    try:
+        import torch.distributed as dist
+
+        import ravex._dist.collectives as collectives
+
+        dist.init_process_group("gloo", rank=rank, world_size=world)
+
+        node = rank // plan["per_node"]
+        if plan["sharding"] == "per_node":
+            collectives.shard_group_ranks = lambda model: [
+                other for other in range(world) if other // plan["per_node"] == node
+            ]
+        else:
+            collectives.shard_group_ranks = lambda model: list(range(world))
+
+        partition = collectives.emergency_partition(object())
+        usable, group = collectives.emergency_group(plan["timeout"], partition)
+        members = (
+            dist.get_process_group_ranks(group)
+            if usable and group is not None
+            else None
+        )
+
+        # The property the whole issue is about: with the channel confined to
+        # a machine, a machine that stops taking part costs the other machine
+        # nothing. Node 1 simply walks away here, which is what a node running
+        # its own inner steps looks like from node 0.
+        answered, elapsed = None, None
+        if usable and plan["detect"]:
+            if node == 0:
+                began = time.perf_counter()
+                try:
+                    answered = collectives.emergency_signalled(rank == 0, group)
+                except Exception as exc:
+                    answered = "%s: %s" % (type(exc).__name__, exc)
+                elapsed = time.perf_counter() - began
+            else:
+                time.sleep(plan["walk_away_seconds"])
+
+        dist.destroy_process_group()
+        out.put((rank, partition, members, answered, elapsed))
+    except BaseException:
+        import traceback
+
+        out.put((rank, None, None, traceback.format_exc(), None))
+
+
+def _run_partition(plan, world=4):
+    import multiprocessing as mp
+
+    ctx = mp.get_context("spawn")
+    out = ctx.Queue()
+    port = _free_port()
+    procs = [
+        ctx.Process(target=_partition_worker, args=(rank, world, port, plan, out))
+        for rank in range(world)
+    ]
+    for proc in procs:
+        proc.start()
+    results = {}
+    try:
+        for _ in procs:
+            rank, partition, members, answered, elapsed = out.get(timeout=180)
+            if members is None and partition is None and isinstance(answered, str):
+                pytest.fail("rank %d failed: %s" % (rank, answered))
+            results[rank] = (partition, members, answered, elapsed)
+    finally:
+        for proc in procs:
+            proc.join(timeout=30)
+            if proc.is_alive():  # pragma: no cover - a hung collective
+                proc.terminate()
+                proc.join(timeout=10)
+    return results
+
+
+class TestTheChannelIsNoWiderThanWhatItProtects:
+    """GPU-125. The save this channel coordinates is collective on the
+    *model's* group — `get_state_dict` is handed no `process_group` — so the
+    ranks that must enter it together are the ranks holding shards of the same
+    model. The channel was one group over every rank of the job, which put
+    every rank on every other machine into a per-step collective it had no
+    stake in.
+    """
+
+    def test_sharding_that_stays_on_a_machine_gets_a_group_per_machine(self):
+        results = _run_partition(
+            {"per_node": 2, "sharding": "per_node", "detect": False,
+             "walk_away_seconds": 0.0, "timeout": 20}
+        )
+
+        for rank, (partition, members, _answered, _elapsed) in results.items():
+            assert partition == [[0, 1], [2, 3]], (
+                "rank %d partitioned the job as %s" % (rank, partition)
+            )
+            assert members == [0, 1] if rank < 2 else members == [2, 3], (
+                "rank %d landed in the group %s" % (rank, members)
+            )
+
+    def test_sharding_that_crosses_machines_keeps_the_whole_job(self):
+        """Not a fallback, and not a regression to be fixed later: when the
+        shards themselves span machines, the save's own collective spans them,
+        so the detection has to as well. The defect was never the wide group —
+        it was the wide group when the sharding was not."""
+        results = _run_partition(
+            {"per_node": 2, "sharding": "global", "detect": False,
+             "walk_away_seconds": 0.0, "timeout": 20}
+        )
+
+        for rank, (partition, members, _answered, _elapsed) in results.items():
+            assert partition is None, "rank %d split a job it should not" % rank
+            assert members == [0, 1, 2, 3], "rank %d: %s" % (rank, members)
+
+    def test_a_machine_that_walks_away_does_not_cost_the_other_one(self):
+        """The reason this matters, run rather than argued.
+
+        Node 1 stops taking part, which is what a node doing its own inner
+        steps between outer rounds looks like from node 0. With the channel
+        confined to a machine, node 0's detection round completes on its own
+        in milliseconds. On the group this channel used to build it would have
+        waited for node 1 and then failed the whole group on a timeout — once
+        per step.
+        """
+        results = _run_partition(
+            {"per_node": 2, "sharding": "per_node", "detect": True,
+             "walk_away_seconds": 3.0, "timeout": 20}
+        )
+
+        for rank in (0, 1):
+            _partition, _members, answered, elapsed = results[rank]
+            assert answered is True, (
+                "rank %d did not get an answer while the other machine was "
+                "away: %r" % (rank, answered)
+            )
+            assert elapsed < 1.0, (
+                "rank %d took %.2fs, so it was waiting for the machine that "
+                "walked away" % (rank, elapsed)
+            )
+
+    def test_and_the_wide_group_really_does_wait_for_it(self):
+        """The negative control, without which the test above proves nothing.
+
+        Same two machines, same machine walking away, and the only difference
+        is that the sharding crosses machines so the channel is one group over
+        the job — which is what it was for every job before GPU-125. Node 0
+        now waits for node 1 and comes out on the group's timeout, shortened
+        here to two seconds so the control is cheap to keep.
+
+        Note what this costs where it is wrong: it is per step.
+        """
+        results = _run_partition(
+            {"per_node": 2, "sharding": "global", "detect": True,
+             "walk_away_seconds": 3.0, "timeout": 2}
+        )
+
+        for rank in (0, 1):
+            _partition, _members, answered, elapsed = results[rank]
+            assert elapsed is not None and elapsed > 1.0, (
+                "rank %d answered in %.3fs on a group containing a machine "
+                "that was not there, so this control is not controlling for "
+                "anything" % (rank, elapsed or 0.0)
             )

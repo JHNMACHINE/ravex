@@ -1891,10 +1891,27 @@ class RavexRuntime:
         its own, before this channel's own cost.
         """
         if self._emergency_group is None:
-            from ravex._dist.collectives import emergency_group
+            from ravex._dist.collectives import emergency_group, emergency_partition
 
+            # Asked unconditionally, by every rank, before the `new_group`
+            # below — both are collective and a rank that skipped either would
+            # leave the others inside one. `emergency_partition` is given None
+            # rather than skipped when this rank somehow has no sharded model,
+            # because the gather inside it is what makes every rank reach the
+            # same verdict, and a rank that did not join it cannot.
+            models = [model for _name, model, _owners in self.registry.sharded_groups()]
+            partition = emergency_partition(models[0] if models else None)
+            if partition is not None:
+                logger.info(
+                    "SIGTERM detection runs per machine: %d group(s) of "
+                    "%s rank(s). The save it coordinates is collective on the "
+                    "model's group, which does not leave this machine, so "
+                    "neither does this (GPU-125).",
+                    len(partition),
+                    "/".join(str(len(members)) for members in partition),
+                )
             usable, self._emergency_group = emergency_group(
-                self.config.emergency_timeout
+                self.config.emergency_timeout, partition
             )
             if not usable:
                 # Asked once and remembered, the same as a failed byte
