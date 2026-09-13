@@ -68,4 +68,33 @@ grep -ro 'emergency[^,}]*' "$DIR/checkpoints" 2>/dev/null | head -20 | tee -a "$
 echo "-- what ravex logged about the emergency path --" | tee -a "$LOG"
 grep -iE "SIGTERM|emergency" "$DIR/ravex.log" 2>/dev/null | tail -20 | tee -a "$LOG"
 
+# GPU-111: the detection is no longer a collective per step. A preempted rank
+# writes one key naming the step everybody saves at, and an ordinary step is a
+# `check` on a key that is not there. What that means for this phase is that
+# the log now carries an announcement, and it carries it on **both** machines
+# with the **same** step in it.
+#
+# This is the first time that protocol runs over a link with a real round trip
+# in it. On loopback the key is written and read in microseconds; here the
+# announcement has to cross a continent before the announced step arrives, and
+# `ANNOUNCE_LEAD` (two cadence checks) is what buys the time for it. If the
+# two machines print different steps, or one prints the "too late to join"
+# line, the lead is too short for this link and that is the number to change.
+echo "-- GPU-111: the announced step, which must match on both machines --" | tee -a "$LOG"
+grep -E "saves together at step|too late to join" "$DIR/ravex.log" 2>/dev/null | tee -a "$LOG"
+
+# GPU-125: the detection channel is one group per machine when the sharding
+# stays on a machine, and one group over the job when it does not.
+#
+# **This shape cannot reach the new branch, and that is worth knowing before
+# somebody reads its absence as a failure.** One GPU per box means
+# NPROC_PER_NODE=1, so the FSDP group spans both machines - the sharding
+# crosses a machine, the wide group is the correct answer, and the line below
+# is expected to print nothing. Its absence is the *unchanged* branch working.
+#
+# Reaching the new branch needs two GPUs per box with FSDP inside each one,
+# which is a different rental and a different phase.
+echo "-- GPU-125: per-machine detection (expected silent at 1 GPU/box) --" | tee -a "$LOG"
+grep -E "SIGTERM detection runs per machine" "$DIR/ravex.log" 2>/dev/null | tee -a "$LOG"
+
 exit 0
