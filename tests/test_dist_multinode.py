@@ -924,6 +924,124 @@ class TestTheObjectGatherOnTwoRanks:
         assert distributed._torch_can_reach_numpy() is True
 
 
+def _object_broadcast_worker(rank, world_size, port, no_numpy, payload, src, out):
+    """One rank of a real gloo group, receiving `payload` from `src`."""
+    import os
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    if no_numpy:
+        os.environ["RAVEX_ASSUME_NO_NUMPY"] = "1"
+    else:
+        os.environ.pop("RAVEX_ASSUME_NO_NUMPY", None)
+
+    try:
+        import torch.distributed as dist
+
+        from ravex._dist import collectives as distributed
+
+        distributed._torch_numpy = None
+        took_the_new_path = not distributed._torch_can_reach_numpy()
+
+        dist.init_process_group("gloo", rank=rank, world_size=world_size)
+        try:
+            got = distributed._broadcast_object(
+                dist, payload if rank == src else None, src
+            )
+        finally:
+            dist.destroy_process_group()
+        out.put((rank, took_the_new_path, got))
+    except Exception as exc:  # pragma: no cover - reported, not swallowed
+        out.put((rank, None, f"{type(exc).__name__}: {exc}"))
+
+
+def _broadcast_across_two_ranks(no_numpy_by_rank, payload, src=0):
+    import multiprocessing as mp
+
+    ctx = mp.get_context("spawn")
+    out = ctx.Queue()
+    port = _free_port()
+    procs = [
+        ctx.Process(
+            target=_object_broadcast_worker,
+            args=(rank, 2, port, no_numpy_by_rank[rank], payload, src, out),
+        )
+        for rank in (0, 1)
+    ]
+    for proc in procs:
+        proc.start()
+    results = {}
+    try:
+        for _ in procs:
+            rank, took_new, got = out.get(timeout=120)
+            if took_new is None:
+                pytest.fail("rank %d failed: %s" % (rank, got))
+            results[rank] = (took_new, got)
+    finally:
+        for proc in procs:
+            proc.join(timeout=30)
+            if proc.is_alive():  # pragma: no cover - a hung collective
+                proc.terminate()
+                proc.join(timeout=10)
+    return results
+
+
+class TestTheObjectBroadcastOnTwoRanks:
+    """The other object collective, and the one that had been left behind.
+
+    `_all_gather_object` replaced torch's gather because it decodes with
+    `tensor.numpy().tobytes()`; `elastic.share_captured` went on calling
+    `dist.broadcast_object_list`, which decodes exactly the same way. The CI
+    job that installs no NumPy found it on 2026-09-13, at the worst possible
+    line: the broadcast that hands every rank the captured state after an
+    elastic regroup. The wire work was done and then it raised, so the run had
+    already paid for the transfer and got a crash instead of a model.
+    """
+
+    # Deliberately not a small scalar: the payload a regroup broadcasts is a
+    # state dict, and a length handled wrongly shows up as garbage rather than
+    # as something that happens to fit.
+    PAYLOAD = ({"layer.weight": [0.5] * 2000, "layer.bias": [0.25]}, {"step": 41})
+
+    def test_both_ranks_without_numpy_agree(self):
+        results = _broadcast_across_two_ranks([True, True], self.PAYLOAD)
+        assert set(results) == {0, 1}, results
+        for rank, (took_new, got) in results.items():
+            assert took_new is True, "rank %d did not take the new path" % rank
+            assert got == self.PAYLOAD, "rank %d received %r" % (rank, got)
+
+    @NEEDS_NUMPY
+    def test_a_rank_with_numpy_and_a_rank_without_still_meet(self):
+        """The same claim `_all_gather_object` makes, on this primitive.
+
+        NumPy is a property of the process, not of the job, so the receiving
+        rank can be on one path while the source is on the other. They agree
+        only if the replacement posts the same two broadcasts, in the same
+        order and with the same dtypes, as torch's own — a `long` holding the
+        length and then the payload as `uint8`.
+
+        The source here is the rank *with* NumPy, which is the interesting
+        direction: it encodes through torch and the other decodes through the
+        replacement.
+        """
+        results = _broadcast_across_two_ranks([False, True], self.PAYLOAD, src=0)
+        assert results[0][0] is False, "rank 0 was supposed to keep torch's path"
+        assert results[1][0] is True, "rank 1 was supposed to take the new one"
+        for rank, (_took, got) in results.items():
+            assert got == self.PAYLOAD, "rank %d received %r" % (rank, got)
+
+    @NEEDS_NUMPY
+    def test_and_the_other_direction_too(self):
+        """Source without NumPy, receiver with. Encoding and decoding are
+        different halves of the compatibility claim and only this arm exercises
+        the replacement's encoder against torch's decoder."""
+        results = _broadcast_across_two_ranks([True, False], self.PAYLOAD, src=0)
+        assert results[0][0] is True
+        assert results[1][0] is False
+        for rank, (_took, got) in results.items():
+            assert got == self.PAYLOAD, "rank %d received %r" % (rank, got)
+
+
 def _drain_split_worker(rank, world_size, port, sharded, out):
     """One rank deciding whether to split `drain`, the way the runtime does."""
     import os

@@ -141,6 +141,36 @@
 
 ### Fixed
 
+- **An elastic regroup crashed on an image without NumPy, after the transfer
+  had already been paid for (GPU-126).**
+
+  `_all_gather_object` exists because `dist.all_gather_object` decodes what it
+  moved with `tensor.numpy().tobytes()`, so where that conversion is
+  unavailable every object collective raises *"Numpy is not available"* —
+  after the wire work is done, which makes it a crash rather than something a
+  caller could fall back from. Ravex depends on PyYAML and nothing else and
+  torch itself does not require NumPy, so that install is a configuration this
+  project has to keep working.
+
+  `broadcast_object_list` decodes exactly the same way, and
+  `elastic.share_captured` went on calling it directly — the one raw object
+  collective left in the package. The line it fails on is the worst one it
+  could be: the broadcast that hands every rank the captured state **after an
+  elastic regroup**. The bytes had crossed and what came back was an exception
+  instead of a model. Found by the CI job that installs no NumPy on purpose.
+
+  `collectives._broadcast_object` replaces it, on the pattern of its sibling:
+  torch's road where NumPy is reachable, and otherwise the same two broadcasts
+  in the same order and with the same dtypes — a `long` holding the payload's
+  length, then the payload as `uint8`, plain pickle because that is what
+  `_object_to_tensor` writes.
+
+  **Wire compatibility is load-bearing, not tidiness.** NumPy is a property of
+  the process, not of the job, so one job can hold a rank on torch's road and a
+  rank on this one. `TestTheObjectBroadcastOnTwoRanks` runs both mixed
+  directions — torch encoding against the replacement's decoder, and the
+  reverse, which is the half the gather's own tests never covered.
+
 - **The preemption channel was wider than the thing it protects, and made
   independent nodes wait for each other (GPU-125, under GPU-113).**
 

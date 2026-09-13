@@ -342,9 +342,11 @@ def share_captured(captured, src: int = 0):
                 "weights without anything failing." % src
             )
 
-    holder = [captured if dist.get_rank() == src else None]
-    dist.broadcast_object_list(holder, src=src)
-    return holder[0]
+    # Not `dist.broadcast_object_list`: it decodes with `tensor.numpy()`, and
+    # an image without NumPy turned this line - the one that puts the model
+    # back together after a regroup - into "Numpy is not available". See
+    # `collectives._broadcast_object`, which is wire-compatible with it.
+    return collectives._broadcast_object(dist, captured, src)
 
 
 def rebuild_after_regroup(build, captured):

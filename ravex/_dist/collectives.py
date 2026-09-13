@@ -143,6 +143,63 @@ def _all_gather_object(dist, value, group=None) -> List[Any]:
     ]
 
 
+def _broadcast_object(dist, value, src, group=None):
+    """One rank's picklable value, handed to every rank of ``group``. **Collective.**
+
+    The same NumPy problem :func:`_all_gather_object` documents, on the other
+    primitive and found the same way — by a CI job on an image without NumPy.
+    ``dist.broadcast_object_list`` decodes what it moved with
+    ``tensor.numpy().tobytes()``, so where that conversion is unavailable the
+    elastic regroup raised *"Numpy is not available"* **after** the wire work
+    was done: a crash at the one moment a run is putting its model back
+    together, rather than something the caller could fall back from.
+
+    ``src`` is a **global** rank, matching what every caller here already has
+    and what ``dist.broadcast`` itself takes.
+
+    The fallback is wire-compatible with ``broadcast_object_list`` over a
+    one-element list, and that is load-bearing rather than tidy: NumPy is a
+    property of the *process*, so one job can hold a rank that takes torch's
+    path and a rank that takes this one, and the two have to meet. Two
+    broadcasts, in the same order and with the same dtypes torch uses — a
+    ``long`` holding the payload's length, then the payload as ``uint8``, and
+    the payload is plain pickle because that is what ``_object_to_tensor``
+    writes when ``weights_only`` is false, which is its default here.
+    """
+    if _torch_can_reach_numpy():
+        holder = [value if dist.get_rank() == src else None]
+        dist.broadcast_object_list(holder, src=src, group=group)
+        return holder[0]
+
+    import pickle
+
+    import torch
+
+    device = _object_device(dist)
+    is_src = dist.get_rank() == src
+
+    if is_src:
+        payload = torch.frombuffer(bytearray(pickle.dumps(value)), dtype=torch.uint8)
+        payload = payload.to(device)
+        sizes = torch.tensor([payload.numel()], dtype=torch.long, device=device)
+    else:
+        sizes = torch.empty(1, dtype=torch.long, device=device)
+
+    dist.broadcast(sizes, src=src, group=group)
+
+    if not is_src:
+        payload = torch.empty(int(sizes[0].item()), dtype=torch.uint8, device=device)
+
+    dist.broadcast(payload, src=src, group=group)
+
+    if is_src:
+        # Nothing to decode, and torch's own version does not decode here
+        # either: the source already holds the object it sent.
+        return value
+    # `bytes(tensor.tolist())` is the NumPy-free spelling of `.numpy().tobytes()`.
+    return pickle.loads(bytes(payload.cpu().tolist()))
+
+
 def get_rank() -> int:
     """Global rank of this process, 0 when not distributed."""
     dist = _dist()
