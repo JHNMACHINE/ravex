@@ -521,6 +521,33 @@ detection channel itself fails, nothing happens beyond what already happens
 today — the last periodic checkpoint stands, same as if this were switched
 off.
 
+### How wide the channel is
+
+The save this coordinates is collective on the **model's** group:
+`get_state_dict` is handed no `process_group`, so what it posts is what FSDP
+built. The ranks that have to enter it together are therefore the ranks
+holding shards of the same model — not every rank of the job.
+
+So the detection channel is one group **per machine** whenever the sharding
+stays on a machine, and one group over the whole job whenever the sharding
+itself crosses one. The second is not a fallback: where the shards span
+machines the save's collective spans them and the detection has to as well.
+
+The difference shows up on a job whose nodes are not in lockstep. With
+`outer_loop: true` each node trains on its own between rounds, and a channel
+spanning the nodes puts a collective across them on every step — which makes
+them wait for each other exactly as often as the outer loop exists to stop
+them doing. Measured in `tests/test_emergency_checkpoint.py`: with the channel
+confined to a machine, a machine that walks away costs the other one
+milliseconds; on one group over the job, the same walk-away costs it the
+group's whole timeout, per step.
+
+Which ranks share a machine is settled once, with a gather on the training
+group rather than on the store. That is deliberate: `new_group` is collective,
+so a rank that reached a different verdict from its peers would not disagree
+with them, it would hang them. A store round hands `None` to whoever runs out
+of deadline first; a collective cannot.
+
 The detection channel runs on its own process group, separate from the one
 carrying gradient synchronization, with its own short timeout
 (`emergency_timeout`). That isolation is deliberate: this project's own

@@ -141,6 +141,45 @@
 
 ### Fixed
 
+- **The preemption channel was wider than the thing it protects, and made
+  independent nodes wait for each other (GPU-125, under GPU-113).**
+
+  `emergency_group` was a `new_group()` with no `ranks=` — one group over
+  every rank of the job — and the detection round is posted on it once per
+  step. What that group has to cover is the save it coordinates, and the save
+  is collective on the **model's** group: `get_state_dict` is handed no
+  `process_group`, so what it posts is what FSDP built. The ranks that must
+  enter it together are the ranks holding shards of the same model.
+
+  On a job whose sharding stays on a machine, every rank on every *other*
+  machine was in a per-step collective it had no stake in. That is a tax
+  anywhere, and on the configuration GPU-113 describes — a 1B model with FSDP
+  inside each node and the outer loop between them — it is not a tax but a
+  contradiction: `outer_inner_steps: 500` means each node trains alone for 500
+  steps, and this channel made them wait for each other 500 times. Both of its
+  own predicates were satisfied there (`has_sharded_models()` is a question
+  about FSDP and knows nothing about the outer loop), so nothing had to be
+  misconfigured to reach it.
+
+  The channel is now one group **per machine** when the sharding stays on a
+  machine, and one group over the job when the sharding crosses one — where
+  the wide group was never the defect and is still the right answer.
+
+  **Which ranks share a machine is settled with a gather on the training
+  group, not on the store**, and the reason is the one this release's other
+  change is built around from the opposite direction: `new_group` is
+  collective, so a rank that reached a different verdict from its peers would
+  not disagree with them, it would hang them. A store round answers `None` to
+  whoever runs out of deadline first, and two ranks can come out of one
+  holding different partitions. It is posted once, immediately before a
+  `new_group` that is collective anyway.
+
+  The test runs two simulated machines and has one of them walk away, which is
+  what a node doing its own inner steps looks like from the other. Confined to
+  a machine, the detection round completes in milliseconds; the same scenario
+  on one group over the job waits out the group's whole timeout — kept as a
+  negative control, because without it the first assertion proves nothing.
+
 - **A loop with no `DataLoader` never closed an outer round, and said nothing
   about it (GPU-123).**
 

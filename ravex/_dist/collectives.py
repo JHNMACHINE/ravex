@@ -275,7 +275,154 @@ def byte_transport_group():
     return True, group
 
 
-def emergency_group(timeout_seconds: int):
+def machine_key() -> str:
+    """What this rank calls the machine it runs on.
+
+    ``torchrun`` numbers the nodes in ``GROUP_RANK``, which is the exact
+    answer wherever it exists. The hostname is the fallback and it is the
+    right one: ranks launched on a node share its network namespace, so they
+    agree about it and ranks on another node do not.
+    """
+    value = os.environ.get("GROUP_RANK")
+    if value is not None and value.strip():
+        return "node%s" % value.strip()
+    try:
+        import socket
+
+        return socket.gethostname()
+    except Exception:  # pragma: no cover - defensive
+        return "unknown"
+
+
+def shard_group_ranks(model):
+    """The global ranks that hold shards of this model, or None.
+
+    What the caller needs is not how many ranks share the model but **which
+    machines they are on**, so this answers in ranks. Both generations keep
+    the group, in different places: FSDP1 hangs a ``process_group`` off every
+    wrapped module, FSDP2 turns the parameters into ``DTensor``s whose device
+    mesh carries one per dimension.
+
+    Every mesh dimension is taken, not only the sharded one: a mesh that
+    reaches a second machine on *any* axis is a mesh whose collectives leave
+    this one, and the question here is exactly whether they do.
+
+    ``None`` means it could not be told, and the caller has to read that as
+    the widest possible answer — which is what this channel assumed before
+    anybody asked the question.
+    """
+    dist = _dist()
+    if dist is None or not dist.is_available() or not dist.is_initialized():
+        return None
+
+    groups = []
+    try:
+        from torch.distributed.fsdp import FullyShardedDataParallel
+
+        for module in model.modules():
+            if isinstance(module, FullyShardedDataParallel):
+                group = getattr(module, "process_group", None)
+                if group is not None:
+                    groups.append(group)
+    except Exception:
+        pass
+
+    if not groups:
+        try:
+            from torch.distributed.tensor import DTensor
+
+            for param in model.parameters():
+                if isinstance(param, DTensor):
+                    mesh = param.device_mesh
+                    for dim in range(int(getattr(mesh, "ndim", 1) or 1)):
+                        try:
+                            groups.append(mesh.get_group(dim))
+                        except Exception:
+                            pass
+                break  # one parameter is enough to find the mesh
+        except Exception:
+            pass
+
+    if not groups:
+        return None
+
+    ranks = set()
+    for group in groups:
+        try:
+            ranks.update(dist.get_process_group_ranks(group))
+        except Exception:
+            return None
+    return sorted(ranks)
+
+
+def emergency_partition(model):
+    """How to split the ranks for the SIGTERM channel, or None to not split.
+
+    **GPU-125.** The detection channel was one group over every rank of the
+    job, which is wider than what it protects. The save it coordinates runs on
+    the *model's* group — ``get_state_dict`` is handed no ``process_group``,
+    so its collectives are the FSDP group's — and the ranks that have to enter
+    it together are the ranks holding shards of the same model. On a job whose
+    sharding is confined to a machine, every rank on another machine was in a
+    per-step collective it had no stake in, and a node waiting on a node is
+    precisely what `outer_loop: true` exists to stop happening.
+
+    So: one group per machine when the sharding stays on a machine, and the
+    whole world when the sharding itself crosses one — where the wide group is
+    not a defect but the correct answer, and nothing here changes it.
+
+    **Gathered over the collective and not over the store, on purpose.** Every
+    rank must reach the same verdict or ``new_group`` below is called with
+    different arguments on different ranks, which is a hang and not a
+    disagreement. A store gather answers ``None`` to whoever runs out of
+    deadline first, so two ranks can come out of it holding different
+    partitions; a collective cannot. This is posted once, immediately before a
+    ``new_group`` that is collective anyway, so it adds no failure mode that
+    the next line does not already have.
+
+    A per-machine group is a *superset* of the shard group when several shard
+    groups share a machine, and that is deliberate: SIGTERM is delivered to a
+    machine, every member of each shard group on it is present, and the
+    partition stays derivable from one gather instead of several.
+    """
+    dist = _dist()
+    if dist is None or not dist.is_available() or not dist.is_initialized():
+        return None
+    world = get_world_size()
+    if world < 2:
+        return None
+
+    try:
+        answers = _all_gather_object(dist, (machine_key(), shard_group_ranks(model)))
+    except Exception as exc:
+        logger.warning(
+            "Could not work out which ranks share a machine (%s). The "
+            "SIGTERM channel falls back to one group over the whole job, "
+            "which is what it was before GPU-125.",
+            exc,
+        )
+        return None
+
+    machines = [str(answer[0]) for answer in answers]
+    for _machine, ranks in answers:
+        if ranks is None:
+            return None
+        if len({machines[rank] for rank in ranks if rank < world}) > 1:
+            # Sharding crosses machines somewhere in this job. The wide group
+            # is then the one the save needs, and every rank reads that from
+            # the same gathered list, so every rank reads it the same way.
+            return None
+
+    order = []
+    for name in machines:
+        if name not in order:
+            order.append(name)
+    return [
+        [rank for rank in range(world) if machines[rank] == name] for name in order
+    ]
+
+
+def emergency_group(timeout_seconds: int, partition=None):
     """A dedicated group for the SIGTERM detection channel: ``(usable, group)``.
 
     **Collective.** GPU-92's minimal coordination primitive — the mattone
@@ -296,6 +443,13 @@ def emergency_group(timeout_seconds: int):
     process group up, or no gloo available to build one on. The caller must
     then treat the emergency channel as off for this run, the same as any
     other collective this module refuses to post.
+
+    ``partition`` (GPU-125) is how the ranks are split, from
+    :func:`emergency_partition`: a list of rank lists, every one of which is
+    built here — ``new_group`` is collective and a group nobody else builds is
+    a hang — and this rank is handed the one it belongs to. ``None`` means one
+    group over the whole job, which is what this channel was and is still the
+    right answer whenever the sharding itself crosses a machine.
     """
     dist = _dist()
     if dist is None or not dist.is_available() or not dist.is_initialized():
@@ -305,10 +459,28 @@ def emergency_group(timeout_seconds: int):
 
     import datetime
 
+    timeout = datetime.timedelta(seconds=timeout_seconds)
     try:
-        group = dist.new_group(
-            backend="gloo", timeout=datetime.timedelta(seconds=timeout_seconds)
-        )
+        if not partition:
+            group = dist.new_group(backend="gloo", timeout=timeout)
+        else:
+            rank = get_rank()
+            group = None
+            for members in partition:
+                # Every group, on every rank, in the same order. Building only
+                # the one this rank is in would leave the others waiting
+                # inside a collective that never completes - `new_group` is
+                # not a local constructor.
+                built = dist.new_group(
+                    ranks=list(members), backend="gloo", timeout=timeout
+                )
+                if rank in members:
+                    group = built
+            if group is None:
+                raise RuntimeError(
+                    "rank %d is in none of the %d group(s) of the partition"
+                    % (rank, len(partition))
+                )
     except Exception as exc:
         logger.warning(
             "Could not open the emergency-signal group: %s. Preemption on "
