@@ -267,3 +267,80 @@ class TestWhatTheAutoloaderTookWithIt:
         two entry points, one of which has no exit."""
         for name in ("activate", "enable", "disable"):
             assert not hasattr(ravex, name), name
+
+
+class TestTheBoundaryHandedOverByHand:
+    """GPU-123: what a loop with no DataLoader can do about the boundary.
+
+    Ravex takes the top of the training iteration from the DataLoader iterator
+    it wraps. A loop over tensors that are already batched has no iterator to
+    wrap, and everything the runtime defers to that moment has to go somewhere
+    else: the checkpoint falls back to mid-step, and the outer round — which
+    cannot fall back, because it writes parameters — simply never happened.
+
+    `ravex.batch_boundary()` is that moment, handed over by hand.
+    """
+
+    def test_calling_it_outside_a_run_does_nothing(self):
+        """It is the kind of call that ends up in a library's own loop, run
+        both under Ravex and not. Raising there would make it un-callable."""
+        assert get_runtime(create=False) is None
+        ravex.batch_boundary()
+
+    def test_the_checkpoint_lands_after_the_scheduler_rather_than_inside_the_step(
+        self, storage
+    ):
+        """The cost of the mid-step fallback, and that handing over removes it.
+
+        A checkpoint taken inside the `optimizer.step()` hook is one
+        `scheduler.step()` short of the state the loop is actually in, so a
+        resumed run trains with a learning rate from the previous step and
+        every step after it is wrong by a little. With an LR that halves every
+        step that is not a rounding difference — it is the whole schedule off
+        by one.
+        """
+        LR, GAMMA = 0.1, 0.5
+
+        def saved_learning_rate(hand_over):
+            @ravex.train_loop(
+                backend="torch_save",
+                checkpoint_every=2,
+                resume=False,
+                checkpoint_on_exit=False,
+            )
+            def train():
+                torch.manual_seed(0)
+                model = torch.nn.Linear(4, 2)
+                optimizer = torch.optim.SGD(model.parameters(), lr=LR)
+                scheduler = torch.optim.lr_scheduler.StepLR(
+                    optimizer, step_size=1, gamma=GAMMA
+                )
+                # Three, not four: a fourth step makes a second checkpoint
+                # due and `load_latest` would answer about that one instead.
+                for _ in range(3):
+                    if hand_over:
+                        ravex.batch_boundary()
+                    model(torch.randn(2, 4)).sum().backward()
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    scheduler.step()
+
+                ravex.flush()
+                state = get_runtime().backend.load_latest()
+                # The checkpoint due at step 2, wherever it was taken. Which
+                # `scheduler.step()` it landed after is the whole question.
+                assert state["step"] == 2, state["step"]
+                (schedule,) = state["schedulers"].values()
+                return schedule["_last_lr"][0]
+
+            return train()
+
+        assert saved_learning_rate(hand_over=True) == pytest.approx(LR * GAMMA**2), (
+            "the boundary was handed over and the checkpoint still landed "
+            "inside optimizer.step(), one scheduler step stale"
+        )
+        assert saved_learning_rate(hand_over=False) == pytest.approx(LR * GAMMA), (
+            "the mid-step fallback no longer costs a stale learning rate, so "
+            "the reason for handing the boundary over is gone and this test "
+            "is measuring nothing"
+        )

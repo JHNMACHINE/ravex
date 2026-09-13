@@ -113,6 +113,42 @@ The cost is that a hard kill loses up to one extra iteration. That is the right
 trade: a checkpoint that resumes *exactly* beats a checkpoint that is one
 iteration fresher and slightly wrong.
 
+### A loop with no dataloader
+
+That wrapper is where the moment comes from, so a loop that never builds a
+`DataLoader` — a pass over tensors that are already batched, which is how a
+good deal of real training code is written — never delivers one. The runtime
+has always had a fallback for the checkpoint: with no dataloader registered, it
+takes it inside the step hook and accepts the stale learning rate, because a
+checkpoint one step off is better than no checkpoint.
+
+The outer round has no such fallback. Closing it mid-step would write the
+averaged parameters into the model underneath an optimizer that has not
+finished, after however many minutes of network it took to fetch them. So the
+round waits for a boundary, and in a loop with no dataloader it waited forever:
+no round closed, no delta was exchanged, and every node trained its own model
+for the whole run — with nothing in the log to say so, because nothing had
+failed.
+
+`ravex.batch_boundary()` is that moment handed over by hand:
+
+```python
+for begin in range(0, len(data), batch_size):
+    ravex.batch_boundary()      # the top of the iteration
+    optimizer.zero_grad()
+    loss_fn(model(x[begin : begin + batch_size]), y[...]).backward()
+    optimizer.step()
+    scheduler.step()
+```
+
+It is idempotent and costs nothing when nothing is due, so it is safe in a loop
+that may or may not run under Ravex, and harmless in one that does have a
+dataloader. A loop that calls it gets its checkpoints at the boundary too,
+rather than through the stale-LR fallback.
+
+And when nobody calls it, the runtime says which call is missing — once, naming
+the consequence — instead of leaving a run that looks healthy and is not.
+
 ### Where the dataset was
 
 `TrackedSampler` wraps the loader's `batch_sampler` (or its `sampler` when

@@ -44,6 +44,14 @@ logger = logging.getLogger("ravex")
 
 _LOG_FORMAT = "%(asctime)s [ravex] %(levelname)s %(message)s"
 
+#: How many further optimizer steps a due round may survive before the
+#: runtime says out loud that nobody is closing it. The dataloader path
+#: cannot reach this: the boundary is the top of the next iteration, which
+#: comes before the next `optimizer.step()` even under gradient
+#: accumulation. The slack is for a loop that steps the same optimizer
+#: more than once per iteration, which is unusual but not wrong.
+_ROUND_BOUNDARY_GRACE_STEPS = 2
+
 
 def _drain_accelerator() -> None:
     """Wait for this rank's queued device work, and let the caller bill it.
@@ -155,6 +163,13 @@ class RavexRuntime:
         #: on a path that runs once per round.
         self.store_for_joins: Any = None
         self._round_due = False
+        #: The step the round came due at, for the warning below. Only
+        #: meaningful while `_round_due` is up.
+        self._round_due_at: Optional[int] = None
+        self._round_boundary_warned = False
+        #: Whether anything is handing us the top of the iteration — the
+        #: dataloader wrapper, or `ravex.batch_boundary()` called by hand.
+        self._boundary_delivered = False
         self._shutdown_done = False
         self._lock = threading.RLock()
         self._framework = "unknown"
@@ -514,6 +529,7 @@ class RavexRuntime:
         if self.config.outer_loop:
             outer = self._outer_loop()
             if outer is not None:
+                self._warn_if_no_round_boundary(outer)
                 outer.record_step()
                 if outer.round_is_over():
                     # Flagged, not closed. Same discipline as `_checkpoint_due`
@@ -523,6 +539,13 @@ class RavexRuntime:
                     # write the outer parameters into the model underneath an
                     # optimizer that is still mid-step — after having spent
                     # however many minutes of network inside it.
+                    if not self._round_due:
+                        # The transition, not the state: `round_is_over()`
+                        # stays true from the step it first answers yes until
+                        # a round actually closes, so re-stamping it here
+                        # would reset the clock every step and the warning
+                        # below would never come due.
+                        self._round_due_at = self.registry.step_count
                     self._round_due = True
 
         if self._emergency_coordination_active():
@@ -534,17 +557,29 @@ class RavexRuntime:
             # scheduler has stepped. Flag it and collect at the top of the next
             # one — see _BatchBoundaryIterator.
             self._checkpoint_due = True
-            if not self.registry.dataloaders:
+            if not self.registry.dataloaders and not self._boundary_delivered:
                 # No dataloader to give us that boundary (a loop over
-                # pre-batched tensors). Mid-iteration is then the best
-                # available point.
+                # pre-batched tensors) and nobody calling
+                # `ravex.batch_boundary()` either. Mid-iteration is then the
+                # best available point — at the cost this hatch has always
+                # had, a saved learning rate one step stale.
                 self._checkpoint_due = False
                 self.checkpoint()
 
     def on_batch_boundary(self) -> None:
-        """Called at the top of each training iteration, before the batch."""
+        """Called at the top of each training iteration, before the batch.
+
+        Two callers: the dataloader wrapper, which gets this moment for free,
+        and `ravex.batch_boundary()`, which is how a loop without a dataloader
+        hands it over.
+        """
         if not self._enabled:
             return
+        # Remembered because the *checkpoint* hatch in `on_step` reads "no
+        # dataloader" as "no boundary". A loop that calls
+        # `ravex.batch_boundary()` has the boundary without having a
+        # dataloader, and its checkpoints belong here rather than mid-step.
+        self._boundary_delivered = True
         if self._round_due:
             self._round_due = False
             self._close_outer_round()
@@ -708,6 +743,40 @@ class RavexRuntime:
             root,
         )
         return loop
+
+    def _warn_if_no_round_boundary(self, outer) -> None:
+        """Say it when a round is due and nothing ever closes it.
+
+        `_round_due` goes up inside `optimizer.step()` and comes down at the
+        next batch boundary. A loop with no DataLoader is handed no boundary
+        for free, so unless it calls `ravex.batch_boundary()` the flag stays
+        up for the rest of the run: no round closes, no delta is exchanged,
+        and every node trains its own model to the end while the log says
+        nothing at all. The silence is the defect worth fixing here — more
+        than the missing call, which the message names.
+
+        Once per process. A run that has been told has been told.
+        """
+        if self._round_boundary_warned or not self._round_due:
+            return
+        if self._round_due_at is None:
+            return
+        waited = self.registry.step_count - self._round_due_at
+        if waited < _ROUND_BOUNDARY_GRACE_STEPS:
+            return
+
+        self._round_boundary_warned = True
+        logger.warning(
+            "Outer round %d has been ready to close for %d optimizer steps "
+            "and nothing has closed it. Ravex takes the batch boundary from "
+            "the DataLoader iterator, and this loop has no DataLoader "
+            "registered, so that moment never arrives: no round will close, "
+            "no delta will be exchanged with the peers, and this node will "
+            "train alone for the rest of the run. Call ravex.batch_boundary() "
+            "at the top of each training iteration.",
+            outer.round_number,
+            waited,
+        )
 
     def _close_outer_round(self) -> None:
         """Exchange deltas with the peers and take the outer step.

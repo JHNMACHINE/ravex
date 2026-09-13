@@ -28,7 +28,7 @@ def free_port():
         return probe.getsockname()[1]
 
 
-def a_node(rank, world, port, root, rounds, inner, queue):
+def a_node(rank, world, port, root, rounds, inner, queue, boundary="public"):
     """One rank: init the group, then a training loop that knows nothing."""
     try:
         import torch.distributed as dist
@@ -86,10 +86,14 @@ def a_node(rank, world, port, root, rounds, inner, queue):
                 optimizer.zero_grad()
                 loss_fn(model(x[begin : begin + 32]), y[begin : begin + 32]).backward()
                 optimizer.step()
-                # The batch boundary a dataloader would give for free. This
-                # loop has no dataloader, which is exactly the case worth
-                # testing: a round must not close inside optimizer.step().
-                ravex._runtime.get_runtime().on_batch_boundary()
+                if boundary == "public":
+                    # The batch boundary a dataloader would give for free.
+                    # This loop has no dataloader, which is exactly the case
+                    # worth testing: a round must not close inside
+                    # optimizer.step(), so somebody has to hand over the top
+                    # of the iteration. `boundary="none"` is the same loop
+                    # with nobody handing it over — GPU-123.
+                    ravex.batch_boundary()
             return (
                 before,
                 loss_fn(model(x), y).item(),
@@ -103,7 +107,7 @@ def a_node(rank, world, port, root, rounds, inner, queue):
                 before,
                 after,
                 sums,
-                [line for line in said if "Outer round" in line],
+                list(said),
             )
         )
     except BaseException as exc:  # reported rather than a silent empty queue
@@ -120,14 +124,19 @@ def a_node(rank, world, port, root, rounds, inner, queue):
             pass
 
 
-def run_two(tmp_path, rounds=3, inner=8):
+def rounds_of(said):
+    """The log lines a closed round leaves behind."""
+    return [line for line in said if "Outer round" in line and "took" in line]
+
+
+def run_two(tmp_path, rounds=3, inner=8, boundary="public"):
     context = mp.get_context("spawn")
     queue = context.Queue()
     port = free_port()
     workers = [
         context.Process(
             target=a_node,
-            args=(rank, 2, port, str(tmp_path), rounds, inner, queue),
+            args=(rank, 2, port, str(tmp_path), rounds, inner, queue, boundary),
         )
         for rank in range(2)
     ]
@@ -167,7 +176,49 @@ def test_a_training_loop_that_knows_nothing_trains_with_a_peer(tmp_path):
     assert left == pytest.approx(right, abs=1e-4), (
         "the two ranks ended with different models, so the rounds did not "
         "reach them: %s against %s\nrank0 rounds: %s\nrank1 rounds: %s"
-        % (left, right, results[0][3], results[1][3])
+        % (left, right, rounds_of(results[0][3]), rounds_of(results[1][3]))
+    )
+
+
+@pytest.mark.skipif(sys.platform == "darwin", reason="spawn + gloo is slow on macOS")
+def test_a_loop_that_hands_over_no_boundary_is_told_so(tmp_path):
+    """GPU-123: the same loop, with nobody handing over the top of it.
+
+    Until now this failure was invisible. A round comes due inside
+    `optimizer.step()` and is flagged rather than closed - deliberately,
+    because closing it there would write the outer parameters into the model
+    underneath an optimizer mid-step - and the flag comes down at the batch
+    boundary. Without a DataLoader and without `ravex.batch_boundary()` that
+    boundary never arrives: the flag stays up, no round closes, and each node
+    trains its own model to the end of the run with not one line in the log
+    to say so.
+
+    So the assertion is in two halves. The run still ends up **wrong**, which
+    is the honest outcome of a loop that never hands over its boundary and is
+    not this issue's to fix. What changed is that it now names the missing
+    call, once.
+    """
+    results = run_two(tmp_path, boundary="none")
+
+    for rank, (_before, _after, _sums, said) in results.items():
+        assert not rounds_of(said), "rank %d closed a round from nowhere: %s" % (
+            rank,
+            rounds_of(said),
+        )
+        complaints = [line for line in said if "ravex.batch_boundary()" in line]
+        assert len(complaints) == 1, (
+            "rank %d said it %d time(s), and once is the whole contract: a "
+            "warning repeated every step is noise a real run scrolls past. "
+            "Everything it said: %s" % (rank, len(complaints), said)
+        )
+        assert "no delta will be exchanged" in complaints[0], (
+            "the warning does not say what the silence costs: %s" % complaints[0]
+        )
+
+    left, right = results[0][2], results[1][2]
+    assert left != pytest.approx(right, abs=1e-4), (
+        "the two ranks agree, so something did exchange after all and the "
+        "warning is now wrong about the consequence"
     )
 
 
@@ -238,7 +289,7 @@ def test_without_a_rendezvous_the_run_carries_on_locally(tmp_path, monkeypatch):
                 optimizer.zero_grad()
                 model(torch.randn(2, 3)).sum().backward()
                 optimizer.step()
-                runtime.on_batch_boundary()
+                ravex.batch_boundary()
             return runtime
 
         runtime = train()

@@ -591,6 +591,23 @@ twice. On nodes drawing from the same distribution that is invisible;
 give each node its own data and `step_weighted` costs **45% more loss** than
 the default. Leave it on `mean` unless you have measured otherwise.
 
+**A loop with no `DataLoader` has to hand over the boundary.** A round is
+closed at the top of a training iteration, never inside `optimizer.step()` —
+closing it there would write the averaged parameters into the model underneath
+an optimizer mid-step. Ravex takes that moment from the `DataLoader` iterator,
+so a loop over tensors that are already batched has to give it explicitly:
+
+```python
+for begin in range(0, len(data), batch_size):
+    ravex.batch_boundary()
+    ...
+    optimizer.step()
+```
+
+Without it no round ever closes and every node trains alone for the whole run.
+Ravex warns once, naming the call, a couple of steps after the first round
+comes due.
+
 **What it needs from the launcher.** Peer addresses and the job token come from
 torch's rendezvous store, so the ranks must have called `init_process_group` —
 `torchrun`, including across machines with `--rdzv-backend=c10d`. The process

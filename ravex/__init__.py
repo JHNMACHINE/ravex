@@ -45,6 +45,7 @@ from typing import Any, Callable, Optional, TypeVar
 __version__ = "0.1.0"
 
 __all__ = [
+    "batch_boundary",
     "checkpoint",
     "deactivate",
     "flush",
@@ -266,6 +267,41 @@ def checkpoint() -> bool:
     if runtime is None:
         return False
     return runtime.checkpoint()
+
+
+def batch_boundary() -> None:
+    """Hand Ravex the top of a training iteration.
+
+    A loop that iterates a ``DataLoader`` never needs this: Ravex wraps the
+    iterator and takes the boundary from it. A loop over tensors that are
+    already batched has no such moment to borrow — and there is no other point
+    in the iteration that would do, because the work Ravex defers to the
+    boundary is exactly the work that must not happen inside
+    ``optimizer.step()``:
+
+    * a **checkpoint** taken mid-step records a learning rate one step stale,
+      so the resumed run trains with the wrong LR from its very first step;
+    * an **outer round** (``outer_loop: true``) writes the averaged parameters
+      into the model, underneath an optimizer that has not finished its step,
+      after spending however many minutes of network to fetch them.
+
+    So call it at the top of each iteration, before the batch::
+
+        for begin in range(0, len(data), batch_size):
+            ravex.batch_boundary()
+            optimizer.zero_grad()
+            loss_fn(model(x[begin : begin + batch_size]), y[...]).backward()
+            optimizer.step()
+
+    Cheap and idempotent: with nothing due it returns having done nothing, and
+    outside an active run it does nothing at all. Calling it in a loop that
+    *does* have a DataLoader is harmless for the same reason.
+    """
+    from ravex._runtime import get_runtime
+
+    runtime = get_runtime(create=False)
+    if runtime is not None:
+        runtime.on_batch_boundary()
 
 
 def flush() -> None:

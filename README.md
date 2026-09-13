@@ -157,6 +157,23 @@ needs no special handling. Checkpoints are collected at the *top of an
 iteration*, never inside one: mid-iteration the LR scheduler has not stepped
 yet, and a checkpoint taken there resumes with a stale learning rate.
 
+That moment comes from the `DataLoader` iterator. **A loop that has no
+`DataLoader`** — one over tensors that are already batched — has none to give,
+and has to hand it over itself:
+
+```python
+for begin in range(0, len(data), batch_size):
+    ravex.batch_boundary()
+    ...
+    optimizer.step()
+    scheduler.step()
+```
+
+Without it a checkpoint falls back to mid-step and pays the stale learning rate
+above, and an [outer round](docs/configuration.md#training-across-the-internet)
+— which cannot fall back, because it *writes* parameters — never closes at all.
+Ravex says so after a couple of steps rather than training on in silence.
+
 Collection runs on the training thread — it has to, to be consistent with the
 step that just finished — and copies the state; the write itself happens in the
 background. What the loop pays for is the copy, not the I/O.

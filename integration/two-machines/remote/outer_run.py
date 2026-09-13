@@ -234,11 +234,12 @@ def main():
         # closed at the *next batch boundary*, because closing it mid-step
         # would write the outer parameters into the model underneath an
         # optimizer that has not finished. That boundary comes from iterating a
-        # DataLoader - so a training loop over pre-batched tensors flags rounds
-        # that nobody ever closes, every node trains alone, and the run looks
-        # healthy throughout. `tests/test_outer_train_loop.py` calls
-        # `on_batch_boundary()` by hand for exactly this reason; a phase that
-        # did the same would be measuring a shape no user has.
+        # DataLoader - so a training loop over pre-batched tensors has to hand
+        # that moment over itself with `ravex.batch_boundary()` (GPU-123), and
+        # one that does neither flags rounds nobody ever closes while looking
+        # healthy throughout. `tests/test_outer_train_loop.py` covers both
+        # shapes; a phase here that called the boundary by hand would be
+        # measuring the one a user reaching for a DataLoader does not have.
         #
         # Each node draws its own data, which is the point: identical shards
         # would make the average a no-op, and a round that moved nothing would

@@ -78,6 +78,37 @@
 
 ### Fixed
 
+- **A loop with no `DataLoader` never closed an outer round, and said nothing
+  about it (GPU-123).**
+
+  A round that is over is flagged inside the `optimizer.step()` hook and closed
+  at the next batch boundary — deliberately, because closing it in the hook
+  would write the averaged parameters into the model underneath an optimizer
+  that has not finished its step, after however many minutes of network it took
+  to fetch them. That boundary comes from the `DataLoader` iterator Ravex
+  wraps.
+
+  A training loop over tensors that are already batched has no such iterator,
+  so the flag went up on the first completed round and stayed up: no round ever
+  closed, no delta was ever exchanged, and every node trained its own model for
+  the whole run. There was no warning, no error, and not one `Outer round` line
+  in the log — the run looked exactly like a healthy one. The checkpoint path
+  has had a fallback for this case since it existed; the round never did.
+
+  Two changes. `ravex.batch_boundary()` is now public: a loop without a
+  dataloader calls it at the top of each iteration and hands over the moment
+  explicitly. And when nothing does, the runtime says which call is missing —
+  once, naming what the silence costs — a couple of optimizer steps after the
+  first round comes due.
+
+  A loop that hands the boundary over gets its **checkpoints** there too,
+  instead of through the mid-step fallback and its learning rate one
+  `scheduler.step()` stale.
+
+  `tests/test_outer_train_loop.py` had been calling the internal hook by hand
+  since it was written, with a comment saying why — which is the shape of this
+  defect exactly: the test compensated for something a user cannot.
+
 - **The outer loop runs on a GPU (GPU-124).** It never had.
 
   With the model on CUDA, `outer_loop: true` raised before the seed round —
