@@ -210,6 +210,38 @@ did not write:
 - **One model.** Converting needs one model to convert into; a run with
   several sharded groups is refused rather than guessed at.
 
+#### The other direction: exporting to a distributed checkpoint
+
+A Ravex store is a format only Ravex reads. To hand a checkpoint to something
+that reads `torch.distributed.checkpoint` — a plain FSDP job,
+`megatron.core.dist_checkpointing`, or `dcp.load` in a script of your own:
+
+```bash
+ravex export --storage ./checkpoints --out ./exported-dcp
+```
+
+`--backend torch_save` for a store written by that backend (the default is
+`moonclip`), `--step N` for a checkpoint other than the latest, and `--model
+KEY` when the checkpoint holds more than one model — the error lists the keys.
+The directory gets `model` and `optim` at its top level, the two keys a DCP
+reader looks for first, plus `ravex` with the step it came from.
+
+How exact each half is depends on what the checkpoint holds, and the command
+prints which case it was:
+
+- **A sharded model in `gather` layout** exports exactly, weights and moments
+  both keyed by parameter name — the form an FSDP or Megatron loader expects.
+- **A plain model** exports its weights exactly and its optimizer **keyed by
+  position**, which is how `optimizer.state_dict()` recorded it. It restores
+  onto an optimizer that lists the same parameters in the same order; it cannot
+  be matched by name, and Ravex does not invent names for it.
+- **A `per_rank` checkpoint is refused.** Each rank's store is one shard,
+  meaningful only at the topology that wrote it. Resume it at that size — or
+  reshard it with `reshard_on_resume` — and export the gathered checkpoint.
+
+What leaves is the model and its optimizer. The sampler position, the RNG and
+the schedulers stay behind: a DCP reader has nowhere to put them.
+
 ### Elastic training: a cluster that changes size while it runs
 
 A job whose nodes come and go needs no Ravex API of its own. `torchrun` already

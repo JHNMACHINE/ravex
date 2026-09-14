@@ -17,6 +17,11 @@ environment about.
 about: ``ravex.yaml`` is searched for *above the working directory*, and
 ``RAVEX_*`` variables win over it, so "which settings am I actually going to
 get" is not always obvious from where you are standing.
+
+``export`` is the other kind of question a command line is for: an operation on
+a store after the run that wrote it is gone. It writes a checkpoint out as a
+``torch.distributed.checkpoint`` directory (GPU-90) — the format other
+frameworks read, where Ravex's own store is a format only Ravex reads.
 """
 
 from __future__ import annotations
@@ -63,6 +68,35 @@ def _status(_args) -> int:
     return 0
 
 
+def _export(args) -> int:
+    from ravex._interop.convert import CannotConvert
+    from ravex._interop.export import load_store, to_dcp
+
+    # Refused rather than written into. DCP names its files by rank and
+    # overwrites its metadata, so an export on top of an earlier one leaves
+    # the earlier one's extra files beside a manifest that no longer lists
+    # them — a directory that loads, and holds more than it says.
+    if os.path.isdir(args.out) and os.listdir(args.out):
+        print(
+            f"ravex export: {args.out} exists and is not empty; export into a "
+            "new directory",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        state = load_store(args.storage, backend=args.backend, step=args.step)
+        notes = to_dcp(state, args.out, key=args.model)
+    except CannotConvert as exc:
+        print(f"ravex export: {exc}", file=sys.stderr)
+        return 2
+
+    print(f"exported step {state.get('step')} of {args.storage} to {args.out}")
+    for note in notes:
+        print(f"  {note}")
+    return 0
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="ravex",
@@ -78,6 +112,24 @@ def main(argv=None) -> int:
     subparsers.add_parser(
         "status", help="show what is configured and what is installed"
     ).set_defaults(handler=_status)
+
+    export = subparsers.add_parser(
+        "export",
+        help="write a checkpoint out as a torch distributed checkpoint (DCP)",
+    )
+    export.add_argument("--storage", required=True, help="the Ravex store to read")
+    export.add_argument("--out", required=True, help="a new directory to write the DCP into")
+    export.add_argument(
+        "--backend",
+        default="moonclip",
+        choices=("moonclip", "torch_save"),
+        help="the backend that wrote the store (default: moonclip)",
+    )
+    export.add_argument("--step", type=int, default=None, help="default: the latest")
+    export.add_argument(
+        "--model", default=None, help="which model, when the checkpoint holds several"
+    )
+    export.set_defaults(handler=_export)
 
     args = parser.parse_args(argv)
     if not hasattr(args, "handler"):

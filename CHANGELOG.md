@@ -4,6 +4,41 @@
 
 ### Added
 
+- **A Ravex checkpoint can leave as a torch distributed checkpoint (GPU-90).**
+
+  ```bash
+  ravex export --storage ./checkpoints --out ./exported-dcp
+  ```
+
+  GPU-90 read other frameworks' checkpoints — DeepSpeed ZeRO and DCP, which is
+  also what Megatron-core writes — and stopped there, so the issue's own
+  example, *start in FSDP, resume in Megatron*, was covered in one direction.
+  A Ravex store is a format only Ravex reads. This writes one checkpoint of it
+  out as DCP, with `dcp.save(..., no_dist=True)`: one process, a directory, no
+  process group.
+
+  **How exact each half is depends on what was checkpointed, and the command
+  prints which case it was.** A sharded model in `gather` layout exports
+  exactly: weights and moments both keyed by parameter name, collected through
+  `get_state_dict`, which is the form an FSDP or Megatron loader expects. A
+  plain model exports its weights exactly and its optimizer *keyed by
+  position*, because `optimizer.state_dict()` recorded it that way — and Ravex
+  does not invent names for it, since assuming the optimizer lists
+  `model.parameters()` in order would be right most of the time and put
+  moments on the wrong parameters the rest, with every shape plausible. The
+  DCP reader already recognises that case on the way back in and says so. A
+  `per_rank` checkpoint is refused: one rank's store is one shard, meaningful
+  only at the topology that wrote it.
+
+  `--step` picks a checkpoint other than the latest, `--model` one model when
+  there are several (the error lists them), and an output directory that
+  already holds something is refused rather than written into — DCP would
+  overwrite the metadata and leave the earlier export's files beside it.
+
+  **The test goes all the way round**: train, export, and resume a fresh run
+  from the export with `convert_foreign`, on the weights that were trained.
+  Both backends' stores export; `tests/test_interop_export.py`.
+
 - **A resumed Lightning run keeps its step budget and its epoch (GPU-71).**
 
   The same failure as GPU-70 below, in the other framework that owns its loop.
