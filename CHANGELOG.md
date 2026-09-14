@@ -4,6 +4,56 @@
 
 ### Added
 
+- **A resumed HuggingFace `Trainer` run keeps its step budget (GPU-70).**
+
+  `Trainer.train()` builds a fresh `TrainerState` before the first batch and
+  stops when `state.global_step` reaches `state.max_steps`. Ravex restored the
+  model, the optimizer and the dataset position underneath it, and left that
+  counter at zero — so a resumed run trained **its whole budget again** from
+  the checkpoint. Measured on 2026-09-14: a 20-step run killed at step 10, with
+  a checkpoint at step 8, trained 20 more steps on resume. 28 in total, a clean
+  exit code, nothing in the log. The existing framework test asserted only that
+  the total stayed under budget *plus* the crash point, which is exactly the
+  room this needed to hide in.
+
+  `HuggingFaceAdapter` is the first adapter to use the GPU-69 seam. It saves
+  the parts of `TrainerState` that are the run's progress — `global_step`,
+  `epoch`, `log_history`, `best_metric`, `best_global_step`,
+  `best_model_checkpoint`, `total_flos`, `num_input_tokens_seen` — and puts
+  them back at resume. With them the same run trains 12 and stops at 20.
+  `max_steps`, `num_train_epochs` and the cadences are deliberately *not*
+  restored: `Trainer` computes them from the arguments of the run doing the
+  resuming, and overwriting them would make a changed `TrainingArguments`
+  silently not apply.
+
+  **Finding the `Trainer`** was the open question on the issue, because Ravex
+  hooks PyTorch and holds no reference to one. It is found from the class: an
+  instance of a Python class refers to its type, so asking the garbage
+  collector who refers to `Trainer` and its subclasses returns the live
+  instances. 18 ms against a 392-thousand-object heap with a 124M model in it,
+  paid once per run. That also covers a `Trainer` built before the decorated
+  function was called, which a patch on `Trainer.__init__` would have missed.
+  With several, the one training a model Ravex tracks is chosen; if that still
+  leaves more than one, nothing is saved and the log says so, because restoring
+  one run's counter into another's loop is worse than restoring none. If
+  `transformers.trainer` was never imported there is nothing to look for —
+  that is a plain loop over a model from the hub.
+
+  **What does not come back: `state.epoch`.** It is restored, and `Trainer`
+  overwrites it at the next step from a variable local to its own loop that
+  started at zero. After a resume it counts this process's epochs: the run
+  stops at the right step, and logs and epoch-based evaluation see a number
+  that is too small. Nothing outside `Trainer` can reach that variable.
+
+  **The warning the module docstring promised now exists.** A `Trainer` with
+  `save_strategy` other than `"no"` writes the model and the optimizer a second
+  time for no extra safety; it is said once, when the `Trainer` is found.
+
+  `integration/test_frameworks.py` gains a test with Ravex's `max_steps` off —
+  the ordinary case, since nobody sets it when `num_train_epochs` already says
+  how long to train — that SIGKILLs the run and requires the resume to train
+  exactly what was left.
+
 - **The preemption channel stops asking every rank every step, and announces a
   step instead (GPU-111).**
 

@@ -211,6 +211,14 @@ result deserves to be stated precisely rather than as "it works":
 - **State restoration is exact.** Model, optimizer, LR scheduler and step count
   all come back. With the per-step randomness removed, a killed run resumes
   into a loss sequence identical to the uninterrupted one.
+- **So does the framework's own progress.** `Trainer` stops on
+  `state.global_step`, and without it a resumed run trains its whole budget
+  again from the checkpoint. Ravex saves and restores the progress in
+  `Trainer.state` — `global_step`, `log_history`, `best_metric` and the rest —
+  so the resume trains what was left. One exception: `state.epoch` is
+  recomputed by `Trainer` from its own loop and, after a resume, counts only
+  this process's epochs. Set `save_strategy="no"`: with it on, the weights are
+  written twice, and Ravex warns about it.
 - **Replay is not.** With shuffling and dropout on, the resumed run continues
   correctly from the checkpointed state but sees a different draw. Both
   frameworks iterate the dataloader on their own schedule and consume the

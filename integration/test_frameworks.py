@@ -30,6 +30,7 @@ test_process_restart, test_ddp, test_fsdp. This is a framework limitation, not
 a general one.
 """
 
+import re
 import subprocess
 import sys
 
@@ -155,3 +156,43 @@ def test_a_killed_run_resumes_rather_than_restarting(framework_workspace, script
     # The budget is global. Without it a resumed script would run its own loop
     # bounds again from the top.
     assert len(before) + len(after) <= TOTAL_STEPS + CRASH_AT
+
+
+#: Three epochs of eight batches: the framework's own budget, with Ravex's
+#: `max_steps` switched off so that nothing but the framework stops the run.
+BUDGET_EPOCHS = 3
+BUDGET_STEPS = 8 * BUDGET_EPOCHS
+
+#: The adapters that restore the counter the framework stops on.
+ADAPTED = ["train_hf.py"]
+
+
+@pytest.mark.parametrize("script", ADAPTED, ids=[SCRIPT_IDS[s] for s in ADAPTED])
+def test_a_resumed_run_keeps_the_frameworks_step_budget(workspace, script):
+    """The framework's loop, not Ravex's `max_steps`, decides when this ends.
+
+    Which is the ordinary case: nobody sets `max_steps` in `ravex.yaml` when
+    `num_train_epochs` or `max_epochs` already says how long to train. Ravex
+    restores the weights, the moments and the dataset position underneath a
+    loop that builds its step counter fresh — so until the adapters existed the
+    resumed run trained its whole budget again from the checkpoint, and the
+    looser assertion above could not tell.
+    """
+    directory = workspace(f"{script}-budget", max_steps=None)
+    killed = run(directory, script, epochs=BUDGET_EPOCHS, die_at=10)
+    assert killed.returncode != 0, "expected the run to be killed"
+
+    restarted = run(directory, script, trace_name="trace2.jsonl", epochs=BUDGET_EPOCHS)
+    assert restarted.returncode == 0, restarted.stdout + restarted.stderr
+
+    log = (directory / "ravex.log").read_text()
+    resumed = re.search(r"Resumed at step (\d+)", log)
+    assert resumed, log
+    resumed_at = int(resumed.group(1))
+    assert resumed_at > 0
+
+    after = losses(read_trace(directory, "trace2.jsonl"))
+    assert len(after) == BUDGET_STEPS - resumed_at, (
+        f"resumed at step {resumed_at} of {BUDGET_STEPS} and trained "
+        f"{len(after)} more"
+    )
