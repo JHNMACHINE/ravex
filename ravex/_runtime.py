@@ -903,6 +903,10 @@ class RavexRuntime:
 
     def _try_resume(self, defer_rng: bool = False) -> None:
         self._resume_attempted = True
+        # The first moment the model, the optimizer and the loader all exist,
+        # which is what makes it the first pin: a run shorter than one cadence
+        # has no checkpoint to pin at and still owes a final one.
+        self.registry.pin_live()
         # Before the `resume` guard: a run that never resumes still deserves to
         # be told its checkpoints are being split, and this is the first point
         # where the process group is up to find out.
@@ -1048,6 +1052,13 @@ class RavexRuntime:
         """
         if not self._enabled:
             return False
+
+        # Before anything reads the registry, and on every rank: what this
+        # checkpoint sees has to still be alive for the final one, which is
+        # written after the training function's locals are gone. See
+        # `ObjectRegistry.pin_live`.
+        if not final:
+            self.registry.pin_live()
 
         # Checked here rather than at activation because at activation there is
         # no model yet to look at. Safe to act on unilaterally despite the rule
@@ -2064,7 +2075,20 @@ class RavexRuntime:
                 and self.registry.step_count != self._last_saved_step
                 and self._final_checkpoint_is_safe()
             ):
-                self.checkpoint(final=True)
+                if self.registry.is_empty():
+                    # Written anyway, this would be the newest checkpoint and
+                    # hold no weights: the next run resumes onto initial
+                    # weights at a step that says the training was done.
+                    logger.warning(
+                        "No final checkpoint at step %d: nothing it would save "
+                        "is alive any more. The last periodic checkpoint "
+                        "(step %s) stays the one a resume uses",
+                        self.registry.step_count,
+                        self._last_saved_step,
+                    )
+                else:
+                    self.checkpoint(final=True)
+            self.registry.release_pins()
             if self._backend is not None:
                 self._backend.close()
             if self._ring_link:

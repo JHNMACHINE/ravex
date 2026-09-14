@@ -656,6 +656,44 @@
 
 ### Fixed
 
+- **A training function that returned wrote a final checkpoint with no weights
+  and no optimizer, and it became the newest one (GPU-127).**
+
+  ```
+  step 8  models: ['model_fa854b7d494c'] optimizers: ['optim_387fc24fb62f']
+  step 10 models: []                     optimizers: []
+  ```
+
+  Ten steps of a plain loop, `checkpoint_every=4`, and the function returns.
+  The periodic checkpoint at step 8 was whole. The final one at step 10 was
+  empty, and the log said `Checkpoint at step 10 handed off`. The next run
+  resumed from it: step 10, initial weights, one warning about a model that
+  "keeps its initial weights". Under a `max_steps` budget the run then
+  considers the training done and never trains again.
+
+  **Why.** The registry holds every model, optimizer, scheduler, scaler and
+  dataloader weakly, and has to: `nn.Module.__init__` is patched, so every
+  module ever built is noted, and a model the script throws away must not
+  stay alive because Ravex once saw it. Since GPU-108 the final checkpoint is
+  written by the decorator's `finally` — and a function that *returned* has
+  released its locals before that line runs. Nothing was alive to save. A
+  SIGKILL never saw this (it resumes from the last periodic checkpoint), and
+  neither did an exception escaping the function (the traceback keeps the
+  frame alive). The ordinary ending did.
+
+  **The fix is a bounded exception to the weak registry, not the end of it.**
+  At the first step and at every checkpoint the runtime pins exactly what is
+  alive at that moment, replacing the previous pin, and lets go at shutdown
+  after the final checkpoint. A model discarded mid-run is released at the
+  next checkpoint; nothing outlives the run, and a test holds that. A run
+  shorter than one cadence is pinned from its first step, so it still saves on
+  the way out. And if a final checkpoint would still find nothing alive it is
+  not written: the last periodic one stays the one a resume uses, and the log
+  says so.
+
+  Found while writing GPU-70, whose in-process test resumed from the empty
+  checkpoint and looked like an adapter that restored nothing.
+
 - **With `outer_save_dtype` set, no two nodes took the same outer step
   (GPU-118).**
 

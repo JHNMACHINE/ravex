@@ -124,6 +124,9 @@ class ObjectRegistry:
         self.resumed: bool = False
         self._pending_rng: Optional[Dict[str, Any]] = None
 
+        # Strong references to what the last checkpoint saw. See `pin_live`.
+        self._pinned: tuple = ()
+
         # Invalidates the cached root-module computation.
         self._generation: int = 0
         self._roots_cache: Optional[List[weakref.ref]] = None
@@ -156,6 +159,36 @@ class ObjectRegistry:
 
     def register_scaler(self, scaler: Any) -> None:
         self._scalers.add(scaler)
+
+    def pin_live(self) -> None:
+        """Hold strong references to what a checkpoint would save right now.
+
+        Everything above is weak, and has to be: every module ever built is
+        noted, and a model the script throws away must not stay alive because
+        Ravex once saw it. But the final checkpoint is written by the
+        decorator's ``finally``, and when the training function *returns* its
+        locals are gone before that line runs. With weak references only, the
+        registry then found nothing alive and wrote a checkpoint with no
+        weights and no optimizer — the newest one, so the next run resumed onto
+        initial weights at the final step.
+
+        So the runtime pins, at the first step and at every checkpoint, exactly
+        the objects that are alive at that moment, replacing the previous pin.
+        What is kept past its natural life is bounded by one cadence: a model
+        discarded mid-run is released at the next checkpoint. And
+        :meth:`release_pins` lets everything go at shutdown, after the final
+        checkpoint.
+        """
+        self._pinned = (
+            tuple(self._root_models()),
+            tuple(self.optimizers),
+            tuple(self.schedulers),
+            tuple(self.scalers),
+            tuple(self.dataloaders),
+        )
+
+    def release_pins(self) -> None:
+        self._pinned = ()
 
     # ─── views ──────────────────────────────────────────────────────
 
