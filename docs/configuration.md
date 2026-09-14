@@ -48,6 +48,7 @@ ravex status
 | `log_file` | `RAVEX_LOG_FILE` | `null` | Log destination. Unset means stderr, WARNING and above only. |
 | `log_level` | `RAVEX_LOG_LEVEL` | `INFO` | |
 | `run_id` | `RAVEX_RUN_ID` | `null` | Recorded in checkpoint metadata; also used as the storage prefix when none is set. |
+| `audit_log` | `RAVEX_AUDIT_LOG` | `false` | Append one hash-chained entry per durable checkpoint to `audit.jsonl` in the store: step, content fingerprint, config digest. See [Audit trail](#audit-trail). |
 | `frameworks.auto_detect` | — | `true` | Whether to identify the training framework in use. File only: there is no environment variable for it. |
 
 ### Sharded models
@@ -494,6 +495,63 @@ in order:
 
 1. `RAVEX_S3_ACCESS_KEY` / `RAVEX_S3_SECRET_KEY`
 2. `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`
+
+### Audit trail
+
+*Which checkpoint produced the model deployed six months ago, and under what
+configuration?* With `audit_log: true` the store keeps the answer in
+`audit.jsonl`, one JSON object per line, appended once per checkpoint:
+
+```json
+{"step": 3000, "written_at": "2026-09-14T15:57:09+00:00",
+ "fingerprint": "9c1e…", "fingerprint_kind": "sha256:file",
+ "config_sha256": "41ab…", "metadata": {"step": "3000", "run_id": "…"},
+ "previous_sha256": "d07f…", "entry_sha256": "5e22…"}
+```
+
+```bash
+ravex audit verify --storage ./checkpoints   # is the chain intact
+ravex audit list   --storage ./checkpoints   # one line per checkpoint
+ravex audit find 9c1e --storage ./checkpoints # which step has this fingerprint
+```
+
+**The fingerprint is not equally strong on both backends, and the entry says
+which one it is.**
+
+- `torch_save` — `sha256:file`, the SHA-256 of the `.pt` file. A commitment to
+  every byte. Hashed on the writer thread, before older files are pruned.
+- `moonclip` — `sha256:tensor-xxh3`, a SHA-256 over the hash Moonclip
+  already keeps for every tensor, with its name, dtype and shape, asked of
+  Moonclip's `describe()`. Needs Moonclip 0.1.1 or later, which reports those
+  hashes; with an older one the fingerprint is `null` and the log says why.
+  Nothing is re-read — and it is exactly as
+  strong as those per-tensor hashes, which are **xxHash3-128**: certain
+  against corruption or an accidental swap, *not* proof against a tensor
+  crafted to collide. It is the same for a tensor stored as a delta as for one
+  stored whole with the same values.
+
+**The chain catches edits, not a forgery from scratch.** Each entry carries the
+SHA-256 of the one before, so an edited, deleted or reordered line is reported
+where it breaks. A file rewritten from the first line with a consistent chain
+verifies too — which is why `verify` prints the last `entry_sha256`: keep that
+value somewhere the machine that trains cannot write to (a ticket, a release
+note, a signed commit), and a rewrite no longer matches it. Signing is left to
+you on purpose; a key on the training machine protects nothing from whoever
+controls that machine.
+
+What else to know:
+
+- **An entry is written once its checkpoint is durable**, not when it is handed
+  off: after the next save returns, or at shutdown. The hashing runs on a
+  thread of its own, and a failure there is logged and never costs the
+  checkpoint.
+- **With Moonclip, keep `keep_last` above 1.** Retention can merge a snapshot
+  out of the manifest before its entry is written, and the entry then records
+  `"fingerprint": null` rather than a guess.
+- **Under `per_rank` each rank's store has its own log**, in `rank_<n>/`.
+- **Not recorded: the loss or the data.** Ravex never sees the loss, and only
+  the training script knows what its dataset is. Put a dataset hash in `run_id`
+  if you have one — `run_id` is in every entry's metadata.
 
 ### More than one machine
 

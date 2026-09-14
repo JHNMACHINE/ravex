@@ -22,6 +22,10 @@ get" is not always obvious from where you are standing.
 a store after the run that wrote it is gone. It writes a checkpoint out as a
 ``torch.distributed.checkpoint`` directory (GPU-90) — the format other
 frameworks read, where Ravex's own store is a format only Ravex reads.
+
+``audit`` is the same kind: reading, listing and verifying the audit log a run
+with ``audit_log: true`` left in its store (GPU-93). The person who needs it is
+usually not the one who ran the training, and is asking months later.
 """
 
 from __future__ import annotations
@@ -97,6 +101,71 @@ def _export(args) -> int:
     return 0
 
 
+def _audit_log(args) -> int:
+    import json
+
+    from ravex import _audit as audit
+
+    path = args.storage
+    if os.path.isdir(path):
+        path = os.path.join(path, audit.AUDIT_FILE)
+    if not os.path.exists(path):
+        print(
+            f"ravex audit: no audit log at {path} - it is only written by a run "
+            "started with audit_log: true (RAVEX_AUDIT_LOG=1). Under "
+            "sharded_checkpoints: per_rank each rank has its own, in rank_<n>/",
+            file=sys.stderr,
+        )
+        return 2
+
+    if args.action == "verify":
+        problems = audit.verify(path)
+        if problems:
+            for problem in problems:
+                print(f"BROKEN  {problem}")
+            return 1
+        entries = audit.read_entries(path)
+        if not entries:
+            print("intact: 0 entries")
+            return 0
+        print(
+            f"intact: {len(entries)} entries, steps {entries[0]['step']} to "
+            f"{entries[-1]['step']}"
+        )
+        # Printed because it is the one thing the chain cannot check by itself:
+        # a file rewritten from scratch verifies too. Kept somewhere the writer
+        # of this file cannot reach, it can.
+        print(f"last entry_sha256 {entries[-1]['entry_sha256']}")
+        print("  keep this value outside the store; it is what proves the log was not rewritten")
+        return 0
+
+    try:
+        entries = audit.read_entries(path)
+    except ValueError as exc:
+        print(f"ravex audit: {path} is not a readable audit log ({exc}); run verify", file=sys.stderr)
+        return 2
+
+    if args.action == "list":
+        for entry in entries:
+            fingerprint = entry.get("fingerprint") or "unavailable"
+            print(
+                f"step {entry.get('step'):>10}  {entry.get('written_at')}  "
+                f"{fingerprint[:16]}  {entry.get('fingerprint_kind')}"
+            )
+        return 0
+
+    if not args.fingerprint:
+        print("ravex audit find: give a fingerprint, or its first characters", file=sys.stderr)
+        return 2
+    matches = audit.find(path, args.fingerprint)
+    if not matches:
+        print(f"ravex audit: no checkpoint with fingerprint {args.fingerprint} in {path}", file=sys.stderr)
+        return 1
+    for entry in matches:
+        print(json.dumps(entry, indent=2, sort_keys=True))
+    return 0
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="ravex",
@@ -130,6 +199,18 @@ def main(argv=None) -> int:
         "--model", default=None, help="which model, when the checkpoint holds several"
     )
     export.set_defaults(handler=_export)
+
+    audit = subparsers.add_parser(
+        "audit", help="verify, list or search a store's audit log (audit_log: true)"
+    )
+    audit.add_argument("action", choices=("verify", "list", "find"))
+    audit.add_argument(
+        "fingerprint", nargs="?", default=None, help="for find: a fingerprint, or its first characters"
+    )
+    audit.add_argument(
+        "--storage", required=True, help="the store directory, or the audit.jsonl inside it"
+    )
+    audit.set_defaults(handler=_audit_log)
 
     args = parser.parse_args(argv)
     if not hasattr(args, "handler"):

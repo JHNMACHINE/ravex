@@ -4,6 +4,63 @@
 
 ### Added
 
+- **An audit trail of checkpoints: `audit_log: true` (GPU-93).**
+
+  The question GPU-93 was opened on — *which checkpoint produced the model
+  deployed six months ago, under which configuration* — had no answer: a
+  checkpoint recorded its step and nothing that identified its content. With
+  the option on, every durable checkpoint appends one line to `audit.jsonl` in
+  its store: the step, when, a content fingerprint and its kind, a SHA-256 of
+  the resolved configuration with credentials removed, the checkpoint's
+  metadata, and the SHA-256 of the previous entry. `ravex audit
+  verify|list|find` reads it.
+
+  **The two backends fingerprint differently, and the entry says which.**
+  `torch_save` hashes the `.pt` file — SHA-256 over every byte. Moonclip
+  already hashes every tensor's raw bytes to decide what to skip, so its
+  fingerprint is a SHA-256 over those per-tensor hashes with their names,
+  dtypes and shapes, asked of Moonclip's `describe()` instead of a second
+  pass over gigabytes,
+  and **exactly as strong as xxHash3-128**, which is certain against
+  corruption and is not proof against a collision crafted on purpose. The
+  issue asked for "SHA256 of checkpoint"; recording a SHA-256 that is only as
+  strong as the hash underneath it without saying so would have been the kind
+  of compliance claim that fails the first person who checks it.
+
+  **The chain is tamper-evident, and says what it cannot do.** An edited,
+  removed or reordered line breaks the chain where it happens, and `verify`
+  names the line. A file rewritten from scratch with a consistent chain
+  verifies too, so `verify` prints the last `entry_sha256` to keep outside the
+  store. GPG signing, also in the issue, is not built: a key on the training
+  machine protects nothing from whoever controls that machine, and signing the
+  file is one command for whoever holds a key that matters.
+
+  **An entry is written when its checkpoint is durable, not when it is handed
+  off.** Both backends wait for the previous write at the start of the next
+  save, so a step's entry is written once the next save returns, or at
+  shutdown after the backend closes; the hashing runs on its own thread. And
+  `torch_save` hashes on its writer thread *before pruning*, because with
+  `keep_last: 1` the file is gone the moment the next one lands.
+
+  **Found by the first whole-run test, on Windows: reading Moonclip's manifest
+  file cost checkpoints.** The first version read `manifest.json` directly,
+  and Moonclip persists it by renaming a new version over it — from its writer,
+  and from its merger when nothing is being saved. On Windows a rename over a
+  file someone holds open fails, even when it was opened sharing delete, which
+  was tried and measured: Moonclip reported *Access denied* and lost the
+  checkpoint it was writing, five runs in five. So the hashes are asked of
+  Moonclip itself through `describe()`, which waits for its own writer, and
+  nothing in Ravex opens a Moonclip file. `describe()` reports `hash_raw` from
+  Moonclip 0.1.1; with an older one the fingerprint is recorded as `null`, the
+  kind as `unavailable`, and the log says why, once. The Moonclip test checks
+  that every checkpoint is still in the store afterwards, not only that the
+  entries look right. The collision itself is a Moonclip bug — any reader, an
+  antivirus included, can trigger it — and is tracked on Moonclip's side.
+
+  Not recorded: the loss, which Ravex never sees, and a dataset hash, which
+  only the training script can compute. `restore exact state by hash` from the
+  issue is `ravex audit find` for the step, and the ordinary resume from it.
+
 - **A Ravex checkpoint can leave as a torch distributed checkpoint (GPU-90).**
 
   ```bash

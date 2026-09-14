@@ -39,7 +39,7 @@ import re
 import time
 from abc import ABC, abstractmethod
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 logger = logging.getLogger("ravex")
 
@@ -135,6 +135,23 @@ class CheckpointBackend(ABC):
 
     def close(self) -> None:
         self.flush()
+
+    #: The directory this store lives in on local disk. With a remote store it
+    #: is the staging directory the bucket is synced from. The audit trail is
+    #: written here (GPU-93), inside the store it describes.
+    store_root: Optional[str] = None
+
+    def fingerprint(self, step: int) -> Tuple[Optional[str], str]:
+        """A content fingerprint of the durable checkpoint at ``step``, and its kind.
+
+        Asked only once the checkpoint is durable — see
+        :class:`ravex._audit.AuditTrail` for how that is known. The kind travels
+        with the value because the two backends answer with hashes of different
+        strength, and an audit entry that did not say which would invite
+        reading one as the other. ``(None, "unavailable")`` from a backend that
+        cannot say, which still gets its entry.
+        """
+        return None, "unavailable"
 
 
 # ─── moonclip ───────────────────────────────────────────────────────
@@ -289,6 +306,7 @@ class MoonclipBackend(CheckpointBackend):
         # `MoonclipManager` is the explicit layer underneath and infers
         # nothing; every keyword above is one it already takes.
         self._manager = moonclip.MoonclipManager(**kwargs)
+        self.store_root = storage.path
 
     def save(
         self, step: int, state: Dict[str, Any], metadata: Dict[str, str]
@@ -463,6 +481,48 @@ class MoonclipBackend(CheckpointBackend):
             except Exception as exc:
                 logger.warning("Final remote sync failed: %s", exc)
 
+    def fingerprint(self, step: int) -> Tuple[Optional[str], str]:
+        """SHA-256 over the per-tensor xxHash3 values Moonclip reports for ``step``.
+
+        Nothing is rehashed: Moonclip already hashed every tensor's raw bytes
+        to decide what to skip. So this is as strong as xxHash3-128 — certain
+        against corruption, not against a collision crafted on purpose — and
+        the kind says so.
+
+        **Asked through** ``describe()``, **never by reading** ``manifest.json``.
+        ``describe()`` waits for Moonclip's own writer. Reading the file does
+        not: on Windows a reader holding it open made Moonclip's rename of the
+        next manifest over it fail, and the save being written was lost —
+        measured on 2026-09-14, five runs in five.
+
+        ``None`` when retention has already merged the snapshot away (keep
+        ``keep_last`` above one with the audit log on), or when this Moonclip
+        does not report tensor hashes — ``hash_raw`` arrives in 0.1.1 — which
+        is said once rather than per checkpoint.
+        """
+        from ravex._audit import tensor_fingerprint
+
+        snapshot = None
+        for candidate in self._manager.list_snapshots():
+            if candidate.get("step") == step:
+                snapshot = candidate
+        if snapshot is None:
+            return None, "unavailable"
+
+        tensors = self._manager.describe(snapshot["id"]).get("tensors", [])
+        found = tensor_fingerprint(tensors)
+        if found is None:
+            if tensors and not getattr(self, "_said_no_hashes", False):
+                self._said_no_hashes = True
+                logger.warning(
+                    "audit_log: Moonclip %s does not report tensor hashes, so "
+                    "checkpoint fingerprints are recorded as null. Moonclip "
+                    "0.1.1 and later report them",
+                    getattr(self._moonclip, "__version__", "?"),
+                )
+            return None, "unavailable"
+        return found, "sha256:tensor-xxh3"
+
 
 # ─── torch.save fallback ────────────────────────────────────────────
 
@@ -507,6 +567,10 @@ class TorchSaveBackend(CheckpointBackend):
             max_workers=1, thread_name_prefix="ravex-writer"
         )
         self._pending: Optional[Future] = None
+        self.store_root = self.directory
+        #: Step -> SHA-256 of its file, filled by the writer when the audit
+        #: trail asks for it (``None`` means nobody asked). See `_write`.
+        self.fingerprints: Optional[Dict[int, str]] = None
 
     def save(
         self, step: int, state: Dict[str, Any], metadata: Dict[str, str]
@@ -544,6 +608,15 @@ class TorchSaveBackend(CheckpointBackend):
         try:
             torch.save(snapshot, temporary)
             os.replace(temporary, path)  # atomic: never leave a half file
+            if self.fingerprints is not None:
+                # Here, between the rename and the prune, because the prune
+                # may delete the *previous* file — and with `keep_last: 1` the
+                # audit trail would otherwise go looking for a checkpoint that
+                # no longer exists. Hashing on this thread keeps the cost off
+                # the training loop.
+                from ravex._audit import file_fingerprint
+
+                self.fingerprints[_step_of(path)] = file_fingerprint(path)
             self._prune()
         except Exception as exc:
             logger.error("Checkpoint write failed for %s: %s", path, exc)
@@ -602,6 +675,18 @@ class TorchSaveBackend(CheckpointBackend):
     def close(self) -> None:
         self.flush()
         self._executor.shutdown(wait=True)
+
+    def fingerprint(self, step: int) -> Tuple[Optional[str], str]:
+        """SHA-256 of the checkpoint's ``.pt`` file: a commitment to every byte."""
+        known = (self.fingerprints or {}).get(step)
+        if known is not None:
+            return known, "sha256:file"
+        path = os.path.join(self.directory, f"step_{step:012d}.pt")
+        if os.path.exists(path):
+            from ravex._audit import file_fingerprint
+
+            return file_fingerprint(path), "sha256:file"
+        return None, "unavailable"
 
 
 # ─── selection ──────────────────────────────────────────────────────

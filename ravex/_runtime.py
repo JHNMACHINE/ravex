@@ -193,6 +193,8 @@ class RavexRuntime:
         #: The adapter's answer to `should_intercept_step`, asked once at
         #: activation. See `on_step` for what a False costs.
         self._count_steps = True
+        #: The audit trail, built at the first save when `audit_log` is on.
+        self._audit: Any = None
 
         self._setup_logging()
 
@@ -1183,6 +1185,7 @@ class RavexRuntime:
 
                     phases.update(backend.save(step, state, metadata) or {})
                     wrote = True
+                    self._record_audit(backend, step, metadata)
         except Exception as exc:
             logger.error("Checkpoint at step %d failed: %s", step, exc, exc_info=True)
             ok = False
@@ -1257,6 +1260,34 @@ class RavexRuntime:
         )
         self._warn_if_cadence_is_expensive(step, started, finished, phases)
         return True
+
+    def _record_audit(self, backend: Any, step: int, metadata: dict) -> None:
+        """Tell the audit trail a save for ``step`` returned (GPU-93).
+
+        On the rank that wrote, right after the backend took the copy. The
+        entry itself comes later — see `ravex._audit.AuditTrail` — so nothing
+        here waits for a disk. And nothing here can fail the checkpoint: an
+        audit trail that cost a run its weights would have its priorities
+        backwards.
+        """
+        if not self.config.audit_log:
+            return
+        try:
+            if self._audit is None:
+                from ravex._audit import AuditTrail
+
+                if hasattr(backend, "fingerprints") and backend.fingerprints is None:
+                    backend.fingerprints = {}
+                self._audit = AuditTrail(backend.store_root, self.config, backend.fingerprint)
+            self._audit.saved(step, metadata)
+        except Exception as exc:
+            logger.warning(
+                "Audit trail: could not record step %d (%s: %s) - the checkpoint "
+                "itself is unaffected",
+                step,
+                type(exc).__name__,
+                exc,
+            )
 
     def _restore_from_remote_if_empty(self) -> None:
         """Fetch this rank's store back out of the bucket, if it has none.
@@ -2091,6 +2122,11 @@ class RavexRuntime:
             self.registry.release_pins()
             if self._backend is not None:
                 self._backend.close()
+            if self._audit is not None:
+                # After the backend closed: every write it had queued is on
+                # disk now, so the last pending entries can be written.
+                self._audit.close()
+                self._audit = None
             if self._ring_link:
                 self._ring_link.close()
                 self._ring_link = None

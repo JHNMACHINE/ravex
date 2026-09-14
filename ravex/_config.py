@@ -569,6 +569,13 @@ class RavexConfig:
     # Purely informational, surfaced in checkpoint metadata.
     run_id: Optional[str] = None
 
+    #: Append one entry per durable checkpoint to ``audit.jsonl`` in the store:
+    #: its step, a content fingerprint, the config digest, chained by SHA-256.
+    #: Off by default because it costs a hash of every checkpoint written — a
+    #: file read for ``torch_save``, a ``describe()`` for Moonclip — and most
+    #: runs are not asked to prove anything. See ``ravex._audit`` (GPU-93).
+    audit_log: bool = False
+
     source: Optional[str] = None  # path of the yaml this came from, if any
 
     #: Values that had to be replaced while loading. Logged by the runtime once
@@ -744,6 +751,8 @@ class RavexConfig:
             self.fallback_on_error = _as_bool(value, self.fallback_on_error)
         if (value := get("RUN_ID")) is not None:
             self.run_id = value
+        if (value := get("AUDIT_LOG")) is not None:
+            self.audit_log = _as_bool(value, self.audit_log)
 
         # Storage
         if (value := get("STORAGE_TYPE")) is not None:
@@ -804,6 +813,7 @@ class RavexConfig:
             "outer_loop",
             "fallback_on_error",
             "framework_auto_detect",
+            "audit_log",
         )
 
         for name in numeric:
