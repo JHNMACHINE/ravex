@@ -164,7 +164,7 @@ BUDGET_EPOCHS = 3
 BUDGET_STEPS = 8 * BUDGET_EPOCHS
 
 #: The adapters that restore the counter the framework stops on.
-ADAPTED = ["train_hf.py"]
+ADAPTED = ["train_hf.py", "train_lightning.py"]
 
 
 @pytest.mark.parametrize("script", ADAPTED, ids=[SCRIPT_IDS[s] for s in ADAPTED])

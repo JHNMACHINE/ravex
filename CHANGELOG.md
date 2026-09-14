@@ -4,6 +4,42 @@
 
 ### Added
 
+- **A resumed Lightning run keeps its step budget and its epoch (GPU-71).**
+
+  The same failure as GPU-70 below, in the other framework that owns its loop.
+  `fit_loop` holds the epoch and batch progress that `current_epoch`,
+  `global_step`, `max_epochs` and `max_steps` are read from, a fresh
+  `Trainer` starts it at zero, and Ravex restoring everything else underneath
+  did not change that. Measured on 2026-09-14 on Lightning 2.6.6: a 20-step run
+  killed at step 10, with a checkpoint at step 8, trained 20 more steps on
+  resume. With the loop restored it trains 12 and ends at epoch 5.
+
+  `LightningAdapter` saves `fit_loop.state_dict()` and hands it back through
+  `load_state_dict()` — the pair Lightning's own checkpoint connector writes
+  under `"loops"` — so no loop counter is read by name, which is what the issue
+  asked for: an adapter reading loop attributes that a minor release renames is
+  worse than none. Declared range: Lightning 2.x under either import name,
+  measured on 2.6.6; the framework CI job installs the newest release.
+
+  **Where the restore lands is not luck.** Ravex resumes on a DataLoader's
+  first `iter()`, and `fit_loop.run()` calls `setup_data()` — which iterates
+  the loader once to build its fetcher — *before* `reset()`. So the loop state
+  is loaded where Lightning's own resume loads it, and the `restarting` flag it
+  sets is read by the `reset()` right after.
+
+  The trainer is found through the `LightningModule` Ravex already tracks,
+  which exposes it as `.trainer`, looking a few levels down for a strategy's
+  wrapper. And Ravex warns once when a `ModelCheckpoint` callback is active,
+  since that writes the model and the optimizer a second time.
+
+  **Detection changed order.** `detect_framework()` asked about transformers
+  before Lightning, so a Lightning run fine-tuning a model from the hub — which
+  imports both — was detected as HuggingFace, found no `Trainer`, and would
+  have resumed with Lightning's budget starting over. Lightning now wins:
+  nothing imports Lightning on transformers' behalf, so the reverse mistake is
+  not available. The `framework` recorded in such a run's checkpoint metadata
+  changes from `huggingface` to `lightning` accordingly.
+
 - **A resumed HuggingFace `Trainer` run keeps its step budget (GPU-70).**
 
   `Trainer.train()` builds a fresh `TrainerState` before the first batch and

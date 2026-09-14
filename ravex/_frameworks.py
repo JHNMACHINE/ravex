@@ -33,8 +33,9 @@ the way out of a resume.
 The wiring came first and on its own — a checkpoint that carries extra state,
 one that does not, one written under another framework — because behaviour
 bolted onto absent wiring is a rewrite of both at once. Read the contract on
-each method before writing an override: :class:`HuggingFaceAdapter` is the
-first, and what it restores is the counter ``Trainer`` stops on.
+each method before writing an override. :class:`HuggingFaceAdapter` and
+:class:`LightningAdapter` both restore the counter their framework's loop stops
+on, which Ravex putting everything else back does not.
 """
 
 from __future__ import annotations
@@ -54,10 +55,16 @@ def detect_framework() -> str:
     """
     modules = sys.modules
 
-    if "transformers" in modules:
-        return "huggingface"
+    # Lightning first. A Lightning run fine-tuning a model from the hub imports
+    # transformers too, and the framework that owns the loop is the one whose
+    # counters have to come back — asked the other way round, that run got the
+    # HuggingFace adapter, found no `Trainer`, and resumed with Lightning's
+    # step budget starting over. Nothing imports Lightning on transformers'
+    # behalf, so the reverse mistake is not available.
     if "lightning" in modules or "pytorch_lightning" in modules:
         return "lightning"
+    if "transformers" in modules:
+        return "huggingface"
     if "accelerate" in modules:
         return "accelerate"
     if "deepspeed" in modules:
@@ -298,14 +305,123 @@ class HuggingFaceAdapter(FrameworkAdapter):
         )
 
 
-class LightningAdapter(FrameworkAdapter):
-    """PyTorch Lightning.
+def _modules_near_the_top(root: Any, depth: int = 3):
+    """``root`` and its descendants down to ``depth`` levels.
 
-    Lightning's ``ModelCheckpoint`` callback covers the model but not the RNG
-    or the dataset position, which is what makes a preemption-resume exact.
+    Bounded, because the module being looked for is the root itself or sits
+    right under a strategy's wrapper — and a full ``modules()`` walk of a large
+    transformer is tens of thousands of attribute lookups for an answer that is
+    never down there.
+    """
+    frontier = [root]
+    for _ in range(depth):
+        below = []
+        for module in frontier:
+            yield module
+            children = getattr(module, "children", None)
+            if callable(children):
+                below.extend(children())
+        frontier = below
+
+
+class LightningAdapter(FrameworkAdapter):
+    """PyTorch Lightning: the fit loop's progress.
+
+    ``ModelCheckpoint`` covers the model, and Ravex already has the model, the
+    optimizer, the RNG and the dataset position. What neither had across a
+    Ravex resume is the *loop*: ``fit_loop`` holds the epoch and batch progress
+    that ``current_epoch``, ``global_step``, ``max_epochs`` and ``max_steps``
+    are all read from, and a fresh ``Trainer`` starts them at zero. Measured on
+    2026-09-14 on Lightning 2.6.6, the same shape as HuggingFace: a 20-step run
+    killed at step 10 with a checkpoint at step 8 trained 20 more steps on
+    resume. With the loop restored it trains 12 and ends at epoch 5.
+
+    **Through the public surface only.** ``fit_loop.state_dict()`` and
+    ``load_state_dict()`` are what Lightning's own checkpoint connector writes
+    under ``"loops"`` and reads back, so no loop counter is read by name and a
+    release that reorganises the loops' internals does not break this. Declared
+    range: Lightning 2.x, under either import name; measured on 2.6.6, and the
+    framework CI job installs the newest release.
+
+    **Why the restore lands in the right place.** Ravex resumes on a
+    DataLoader's first ``iter()``, and ``fit_loop.run()`` calls
+    ``setup_data()`` — which iterates the loader once to build its fetcher —
+    *before* ``reset()``. So the state is loaded where Lightning's own resume
+    loads it, and the ``restarting`` flag ``load_state_dict`` sets is read by
+    the ``reset()`` right after, as it is after ``Trainer.fit(ckpt_path=...)``.
+
+    **Finding the Trainer.** A ``LightningModule`` exposes the trainer that is
+    fitting it as ``.trainer``, and that module is one of the models Ravex
+    tracks — as the root, or a level or two down inside a strategy's wrapper.
+    Held strongly once found, for the reason given on
+    :class:`HuggingFaceAdapter`.
     """
 
     name = "lightning"
+
+    def __init__(self) -> None:
+        self._found: Any = None
+        self._warned_duplicate = False
+
+    def _trainer(self) -> Any:
+        if self._found is not None:
+            return self._found
+        registry = _runtime_registry()
+        if registry is None:
+            return None
+        for root in registry.models:
+            for module in _modules_near_the_top(root):
+                try:
+                    # The property raises on a LightningModule no trainer is
+                    # attached to, and plain modules have no such attribute.
+                    trainer = module.trainer
+                except Exception:
+                    continue
+                # Fabric attaches a shim with no loops; that is not this.
+                if trainer is not None and hasattr(trainer, "fit_loop"):
+                    self._found = trainer
+                    self._warn_if_duplicated(trainer)
+                    return trainer
+        return None
+
+    def _warn_if_duplicated(self, trainer: Any) -> None:
+        if self._warned_duplicate:
+            return
+        self._warned_duplicate = True
+        if getattr(trainer, "checkpoint_callback", None) is not None:
+            logger.warning(
+                "Lightning is checkpointing too (a ModelCheckpoint callback is "
+                "active): the model and the optimizer are written twice, once "
+                "by each, and the second copy adds no safety. Pass "
+                "Trainer(enable_checkpointing=False) to leave it to Ravex"
+            )
+
+    def collect_extra_state(self) -> Dict[str, Any]:
+        import copy
+
+        trainer = self._trainer()
+        if trainer is None:
+            return {}
+        return {"fit_loop": copy.deepcopy(trainer.fit_loop.state_dict())}
+
+    def restore_extra_state(self, state: Dict[str, Any]) -> None:
+        loop_state = state.get("fit_loop")
+        if not loop_state:
+            return
+        trainer = self._trainer()
+        if trainer is None:
+            logger.warning(
+                "This checkpoint carries Lightning loop progress and no "
+                "Lightning Trainer was found to restore it into, so the step "
+                "and epoch budget starts over"
+            )
+            return
+        trainer.fit_loop.load_state_dict(loop_state)
+        logger.info(
+            "Restored Lightning loop progress: global_step=%s epoch=%s",
+            getattr(trainer, "global_step", "?"),
+            getattr(trainer, "current_epoch", "?"),
+        )
 
 
 _ADAPTERS = {

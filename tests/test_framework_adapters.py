@@ -279,6 +279,13 @@ def run_hf_trainer(workdir, die_at=0, epochs=5):
 
 
 class TestHuggingFaceTrainerForReal:
+    @pytest.fixture(autouse=True)
+    def detected_as_huggingface(self, monkeypatch):
+        """Detection reads ``sys.modules``, and whether an earlier test in this
+        process imported Lightning is not something these tests should depend
+        on. Detection itself is tested on its own, below."""
+        monkeypatch.setattr(frameworks, "detect_framework", lambda: "huggingface")
+
     def test_a_resumed_run_keeps_its_step_budget(self, storage, tmp_path):
         pytest.importorskip("transformers")
         pytest.importorskip("accelerate")
@@ -311,4 +318,204 @@ class TestHuggingFaceTrainerForReal:
 
         run_hf_trainer(tmp_path, die_at=10)
         trained, _ = run_hf_trainer(tmp_path)
+        assert trained > 10, "without the adapter the budget no longer starts over"
+
+
+# ─── Detection ──────────────────────────────────────────────────────
+
+
+class TestDetection:
+    def test_lightning_wins_when_both_are_imported(self, monkeypatch):
+        """A Lightning run fine-tuning a hub model imports transformers too, and
+        Lightning is the one that owns the loop."""
+        monkeypatch.setitem(sys.modules, "transformers", types.ModuleType("transformers"))
+        monkeypatch.setitem(sys.modules, "lightning", types.ModuleType("lightning"))
+        assert frameworks.detect_framework() == "lightning"
+
+    def test_transformers_alone_is_huggingface(self, monkeypatch):
+        monkeypatch.setitem(sys.modules, "transformers", types.ModuleType("transformers"))
+        monkeypatch.delitem(sys.modules, "lightning", raising=False)
+        monkeypatch.delitem(sys.modules, "pytorch_lightning", raising=False)
+        assert frameworks.detect_framework() == "huggingface"
+
+    def test_the_old_import_name_is_lightning_too(self, monkeypatch):
+        monkeypatch.delitem(sys.modules, "lightning", raising=False)
+        monkeypatch.setitem(
+            sys.modules, "pytorch_lightning", types.ModuleType("pytorch_lightning")
+        )
+        assert frameworks.detect_framework() == "lightning"
+
+
+# ─── Lightning, against a stand-in ──────────────────────────────────
+
+
+class FakeLoop:
+    def __init__(self, state):
+        self.state = state
+        self.loaded = []
+
+    def state_dict(self):
+        return self.state
+
+    def load_state_dict(self, state):
+        self.loaded.append(state)
+
+
+def fake_lightning_trainer(checkpoint_callback=None, **state):
+    return SimpleNamespace(
+        fit_loop=FakeLoop(state), checkpoint_callback=checkpoint_callback
+    )
+
+
+def fake_lightning_module(trainer):
+    """A module with a ``trainer``, which is all the adapter looks at."""
+    module = torch.nn.Linear(2, 1)
+    module.trainer = trainer
+    return module
+
+
+class TestLightningFindsItsTrainer:
+    def test_through_the_module_it_is_fitting(self, monkeypatch):
+        tracking(monkeypatch, fake_lightning_module(fake_lightning_trainer(step=4)))
+        assert frameworks.LightningAdapter().collect_extra_state() == {
+            "fit_loop": {"step": 4}
+        }
+
+    def test_a_level_down_inside_a_strategy_wrapper(self, monkeypatch):
+        trainer = fake_lightning_trainer(step=4)
+        tracking(monkeypatch, torch.nn.Sequential(fake_lightning_module(trainer)))
+        assert frameworks.LightningAdapter().collect_extra_state()["fit_loop"] == {
+            "step": 4
+        }
+
+    def test_a_plain_model_has_nothing_to_collect(self, monkeypatch):
+        tracking(monkeypatch, torch.nn.Linear(2, 1))
+        assert frameworks.LightningAdapter().collect_extra_state() == {}
+
+    def test_a_shim_with_no_loops_is_not_a_trainer(self, monkeypatch):
+        """What Fabric attaches in a Trainer's place."""
+        tracking(monkeypatch, fake_lightning_module(SimpleNamespace()))
+        assert frameworks.LightningAdapter().collect_extra_state() == {}
+
+    def test_what_is_collected_does_not_move_with_the_loop(self, monkeypatch):
+        trainer = fake_lightning_trainer(progress={"completed": 1})
+        tracking(monkeypatch, fake_lightning_module(trainer))
+        collected = frameworks.LightningAdapter().collect_extra_state()
+        trainer.fit_loop.state["progress"]["completed"] = 2
+        assert collected["fit_loop"]["progress"] == {"completed": 1}
+
+
+class TestLightningState:
+    def test_restore_hands_the_loop_its_own_state(self, monkeypatch):
+        trainer = fake_lightning_trainer()
+        tracking(monkeypatch, fake_lightning_module(trainer))
+        frameworks.LightningAdapter().restore_extra_state({"fit_loop": {"step": 8}})
+        assert trainer.fit_loop.loaded == [{"step": 8}]
+
+    def test_loop_state_with_no_trainer_to_take_it_is_named(
+        self, monkeypatch, ravex_log
+    ):
+        tracking(monkeypatch)
+        frameworks.LightningAdapter().restore_extra_state({"fit_loop": {"step": 8}})
+        assert "no Lightning Trainer was found" in ravex_log.text
+
+    def test_model_checkpoint_on_is_warned_about_once(self, monkeypatch, ravex_log):
+        trainer = fake_lightning_trainer(checkpoint_callback=object())
+        tracking(monkeypatch, fake_lightning_module(trainer))
+        adapter = frameworks.LightningAdapter()
+        adapter.collect_extra_state()
+        adapter.collect_extra_state()
+
+        assert ravex_log.text.count("checkpointing too") == 1
+        assert "enable_checkpointing=False" in ravex_log.text
+
+    def test_model_checkpoint_off_is_silent(self, monkeypatch, ravex_log):
+        tracking(monkeypatch, fake_lightning_module(fake_lightning_trainer()))
+        frameworks.LightningAdapter().collect_extra_state()
+        assert "checkpointing too" not in ravex_log.text
+
+
+# ─── Lightning, for real ────────────────────────────────────────────
+
+
+def run_lightning(die_at=0, epochs=5):
+    """A decorated ``Trainer.fit``: 8 rows, batch 2, so 4 steps an epoch.
+
+    Returns the steps this call trained, and ``global_step`` and
+    ``current_epoch`` where it ended.
+    """
+    import lightning as L
+    from torch.utils.data import DataLoader, TensorDataset
+
+    trained = []
+
+    class Regressor(L.LightningModule):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(2, 1)
+
+        def training_step(self, batch, index):
+            trained.append(1)
+            x, y = batch
+            return ((self.linear(x) - y) ** 2).mean()
+
+        def on_train_batch_end(self, *args):
+            if die_at and self.trainer.global_step >= die_at:
+                raise Crash(self.trainer.global_step)
+
+        def configure_optimizers(self):
+            return torch.optim.SGD(self.parameters(), lr=0.1)
+
+    @ravex.train_loop(backend="torch_save", checkpoint_every=4)
+    def train():
+        generator = torch.Generator().manual_seed(0)
+        loader = DataLoader(
+            TensorDataset(
+                torch.randn(8, 2, generator=generator),
+                torch.randn(8, 1, generator=generator),
+            ),
+            batch_size=2,
+        )
+        trainer = L.Trainer(
+            max_epochs=epochs,
+            accelerator="cpu",
+            devices=1,
+            enable_checkpointing=False,
+            logger=False,
+            enable_progress_bar=False,
+            enable_model_summary=False,
+        )
+        try:
+            trainer.fit(Regressor(), loader)
+        except Crash:
+            pass
+        return trainer.global_step, trainer.current_epoch
+
+    global_step, epoch = train()
+    return len(trained), global_step, epoch
+
+
+class TestLightningForReal:
+    @pytest.fixture(autouse=True)
+    def detected_as_lightning(self, monkeypatch):
+        monkeypatch.setattr(frameworks, "detect_framework", lambda: "lightning")
+
+    def test_a_resumed_run_keeps_its_step_budget_and_its_epoch(self, storage):
+        pytest.importorskip("lightning")
+
+        trained, _, _ = run_lightning(die_at=10)
+        assert trained == 10
+
+        trained, global_step, epoch = run_lightning()
+        assert (global_step, epoch) == (20, 5)
+        assert trained == 10, "the resumed run started its step budget over"
+
+    def test_without_the_adapter_the_budget_starts_over(self, storage, monkeypatch):
+        pytest.importorskip("lightning")
+        monkeypatch.setattr(
+            frameworks, "get_adapter", lambda framework: frameworks.FrameworkAdapter()
+        )
+
+        run_lightning(die_at=10)
+        trained, _, _ = run_lightning()
         assert trained > 10, "without the adapter the budget no longer starts over"
