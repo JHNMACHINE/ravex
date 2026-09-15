@@ -44,8 +44,16 @@ print("  torch", torch.__version__, "cuda", torch.version.cuda,
       "devices", torch.cuda.device_count())
 if torch.cuda.is_available():
     cap = "sm_%d%d" % torch.cuda.get_device_capability(0)
-    ok = cap in torch.cuda.get_arch_list()
-    print("  gpu is", cap, "and torch has kernels for it:", ok)
+    # A real op rather than `cap in get_arch_list()`: a GPU runs kernels built
+    # for a lower minor of its own major, so an RTX 4090 (sm_89, in no list)
+    # read as "no kernels" while NCCL ran on it fine. See 10-setup.sh.
+    try:
+        x = torch.randn(64, 64, device="cuda")
+        float((x @ x).sum())
+        ok = True
+    except Exception:
+        ok = False
+    print("  gpu is", cap, "and torch runs an op on it:", ok)
     if not ok:
         print("  ** every CUDA op will fail with 'no kernel image'."
               " Run 10-setup.sh, which now fixes this. **")

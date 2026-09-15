@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Install what the phases need. A couple of minutes, no Rust.
+# Install what the phases need. A few minutes, including a Rust toolchain for
+# ravex's core when the image has none.
 #
 #   bash $KIT_ROOT/kit/10-setup.sh
 #
@@ -57,8 +58,15 @@ try:
     import torch
     if not torch.cuda.is_available():
         sys.exit(0)                      # no GPU here: not this check's business
-    cap = "sm_%d%d" % torch.cuda.get_device_capability(0)
-    sys.exit(0 if cap in torch.cuda.get_arch_list() else 1)
+    # **A real operation, not the arch list** (2026-09-15). The list names the
+    # architectures the kernels were built for, and a GPU runs kernels built
+    # for a lower minor of its own major: an RTX 4090 is sm_89, is in no list,
+    # and runs the sm_86 kernels. Asking the list failed it, reinstalled torch,
+    # and failed it again. A kernel that is really missing fails here, on the
+    # op — which is the failure the comment above is about.
+    x = torch.randn(64, 64, device="cuda")
+    float((x @ x).sum())
+    sys.exit(0)
 except Exception:
     sys.exit(1)
 PY
@@ -76,6 +84,19 @@ if ! arch_ok; then
 fi
 
 pip install --quiet PyYAML "$MOONCLIP_SPEC"
+
+# **Ravex has a Rust core since GPU-105**, so the editable install below builds
+# it with maturin and wants `cargo`. RunPod's images have a C compiler and no
+# Rust (both pods on 2026-09-15), and the failure arrives after the torch
+# reinstall above, a few minutes in. Linked into /usr/local/bin because every
+# phase is `ssh host '...'`, which never puts ~/.cargo/bin on the PATH.
+if ! command -v cargo >/dev/null; then
+    echo "-- no Rust toolchain: installing one for ravex's core"
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal >/dev/null
+    ln -sf "$HOME/.cargo/bin/cargo" "$HOME/.cargo/bin/rustc" \
+        "$HOME/.cargo/bin/rustup" /usr/local/bin/
+fi
 pip install --quiet --no-deps -e $KIT_ROOT/ravex
 
 # Checks the install rather than arming anything: the training script attaches
