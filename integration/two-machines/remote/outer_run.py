@@ -198,7 +198,11 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(args.out, exist_ok=True)
     beat = Heartbeat(os.path.join(args.out, "phase.log"), rank).start()
-    beat.say("built the process group, device %s" % device.type)
+    beat.say(
+        "%s, device %s"
+        % ("meeting at the rendezvous %s" % args.rendezvous if args.rendezvous
+           else "built the process group", device.type)
+    )
     rounds = Rounds(heartbeat=beat)
 
     import ravex
