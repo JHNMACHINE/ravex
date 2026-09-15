@@ -77,7 +77,11 @@ dependencies = ["PyYAML>=5.1"]
 #            `load_tensors` and `describe_state_dict` and *can* do without
 #            them, so it asks `hasattr`; the exchange cannot, so the floor is
 #            where it has to be caught.
-moonclip = ["moonclip>=0.1.0"]
+#            0.1.1 since GPU-93 and GPU-128: `describe()` carries `hash_raw`,
+#            which the audit trail fingerprints a Moonclip checkpoint by, and
+#            on Windows a reader holding the manifest open no longer costs the
+#            checkpoint being written.
+moonclip = ["moonclip>=0.1.1"]
 dev = ["pytest>=7", "numpy"]
 
 [project.urls]
