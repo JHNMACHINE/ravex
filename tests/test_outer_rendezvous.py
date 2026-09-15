@@ -294,6 +294,10 @@ def rounds_over(said, nodes):
 @pytest.mark.skipif(sys.platform == "darwin", reason="spawn is slow on macOS")
 def test_nodes_started_on_their_own_train_one_model_and_a_later_one_joins(server, tmp_path):
     """GPU-121's join, reached for the first time from a process a user launches."""
+    # Here and not at the top of the module: a round report is a Moonclip
+    # snapshot, but the pieces above need no engine, and the CI job without
+    # Moonclip should still run them.
+    pytest.importorskip("moonclip")
     context = mp.get_context("spawn")
     queue = context.Queue()
     job = "join"
@@ -339,6 +343,7 @@ def test_the_first_node_dying_does_not_take_the_run_with_it(server, tmp_path):
     exchange reads peer addresses from it on every fetch. Here the store is the
     server's, so node 0 going away costs the run one contributor and nothing
     else."""
+    pytest.importorskip("moonclip")
     context = mp.get_context("spawn")
     queue = context.Queue()
     job = "dies"
