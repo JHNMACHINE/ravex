@@ -170,6 +170,41 @@ def test_a_peer_still_finishing_its_round_is_waited_for(nodes):
     assert len(got) == 1 and got[0].steps == 99
 
 
+def test_a_peer_behind_by_longer_than_one_read_slice_is_still_waited_for(
+    nodes, monkeypatch
+):
+    """The wait is bounded by the round's deadline, not by one ``recv``.
+
+    Found on two real machines, EU and US, on 2026-09-15: the American node
+    spent 56 s in its first round, the European one waited for its report for
+    exactly the 30 s of one read slice, took the timeout for an absence and
+    closed round 1 without it — while the American node then found the
+    European report and averaged it in. One round in, two models.
+
+    The slice is shrunk so the test does not have to wait 30 s to show it: a
+    peer five slices late has to come back as a report, because the deadline
+    is ten seconds away.
+    """
+    from ravex._dist import exchange as _exchange
+
+    monkeypatch.setattr(_exchange, "RECV_SLICE", 0.2)
+    zero, one = nodes(0), nodes(1)
+    delta = a_delta()
+    publish(zero, delta, 0, 10)
+
+    def late():
+        time.sleep(1.0)
+        publish(one, delta, 0, 42)
+
+    threading.Thread(target=late, daemon=True).start()
+    got = zero.gather([1], 0, _report.expectation(delta), time.monotonic() + 10)
+
+    assert len(got) == 1 and got[0].steps == 42, (
+        "a peer one second behind was treated as absent: the read slice "
+        "decided the round instead of the deadline"
+    )
+
+
 def test_a_peer_already_past_the_round_says_so_instead_of_hanging(nodes):
     zero, one = nodes(0), nodes(1)
     delta = a_delta()

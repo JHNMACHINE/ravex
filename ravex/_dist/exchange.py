@@ -113,6 +113,11 @@ MAX_HANDLERS = 256
 #: Bytes moved per socket call.
 CHUNK = 1 << 20
 
+#: The longest a single ``recv`` waits before the deadline is looked at again.
+#: A slice, not a limit: running out of one means "check the deadline and read
+#: again", never "the peer is gone". See `_recv_exactly`.
+RECV_SLICE = 30.0
+
 #: Round directories a node keeps. A report is worth holding for about as long
 #: as a peer might still be fetching it, and retention never deletes one that
 #: is on a socket - see `DeltaExchange._serving`. Three, so a slow peer has a
@@ -1083,6 +1088,17 @@ def _recv_exactly(connection, count: int, deadline: float) -> bytes:
     The deadline is rechecked per chunk rather than only set on the socket:
     a peer trickling one byte per timeout would otherwise hold a fetch open
     long past the round it belongs to.
+
+    **A slice running out is not the peer being absent** (2026-09-15, EU and
+    US on two RunPod boxes). The greeting's answer is held back until the peer
+    has the round, so this call is where a node ahead waits for one behind —
+    up to the round's deadline. The slice used to be a timeout that raised,
+    and `fetch` read the raise as "no report": the node in Europe closed round
+    1 without the American one after exactly 30 s, while the American one,
+    still in its first round for 56 s, then found the European report
+    published and averaged it in. Two nodes averaging different sets from the
+    first round is two models, and every later round closed over both of them
+    as if nothing had happened.
     """
     if count == 0:
         return b""
@@ -1091,8 +1107,11 @@ def _recv_exactly(connection, count: int, deadline: float) -> bytes:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise OSError("deadline passed after %d of %d bytes" % (len(buffer), count))
-        connection.settimeout(min(remaining, 30.0))
-        block = connection.recv(min(CHUNK, count - len(buffer)))
+        connection.settimeout(min(remaining, RECV_SLICE))
+        try:
+            block = connection.recv(min(CHUNK, count - len(buffer)))
+        except _socket.timeout:
+            continue
         if not block:
             raise OSError("peer closed after %d of %d bytes" % (len(buffer), count))
         buffer += block
