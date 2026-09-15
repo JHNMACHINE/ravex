@@ -123,6 +123,20 @@ kill0)
     fi
     ;;
 
+learn)
+    # Every other arm trains on noise and can only say that rounds close. This
+    # one has something to learn (outer_run.py --task teacher): the held-out
+    # loss has to fall round after round, and after the same round both boxes
+    # have to print the same parameter hash — one model on two continents.
+    section "a task with something to learn: held-out loss and parameter hash per round"
+    disk_guard
+    rm -rf "${DIR:?}/learn"
+    start_server
+    RDZV_PARAMS="${LEARN_PARAMS:-2e7}" RDZV_HIDDEN="${LEARN_HIDDEN:-2048}" \
+        UNTIL="${LEARN_UNTIL:-10}" \
+        trainer "node$NODE_RANK" --task teacher --lr "${LEARN_LR:-1e-3}"
+    ;;
+
 stop)
     stop_server
     ;;
@@ -144,5 +158,5 @@ PY
     ;;
 
 *)
-    echo "usage: $0 {base|join|kill0|stop|report}" >&2; exit 2 ;;
+    echo "usage: $0 {base|join|kill0|learn|stop|report}" >&2; exit 2 ;;
 esac

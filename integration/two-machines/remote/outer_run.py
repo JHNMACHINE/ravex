@@ -30,6 +30,7 @@ comparable with what ``bench/round_link_cost.py`` prints for the same fields.
 """
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -142,6 +143,27 @@ def build_model(target_params, hidden):
     return nn.Sequential(*blocks), layers
 
 
+def make_teacher(hidden, held_out=512):
+    """Something to learn, and a held-out set nobody trains on.
+
+    **Why this exists (2026-09-15).** Every phase that ran the outer loop on
+    two continents trained on noise — inputs and targets both `randn`,
+    unrelated — so it measured rounds, nodes and seconds and could not say
+    whether anything was learned. This is the smallest task that can: a fixed
+    linear map scaled to unit variance, identical on every node because it is
+    drawn from a fixed seed, and a held-out set drawn from the same seed that
+    no node ever trains on. Each node's *training* inputs stay its own.
+    """
+    generator = torch.Generator().manual_seed(1234)
+    weight = torch.randn(hidden, hidden, generator=generator) / hidden ** 0.5
+
+    def teacher(x):
+        return x @ weight.T
+
+    held_x = torch.randn(held_out, hidden, generator=generator)
+    return teacher, held_x, teacher(held_x)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--rounds", type=int, default=6)
@@ -176,6 +198,11 @@ def main():
     parser.add_argument(
         "--until-round", type=int, default=0,
         help="stop once this round has closed, instead of after --rounds",
+    )
+    parser.add_argument(
+        "--task", default="noise", choices=("noise", "teacher"),
+        help="noise: measures the round only; teacher: something to learn, "
+        "with the held-out loss and a parameter hash logged at every round",
     )
     args = parser.parse_args()
 
@@ -251,7 +278,13 @@ def main():
         torch.manual_seed(3)  # same weights on both nodes to start
         model, layers = build_model(args.params, args.hidden)
         model = model.to(device)
-        optimizer = torch.optim.SGD(model.parameters(), lr=args.lr)
+        if args.task == "teacher":
+            # Adam where there is something to learn: SGD at this lr barely
+            # moves a deep GELU stack in the handful of rounds a rented box can
+            # afford, and the question is whether the loss falls.
+            optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+        else:
+            optimizer = torch.optim.SGD(model.parameters(), lr=args.lr)
 
         dense = sum(p.numel() for p in model.parameters())
         if rank == 0:
@@ -278,14 +311,51 @@ def main():
         # look like a round that worked.
         generator = torch.Generator().manual_seed(11 + rank)
         samples = args.batch * args.inner * (max(args.rounds, args.until_round + 1) + 1)
-        data = torch.utils.data.TensorDataset(
-            torch.randn(samples, args.hidden, generator=generator),
-            torch.randn(samples, args.hidden, generator=generator),
-        )
+        inputs = torch.randn(samples, args.hidden, generator=generator)
+        if args.task == "teacher":
+            teacher, held_x, held_y = make_teacher(args.hidden)
+            targets = teacher(inputs)
+        else:
+            teacher = held_x = held_y = None
+            targets = torch.randn(samples, args.hidden, generator=generator)
+        data = torch.utils.data.TensorDataset(inputs, targets)
         loader = torch.utils.data.DataLoader(
             data, batch_size=args.batch, shuffle=False, num_workers=0
         )
         loss_fn = nn.MSELoss()
+
+        evals = []
+
+        def evaluate(label):
+            """Held-out loss, and a hash of every parameter, right now.
+
+            Called at the top of an iteration just after a round closed and
+            before the next step: the one moment every node must hold the
+            same parameters. The loss says whether the run is learning; the
+            hash says whether the two continents hold one model — bit for
+            bit, which a matching loss alone would not prove.
+            """
+            was_training = model.training
+            model.eval()
+            total = 0.0
+            with torch.no_grad():
+                for start in range(0, len(held_x), 256):
+                    xb = held_x[start:start + 256].to(device)
+                    yb = held_y[start:start + 256].to(device)
+                    total += float(loss_fn(model(xb), yb)) * len(xb)
+                digest = hashlib.sha256()
+                for parameter in model.parameters():
+                    digest.update(parameter.detach().float().cpu().numpy().tobytes())
+            model.train(was_training)
+            entry = {
+                "label": label,
+                "heldout_loss": total / len(held_x),
+                "params_sha256": digest.hexdigest()[:16],
+                "at": time.time(),
+            }
+            evals.append(entry)
+            beat.say("EVAL %s: held-out loss %.6f, params %s"
+                     % (label, entry["heldout_loss"], entry["params_sha256"]))
 
         wanted = args.inner * args.rounds
         if args.until_round:
@@ -297,11 +367,18 @@ def main():
 
         runtime = get_runtime()
         done = 0
+        evaluated_at = None
+        if teacher is not None:
+            evaluate("before training")
         beat.say("training round 0 (%d steps per round)" % args.inner)
         for batch, target in loader:
             if done >= wanted:
                 break
             outer = runtime._outer if runtime is not None else None
+            # Before the stop check, so the last round closed is evaluated too.
+            if teacher is not None and outer and outer.round_number != evaluated_at:
+                evaluated_at = outer.round_number
+                evaluate("after round %d" % (outer.round_number - 1))
             if args.until_round and outer and outer.round_number > args.until_round:
                 break
             round_now = done // args.inner
@@ -323,8 +400,9 @@ def main():
             loss_fn(model(batch.to(device)), target.to(device)).backward()
             optimizer.step()
             done += 1
+        return evals
 
-    train()
+    evals = train() or []
     beat.say("done training; writing results")
     beat.stop()
 
@@ -335,6 +413,8 @@ def main():
         "hidden": args.hidden,
         "inner": args.inner,
         "save_dtype": args.save_dtype or None,
+        "task": args.task,
+        "evals": evals,
         "wall_seconds": round(time.time() - started, 2),
         "rounds": rounds.seen,
         "warnings": rounds.other[-40:],
