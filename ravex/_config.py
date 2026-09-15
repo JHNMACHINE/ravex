@@ -560,6 +560,25 @@ class RavexConfig:
     #: checkpoint nobody meant to keep.
     outer_root: Optional[str] = None
 
+    #: The address of a ``ravex rendezvous`` server, ``host:port`` (GPU-129).
+    #: Set, and the outer loop takes its store, its node number and its peers
+    #: from there instead of from ``init_process_group``: the nodes are plain
+    #: ``python train.py``, need not all be there at the start, and do not lose
+    #: the store when one of them dies. Unset, it is torchrun as before. Also
+    #: ``RAVEX_RENDEZVOUS``. Read `ravex._dist.rendezvous` for what it does not
+    #: do — the server has no authentication.
+    outer_rendezvous: Optional[str] = None
+
+    #: The job's name on that server, which keeps several jobs apart on one.
+    #: Every node of a run gives the same one. Also ``RAVEX_OUTER_JOB``.
+    outer_job: str = "default"
+
+    #: How many nodes start the run together. The first this many to reach the
+    #: rendezvous wait for each other and take the starting parameters from
+    #: the first; every node after them joins the run in progress (GPU-121).
+    #: Also ``RAVEX_OUTER_MIN_NODES``.
+    outer_min_nodes: int = 2
+
     log_file: Optional[str] = None
     log_level: str = "INFO"
     fallback_on_error: bool = True
@@ -717,6 +736,12 @@ class RavexConfig:
             self.track_dataloaders = _as_bool(value, self.track_dataloaders)
         if (value := get("TRACK_RNG")) is not None:
             self.track_rng = _as_bool(value, self.track_rng)
+        if (value := get("RENDEZVOUS")) is not None:
+            self.outer_rendezvous = value
+        if (value := get("OUTER_JOB")) is not None:
+            self.outer_job = value
+        if (value := get("OUTER_MIN_NODES")) is not None:
+            self.outer_min_nodes = _as_int(value, self.outer_min_nodes)
         if (value := get("HANDLE_SIGTERM")) is not None:
             self.handle_sigterm = _as_bool(value, self.handle_sigterm)
         if (value := get("EMERGENCY_COORDINATION")) is not None:
@@ -950,6 +975,33 @@ class RavexConfig:
                 self.outer_save_dtype = None
             else:
                 self.outer_save_dtype = name
+        if self.outer_rendezvous is not None:
+            from ravex._dist.rendezvous import parse_address
+
+            text = str(self.outer_rendezvous).strip()
+            try:
+                parse_address(text)
+                self.outer_rendezvous = text
+            except ValueError as exc:
+                # Recorded rather than raised, like every other option read
+                # from a file. The outer loop then looks for torch's store, does
+                # not find one, and says so — so a typo here is two log lines,
+                # not a node quietly training alone.
+                if text:
+                    self.problems.append(f"outer_rendezvous: {exc}; not using it")
+                self.outer_rendezvous = None
+        if not isinstance(self.outer_job, str):
+            self.outer_job = str(self.outer_job)
+        from ravex._dist.rendezvous import valid_job
+
+        if not valid_job(self.outer_job):
+            self.problems.append(
+                f"outer_job={self.outer_job!r} is not a job name (letters, "
+                "digits, '.', '_' and '-'); using 'default'"
+            )
+            self.outer_job = "default"
+        if self.outer_min_nodes < 1:
+            self.outer_min_nodes = 1
         if str(self.compression).strip().lower() in ("none", "off", ""):
             self.compression_level = 0
 

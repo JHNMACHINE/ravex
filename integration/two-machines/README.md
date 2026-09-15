@@ -194,6 +194,28 @@ different images. Its wire format is checked by
 real gloo processes locally — so what is left for two machines is latency,
 ordering and a peer that disappears, not the encoding.
 
+## The outer loop without torchrun
+
+`110-rendezvous.sh` is GPU-129 on real machines: no `torchrun`, no process
+group, plain `python` on each box, and the store every node reads is a
+`ravex rendezvous` in a process of its own on node 0. Three arms — `base`,
+`join`, `kill0` — plus `stop` for the server, which no arm stops by itself: in
+`kill0` node 0's script ends the moment its trainer dies, and the server is
+exactly what has to outlive it.
+
+**`kill0` is the arm torchrun could not pass.** Under torchrun the store lives in
+node 0's agent, and the exchange reads peer addresses from it on every fetch, so
+losing node 0's box stops every round. It had never been tried: the `kill` arm
+of `100-outer.sh` kills node 1.
+
+**In `join`, the number to read is the joiner's first `gather_wait_seconds`.** It
+downloads the outer parameters and the momentum — twice a delta — over the real
+link, inside the round it enters. On loopback that cost nothing.
+
+**The rendezvous has no authentication.** Whoever reaches its port can read the
+job token. A RunPod pod exposes only the ports it was created with, so 29400 is
+reachable over `podnet1` and not from outside; keep it that way.
+
 ## Rules that cost money to relearn
 
 **Interrupting the command on your machine does not stop the phase on the box.**
@@ -244,6 +266,7 @@ anything that exists only there is a result that can be taken away.
 | `remote/45-nccl-regroup.sh` | the group rebuilt without the rank that went away |
 | `remote/46-gpu92-sigterm.sh` | one rank preempted, every rank saving together |
 | `remote/100-outer.sh` | the outer loop over the link: base, bf16, a node killed, resume |
+| `remote/110-rendezvous.sh` | the outer loop with no torchrun: base, a node joining late, node 0 killed |
 | `remote/00-preflight.sh` | the go/no-go |
 | `remote/10-setup.sh` | install moonclip and this ravex, fix torch if the GPU needs it |
 | `remote/20-correctness.sh` | train, replicate, die like a preempted box, lose a machine, resume |

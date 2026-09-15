@@ -62,7 +62,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 logger = logging.getLogger("ravex")
 
@@ -167,11 +167,15 @@ class Membership:
     """
 
     def __init__(self, store, rank: int, base_world: int,
-                 window: int = JOIN_WINDOW):
+                 window: int = JOIN_WINDOW,
+                 ceiling: Optional[Callable[[], int]] = None):
         self.store = store
         self.rank = rank
         self.base_world = base_world
         self.window = window
+        #: How many node numbers the rendezvous has handed out, when there is a
+        #: rendezvous of Ravex's own to ask (GPU-129). See :meth:`span`.
+        self.ceiling = ceiling
         self.accepted: Dict[int, int] = {}
 
         #: Joiners this node has already told the store it accepts. Kept so
@@ -185,6 +189,42 @@ class Membership:
         #: forever, and nothing would ever say why the run got slower.
         self._state_until: Dict[int, int] = {}
 
+    def span(self) -> int:
+        """How many ranks past the base to look at for join keys.
+
+        With a rendezvous of Ravex's own the answer is exact: nobody announces
+        without having taken a number first, so the counter bounds every rank
+        that could have. Without one it is the fixed :data:`JOIN_WINDOW`.
+
+        The difference is more than a ceiling. The fixed window limited the
+        joins a run could take **over its whole life** — a node that crashes
+        and comes back takes a new number — and every rank looked at is a
+        store round trip at every boundary, twice. On a link between
+        continents a round trip is a sizeable fraction of a second, and the
+        window was sixteen of them asking about nodes that do not exist.
+        """
+        if self.ceiling is None:
+            return self.window
+        try:
+            return max(0, int(self.ceiling()) - self.base_world)
+        except Exception:
+            return self.window
+
+    def take_in_joined(self) -> None:
+        """For a node that has just joined: every announcement made so far counts.
+
+        A member meets each join key at a boundary before the round it names,
+        and :meth:`refresh` raises when it meets one too late. A node that has
+        just joined cannot have met the earlier ones in time — it was not
+        running — and does not need to have: :func:`join` handed it the outer
+        parameters published for its own admission round, which already carry
+        everything those earlier joiners contributed. So they are taken in as
+        known, and from here this node meets later ones the way members do.
+        """
+        for peer, admit in announced(self.store, self.base_world, self.span()).items():
+            if peer != self.rank:
+                self.accepted[peer] = admit
+
     def wants_state(self, round_number: int) -> bool:
         """Whether somebody is waiting for the outer parameters right now.
 
@@ -195,7 +235,7 @@ class Membership:
         snapshots and not a run's worth, and the last one is logged.
         """
         wanted = False
-        for rank in range(self.base_world, self.base_world + self.window):
+        for rank in range(self.base_world, self.base_world + self.span()):
             if rank == self.rank:
                 continue
             try:
@@ -245,7 +285,7 @@ class Membership:
         to know about *other* joiners to compute its own admission round, and
         it has no peer set of its own to ask for yet.
         """
-        for peer, admit in announced(self.store, self.base_world, self.window).items():
+        for peer, admit in announced(self.store, self.base_world, self.span()).items():
             if peer == self.rank:
                 continue
             known = self.accepted.get(peer)
@@ -378,7 +418,7 @@ def state_round(store) -> Optional[int]:
 
 
 def join(store, exchange, loop, rank: int, base_world: int, deadline: float,
-         poll: float = 0.05) -> bool:
+         poll: float = 0.05, window: int = JOIN_WINDOW) -> bool:
     """Take a node into a run that is already going. The joiner's whole half.
 
     Returns True once this node holds the run's outer parameters and is
@@ -424,7 +464,7 @@ def join(store, exchange, loop, rank: int, base_world: int, deadline: float,
             # while this node was still getting ready - which is a join that
             # did not happen rather than one that half happened, because
             # nothing was published under it.
-            highest = observe(store, base_world) or -1
+            highest = observe(store, base_world, window) or -1
             announced_at = max(floor, highest + 1)
             announce(store, rank, announced_at)
             logger.info(

@@ -176,6 +176,9 @@ class RavexRuntime:
         #: Kept so the round boundary does not go looking for the store again
         #: on a path that runs once per round.
         self.store_for_joins: Any = None
+        #: Whether this node came in through `membership.join` rather than
+        #: starting with the run (GPU-129). A joiner does not serve joins.
+        self._outer_joined = False
         self._round_due = False
         #: The step the round came due at, for the warning below. Only
         #: meaningful while `_round_due` is up.
@@ -652,7 +655,11 @@ class RavexRuntime:
         from ravex._dist.agreement import rendezvous_store
         from ravex._dist.collectives import get_rank, get_world_size
         from ravex._dist.exchange import SEED_ROUND, DeltaExchange, adopt_outer_state
+        from functools import partial
+
+        from ravex._dist import rendezvous as _rendezvous
         from ravex._dist.membership import Membership
+        from ravex._dist.membership import join as join_run
         from ravex._dist.outer import OuterLoop
 
         models = self.registry.models
@@ -663,7 +670,18 @@ class RavexRuntime:
                 % len(models)
             )
 
-        store = rendezvous_store()
+        address = self.config.outer_rendezvous
+        joining = False
+        ceiling = None
+        if address:
+            # GPU-129: a store of Ravex's own, outside every training process,
+            # and node numbers handed out as nodes arrive instead of ranks
+            # assigned once, to everybody at the same moment, by torchrun.
+            store, rank, world, joining = self._join_rendezvous(address)
+            ceiling = partial(_rendezvous.registered, store)
+        else:
+            store = rendezvous_store()
+            rank, world = get_rank(), get_world_size()
         if store is None:
             # Worth being precise about, because it reads like a
             # fault-tolerance limit and is not one. The process group is used
@@ -675,22 +693,21 @@ class RavexRuntime:
                 "no rendezvous store: the outer loop takes peer addresses and "
                 "the job token from torch's store, which exists only after "
                 "init_process_group. Launch under torchrun (across machines "
-                "with --rdzv-backend=c10d)"
+                "with --rdzv-backend=c10d), or start `ravex rendezvous` and "
+                "give its address as outer_rendezvous"
             )
 
-        world = get_world_size()
-        if world < 2:
+        if not address and world < 2:
             raise RuntimeError("world size is %d; a round needs peers" % world)
 
-        rank = get_rank()
         # The set this node exchanges with is now asked for **per round**
         # rather than computed once (GPU-121). Computed once, a node that joins
         # a run in progress appears in it nowhere and no amount of announcing
         # helps; asked per round, membership is a function of the round number
         # and every member computes the same answer for the same round.
-        self._membership = Membership(store, rank, world)
+        self._membership = Membership(store, rank, world, ceiling=ceiling)
         self.store_for_joins = store
-        self._outer_peers = self._membership.peers_at(0)
+        self._outer_joined = joining
         root = self.config.outer_root or os.path.join(
             self.config.storage.path, "rounds", str(rank)
         )
@@ -702,6 +719,7 @@ class RavexRuntime:
             node=str(rank),
             compression_level=self.config.compression_level,
             save_dtype=self.config.outer_save_dtype,
+            route_toward=_rendezvous.parse_address(address)[0] if address else None,
         )
         if not exchange.start():
             raise RuntimeError("the round exchange could not open its listener")
@@ -736,22 +754,40 @@ class RavexRuntime:
         # the same outer parameters or the difference between them is never
         # touched again. See `adopt_outer_state` for what that looks like from
         # the outside, which is a run that appears to be working.
-        if not adopt_outer_state(
-            loop, exchange, 0, rank, time.monotonic() + self.config.outer_deadline
-        ):
-            raise RuntimeError(
-                "could not take the starting parameters from rank 0 within "
-                "%ds. Training on this node's own would put it a fixed "
-                "distance from every peer for the rest of the run"
-                % self.config.outer_deadline
-            )
-        # Training rounds start after the seed round, which used number 0.
-        loop.round_number = SEED_ROUND + 1
+        deadline = time.monotonic() + self.config.outer_deadline
+        if joining:
+            # A run already going. The outer parameters come from the members,
+            # published for a round boundary they all agree on — not from a
+            # seed round, which is long over. See `membership.join`.
+            if not join_run(
+                store, exchange, loop, rank, world, deadline,
+                window=self._membership.span(),
+            ):
+                raise RuntimeError(
+                    "could not join the run within %ds. Nothing was published, "
+                    "so the members closed their rounds without this node. A "
+                    "run that has lost one of the nodes it started with cannot "
+                    "take a new one (membership.acknowledged)"
+                    % self.config.outer_deadline
+                )
+            self._membership.take_in_joined()
+        else:
+            if not adopt_outer_state(loop, exchange, 0, rank, deadline):
+                raise RuntimeError(
+                    "could not take the starting parameters from rank 0 within "
+                    "%ds. Training on this node's own would put it a fixed "
+                    "distance from every peer for the rest of the run"
+                    % self.config.outer_deadline
+                )
+            # Training rounds start after the seed round, which used number 0.
+            loop.round_number = SEED_ROUND + 1
+        self._outer_peers = self._membership.peers_at(loop.round_number)
         logger.info(
-            "Outer loop on: rank %d of %d, %d inner step(s) per round%s, "
-            "reports staged in %s.",
-            rank,
-            world,
+            "Outer loop on: %s, %d inner step(s) per round%s, reports staged "
+            "in %s.",
+            "node %d, joined at round %d" % (rank, loop.round_number)
+            if joining
+            else "rank %d of %d" % (rank, world),
             self.config.outer_inner_steps,
             " or %.0fs" % self.config.outer_round_seconds
             if self.config.outer_round_seconds
@@ -759,6 +795,44 @@ class RavexRuntime:
             root,
         )
         return loop
+
+    def _join_rendezvous(self, address):
+        """Reach a ``ravex rendezvous`` and take a node number there (GPU-129).
+
+        Returns ``(store, node, base_world, joining)``. A base member returns
+        once every base member has arrived, so that the seed round has somebody
+        to take the starting parameters from. A joiner returns at once: the rest
+        of its way in is `membership.join`, which needs the exchange built first.
+        """
+        from ravex._dist import rendezvous as _rendezvous
+
+        job = self.config.outer_job
+        base = int(self.config.outer_min_nodes)
+        store = _rendezvous.connect(
+            address, job, timeout=float(self.config.outer_deadline)
+        )
+        node = _rendezvous.register(store)
+        if node >= base:
+            logger.info(
+                "Node %d at the rendezvous %s, job %s: the %d node(s) that start "
+                "the run are already there, so this one joins it in progress.",
+                node, address, job, base,
+            )
+            return store, node, base, True
+        logger.info(
+            "Node %d of the %d that start job %s, at the rendezvous %s.",
+            node, base, job, address,
+        )
+        if not _rendezvous.wait_for_base(
+            store, base, time.monotonic() + self.config.outer_deadline
+        ):
+            raise RuntimeError(
+                "only %d of the %d node(s) that start job %s reached the "
+                "rendezvous within %ds"
+                % (_rendezvous.registered(store), base, job,
+                   self.config.outer_deadline)
+            )
+        return store, node, base, False
 
     def _warn_if_no_round_boundary(self, outer) -> None:
         """Say it when a round is due and nothing ever closes it.
@@ -814,10 +888,15 @@ class RavexRuntime:
                 # outer parameters down for a candidate and taking in an
                 # announcement both have to happen at the round number every
                 # member agrees on, which is this one.
-                serve_joins(
-                    self.store_for_joins, self._exchange, self._outer,
-                    self._membership,
-                )
+                if not self._outer_joined:
+                    # Only a node the run started with serves a join: the
+                    # protocol takes the state and the acknowledgements from
+                    # the base members (`membership.acknowledged`), so a node
+                    # that joined itself would write snapshots nobody asks for.
+                    serve_joins(
+                        self.store_for_joins, self._exchange, self._outer,
+                        self._membership,
+                    )
                 self._outer_peers = self._membership.peers_at(
                     self._outer.round_number
                 )

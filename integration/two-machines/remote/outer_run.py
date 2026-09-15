@@ -19,6 +19,11 @@ the rendered line would mean re-deriving numbers that are already there, at
 one decimal place, and being wrong about it quietly.
 
     torchrun ... outer_run.py --rounds 6 --inner 50 --params 3e8
+    python outer_run.py --rendezvous 10.1.2.3:29400 --until-round 8 ...
+
+The second form is GPU-129: no torchrun and no process group, the nodes meet at
+a ``ravex rendezvous`` and take their numbers there. ``110-rendezvous.sh``
+drives it.
 
 What comes home is ``rounds.node<rank>.json``: one object per round, directly
 comparable with what ``bench/round_link_cost.py`` prints for the same fields.
@@ -157,18 +162,38 @@ def main():
         "--die-on-rank", type=int, default=1,
         help="which rank dies, when --die-at-round is set",
     )
+    parser.add_argument(
+        "--rendezvous", default="",
+        help="host:port of a `ravex rendezvous`; no torchrun, no process group",
+    )
+    parser.add_argument("--job", default="gpu129")
+    parser.add_argument("--min-nodes", type=int, default=2)
+    parser.add_argument(
+        "--node-index", type=int, default=0,
+        help="with --rendezvous: this box's index, for file names only",
+    )
+    parser.add_argument("--name", default="", help="names the rounds file")
+    parser.add_argument(
+        "--until-round", type=int, default=0,
+        help="stop once this round has closed, instead of after --rounds",
+    )
     args = parser.parse_args()
 
     import torch.distributed as dist
 
-    rank = int(os.environ.get("RANK", "0"))
-    world = int(os.environ.get("WORLD_SIZE", "1"))
+    if args.rendezvous:
+        # GPU-129: no process group at all. The node's number comes from the
+        # rendezvous; this index names files and the heartbeat, nothing more.
+        rank, world = args.node_index, 0
+    else:
+        rank = int(os.environ.get("RANK", "0"))
+        world = int(os.environ.get("WORLD_SIZE", "1"))
 
-    # gloo, not nccl: the outer loop takes only addresses and the job token
-    # from the process group and moves every byte on its own sockets, so the
-    # group never carries a tensor. A nccl group here would add a second
-    # network path to go wrong for no benefit.
-    dist.init_process_group("gloo", rank=rank, world_size=world)
+        # gloo, not nccl: the outer loop takes only addresses and the job token
+        # from the process group and moves every byte on its own sockets, so the
+        # group never carries a tensor. A nccl group here would add a second
+        # network path to go wrong for no benefit.
+        dist.init_process_group("gloo", rank=rank, world_size=world)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(args.out, exist_ok=True)
@@ -197,6 +222,9 @@ def main():
         outer_root=os.path.join(args.root, "rounds"),
         outer_deadline=args.deadline,
         outer_save_dtype=(args.save_dtype or None),
+        outer_rendezvous=(args.rendezvous or None),
+        outer_job=args.job,
+        outer_min_nodes=args.min_nodes,
         enabled=True,
         resume=False,
         checkpoint_every=10 ** 9,
@@ -245,7 +273,7 @@ def main():
         # would make the average a no-op, and a round that moved nothing would
         # look like a round that worked.
         generator = torch.Generator().manual_seed(11 + rank)
-        samples = args.batch * args.inner * (args.rounds + 1)
+        samples = args.batch * args.inner * (max(args.rounds, args.until_round + 1) + 1)
         data = torch.utils.data.TensorDataset(
             torch.randn(samples, args.hidden, generator=generator),
             torch.randn(samples, args.hidden, generator=generator),
@@ -256,17 +284,28 @@ def main():
         loss_fn = nn.MSELoss()
 
         wanted = args.inner * args.rounds
+        if args.until_round:
+            # A round number rather than a step count is what lets a node that
+            # joined late stop on the same round as the others, and so hold the
+            # same model at the end (GPU-129).
+            wanted = len(loader)
+        from ravex._runtime import get_runtime
+
+        runtime = get_runtime()
         done = 0
         beat.say("training round 0 (%d steps per round)" % args.inner)
         for batch, target in loader:
             if done >= wanted:
+                break
+            outer = runtime._outer if runtime is not None else None
+            if args.until_round and outer and outer.round_number > args.until_round:
                 break
             round_now = done // args.inner
             if done % args.inner == 0 and done:
                 # Said before the round closes, so a long silence after this
                 # line is the exchange and not the training.
                 beat.say("training round %d" % round_now)
-            if (args.die_at_round and rank == args.die_on_rank
+            if (args.die_at_round and (args.rendezvous or rank == args.die_on_rank)
                     and round_now == args.die_at_round
                     and done % args.inner == 0):
                 # The way a preempted box goes: no leave, no cleanup, the
@@ -296,7 +335,7 @@ def main():
         "rounds": rounds.seen,
         "warnings": rounds.other[-40:],
     }
-    path = os.path.join(args.out, "rounds.node%d.json" % rank)
+    path = os.path.join(args.out, "rounds.%s.json" % (args.name or "node%d" % rank))
     with open(path, "w") as handle:
         json.dump(payload, handle, indent=2)
 
@@ -315,7 +354,8 @@ def main():
     print()
     print("wrote %s" % path)
 
-    dist.destroy_process_group()
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

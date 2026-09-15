@@ -286,7 +286,7 @@ def set_deadline(sock, seconds: float) -> None:
         sock.setsockopt(_socket.SOL_SOCKET, option, value)
 
 
-def advertise(port: int) -> str:
+def advertise(port: int, toward: Optional[str] = None) -> str:
     """The address to publish, and **never this host's name**.
 
     ``RingLink._advertise`` solves the same problem for the replication ring
@@ -306,11 +306,15 @@ def advertise(port: int) -> str:
        the nodes are on different continents — behind NAT no local lookup
        returns the address a peer dials.
     2. The routing table, asked which local address would be used to reach
-       ``MASTER_ADDR``. Same trick as ``RingLink._advertise``: a UDP
-       ``connect`` sends no packet, it only fills in the local address.
-    3. The same question asked toward a public address, for a node launched
-       without a torchrun rendezvous — which is what an independently started
-       node on a rented box is.
+       ``toward`` — the ``ravex rendezvous`` server, when there is one — and
+       then ``MASTER_ADDR``. Same trick as ``RingLink._advertise``: a UDP
+       ``connect`` sends no packet, it only fills in the local address. The
+       server comes first because it is the one address known to sit on the
+       network the peers share: on a RunPod pair it is on ``podnet1``, where
+       the route toward a public address leaves by the bridge interface no
+       other pod can reach (GPU-129).
+    3. The same question asked toward a public address, for a node that has
+       neither.
     4. Loopback, with a warning that says plainly that no other machine will
        reach it.
     """
@@ -318,7 +322,7 @@ def advertise(port: int) -> str:
     if configured:
         return configured if ":" in configured else "%s:%d" % (configured, port)
 
-    for target in (os.environ.get("MASTER_ADDR"), "8.8.8.8"):
+    for target in (toward, os.environ.get("MASTER_ADDR"), "8.8.8.8"):
         if not target:
             continue
         probe = None
@@ -359,8 +363,12 @@ class DeltaExchange:
         patience: float = 60.0,
         compression_level: int = 3,
         save_dtype=None,
+        route_toward: Optional[str] = None,
     ):
         self.rank = int(rank)
+        #: A host on the network the peers share, to pick the address this
+        #: node advertises by. See :func:`advertise`.
+        self.route_toward = route_toward
         self.node = node or str(rank)
         self.store = store
         self.patience = float(patience)
@@ -479,7 +487,7 @@ class DeltaExchange:
             listener.settimeout(0.5)
             self.listener = listener
 
-            self.address = advertise(listener.getsockname()[1])
+            self.address = advertise(listener.getsockname()[1], self.route_toward)
             self.store.set(ADDRESS_KEY % self.rank, self.address.encode("utf-8"))
         except OSError as exc:
             logger.warning("Could not open the round exchange: %s", exc)

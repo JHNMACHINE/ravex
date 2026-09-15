@@ -765,11 +765,45 @@ Without it no round ever closes and every node trains alone for the whole run.
 Ravex warns once, naming the call, a couple of steps after the first round
 comes due.
 
-**What it needs from the launcher.** Peer addresses and the job token come from
-torch's rendezvous store, so the ranks must have called `init_process_group` —
-`torchrun`, including across machines with `--rdzv-backend=c10d`. The process
-group is used for its *store* and never for the exchange, so a rank dying
-breaks a group nothing here touches; what it constrains is the start.
+**What it needs from the launcher: a store, from one of two places.** Peer
+addresses, the job token and who is in the run live in a key-value store.
+
+*torch's*, when the ranks have called `init_process_group` — `torchrun`,
+including across machines with `--rdzv-backend=c10d`. The group is used for its
+store and never for the exchange. What it constrains is everything around that:
+every rank has to be there at the start, a node that arrives later has no rank
+to be given, and the store lives in the torchrun agent on the endpoint's
+machine — which the exchange reads on every fetch, so losing that machine stops
+every round.
+
+*Ravex's own*, from `ravex rendezvous` (GPU-129):
+
+```bash
+ravex rendezvous --port 29400        # on a machine that stays up; it trains nothing
+```
+
+```yaml
+outer_loop: true
+outer_rendezvous: 10.0.0.5:29400     # or RAVEX_RENDEZVOUS
+outer_job: my-run                    # or RAVEX_OUTER_JOB: keeps runs apart on one server
+outer_min_nodes: 2                   # or RAVEX_OUTER_MIN_NODES
+```
+
+Each node is then plain `python train.py`: no torchrun, no process group, no
+`RANK`. It takes the next number from a counter on the server that never hands
+one out twice. The first `outer_min_nodes` wait for each other and start the
+run; every node after them joins the run in progress — it takes the outer
+parameters and momentum the members publish for a round they all agree on, and
+contributes from that round. A node that crashes and is started again is a new
+node, and joins the same way.
+
+Three limits, and the first is a warning. **The server has no
+authentication**: whoever reaches its port can read the job token that tells
+members from strangers, so keep it on a private network. It is a single point,
+and restarting it loses the job's state — though a small process is easier to
+keep alive than a spot GPU. And a run that has lost one of its starting nodes
+cannot take a new one yet: a joiner waits for every starting node to
+acknowledge it, and a dead one never will.
 
 **`RAVEX_EXCHANGE_ADDRESS` is required whenever the nodes are not on one
 network.** Behind NAT, nothing a process can ask its own kernel returns the

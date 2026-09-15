@@ -166,6 +166,40 @@ def _audit_log(args) -> int:
     return 0
 
 
+def _rendezvous(args) -> int:
+    """Hold the store outer-loop nodes meet at, until interrupted (GPU-129)."""
+    import time
+
+    from ravex._dist import rendezvous
+
+    try:
+        server = rendezvous.serve(args.host, args.port)
+    except Exception as exc:
+        print(
+            f"ravex rendezvous: could not listen on {args.host}:{args.port}: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        f"Rendezvous listening on {args.host}:{args.port}. Nodes meet here with "
+        f"outer_rendezvous (or {rendezvous.ENV}) set to this machine's address "
+        f"and port {args.port}.",
+        flush=True,
+    )
+    print(
+        "No authentication: whoever reaches this port can read every job's "
+        "token. Keep it on a private network.",
+        flush=True,
+    )
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        del server
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="ravex",
@@ -211,6 +245,16 @@ def main(argv=None) -> int:
         "--storage", required=True, help="the store directory, or the audit.jsonl inside it"
     )
     audit.set_defaults(handler=_audit_log)
+
+    rendezvous = subparsers.add_parser(
+        "rendezvous",
+        help="hold the store outer-loop nodes meet at, without torchrun (outer_rendezvous)",
+    )
+    rendezvous.add_argument(
+        "--host", default="0.0.0.0", help="the interface to listen on (default: all)"
+    )
+    rendezvous.add_argument("--port", type=int, default=29400, help="default: 29400")
+    rendezvous.set_defaults(handler=_rendezvous)
 
     args = parser.parse_args(argv)
     if not hasattr(args, "handler"):

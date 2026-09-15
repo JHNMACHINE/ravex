@@ -4,6 +4,49 @@
 
 ### Added
 
+- **Nodes that start on their own: `ravex rendezvous` and `outer_rendezvous`
+  (GPU-129).**
+
+  The outer loop took its store — peer addresses, the job token, who is in the
+  run — from `init_process_group`. So it needed torchrun, every node present at
+  the start, and a store living inside node 0's torchrun agent. Two
+  consequences had not been written down anywhere. The exchange reads peer
+  addresses from that store on every fetch, so losing node 0's machine stopped
+  every round, not only node 0's contribution; the two-machine session of
+  2026-09-10 killed node 1 and never saw it. And the join of GPU-121 was
+  reachable from its tests and from nothing a user could launch: a process
+  started later has no rank for torchrun to give it.
+
+  `ravex rendezvous --port 29400` now holds the store in a process of its own.
+  It is torch's `TCPStore`, so everything built on the store is unchanged. A
+  node given `outer_rendezvous: host:port` (or `RAVEX_RENDEZVOUS`) is plain
+  `python train.py`, with no process group. It takes a number from a counter
+  on the server that never hands one out twice. The first `outer_min_nodes`
+  wait for each other and start the run with a seed round, as ranks did; every
+  later number joins the run in progress. A node that crashes and comes back
+  is a new node. `outer_job` keeps several runs apart on one server.
+
+  Two things changed underneath. A member used to look for join announcements
+  among a fixed sixteen ranks past the starting ones, which capped the joins a
+  run could take over its whole life, restarts included, and cost one store
+  round trip per rank at every boundary; with a rendezvous it looks exactly as
+  far as the counter. And a node now picks the address it advertises by asking
+  the routing table toward the rendezvous server first — on a RunPod pair that
+  is the private interface, where the route toward a public address leaves by
+  a bridge no other pod can reach.
+
+  Tested as it has to be: separate processes with no `RANK` and no
+  `MASTER_ADDR`; a third that arrives after the start and ends holding the same
+  model, bit for bit; and node 0 exiting mid-run while the other two keep
+  closing rounds.
+
+  Not done, and said here first. The server has **no authentication** — whoever
+  reaches its port can read the job token — so it belongs on a private network.
+  It is still a single point, moved off a rented GPU, and restarting it loses
+  the job's state. A run that has lost one of its starting nodes still cannot
+  take a new one, because the lost node never acknowledges. And a node is one
+  process: FSDP inside a box under the outer loop is not part of this.
+
 - **An audit trail of checkpoints: `audit_log: true` (GPU-93).**
 
   The question GPU-93 was opened on — *which checkpoint produced the model
