@@ -144,10 +144,14 @@ jobs:
           # *whole* suite writes by a different road. That is why this job
           # runs all of it rather than a selection of it.
           #
-          # **On four workers, because it had run out of room.** This job was
-          # cancelled at the ten-minute wall on every push from 6bc008c - the
-          # commit that added `test_outer_rendezvous.py` - while the last
-          # green before it finished at 9m37s, twenty-three seconds under.
+          # **On four workers, because it had run out of room.** This job
+          # went red on every push from 6bc008c - the commit that added
+          # `test_outer_rendezvous.py` - and at the ten-minute wall on most of
+          # them: two of those eight were a push two minutes later cancelling
+          # the run instead, which reads the same from the API and is not the
+          # same thing. `da7de2c`, the last of them, was killed at 10m02s. The
+          # last green before all this, 7dab99a, finished at 9m37s: twenty-
+          # three seconds of room, and the new file costs seventy.
           # The suite is the cost and not the build: in a container with this
           # runner's shape, building Moonclip takes 59 s and the whole setup
           # 167.
