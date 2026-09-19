@@ -182,10 +182,26 @@ def test_a_bad_rendezvous_setting_is_reported_rather_than_raised(monkeypatch, tm
 
 
 def outer_digest(outer):
+    """A fingerprint of the outer parameters, without NumPy.
+
+    `.numpy().tobytes()` was the obvious spelling and it cost this file every
+    run of the one job where it executes. Ravex depends on PyYAML and nothing
+    else, torch does not require NumPy, and the Moonclip job's image has none
+    — that install is a supported configuration the package goes out of its
+    way to keep working (GPU-126), and these tests only run where Moonclip is
+    installed, which is that image. So the helper raised *"Numpy is not
+    available"*, the node reported no result, and the failure read as the
+    rendezvous not finishing.
+
+    `bytes(tensor.tolist())` is the NumPy-free spelling `collectives.py`
+    already uses; the `uint8` view is what makes it the same bytes for a
+    parameter that is not `uint8` to begin with.
+    """
     digest = hashlib.sha256()
     for name in sorted(outer):
         digest.update(name.encode("utf-8"))
-        digest.update(outer[name].detach().cpu().contiguous().numpy().tobytes())
+        raw = outer[name].detach().cpu().contiguous().flatten().view(torch.uint8)
+        digest.update(bytes(raw.tolist()))
     return digest.hexdigest()
 
 
