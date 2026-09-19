@@ -28,6 +28,22 @@ def _free_port() -> int:
 # ─── discovery: no process group involved at all ───────────────────────
 
 
+#: How long a worker waits for the *other* worker to get somewhere, which is
+#: mostly how long a freshly spawned interpreter takes to import torch.
+#:
+#: It was 15 s, and 15 s is a claim about how fast the machine is rather than
+#: anything about the code under test. On a CI runner sharing four cores with
+#: three other pytest workers it stopped being true: the master's wait expired,
+#: it polled a store nobody had written to yet, and the red read
+#: `assert None == '10.0.0.9:29500'` - a sentence about `pending_join` for a
+#: candidate that was still importing torch. The rest of this suite gives the
+#: same kind of step 60 s and more.
+#:
+#: And a wait that runs out now says so, instead of letting the poll happen
+#: anyway and leaving the assertion to describe the wrong thing.
+SPAWN_GRACE = 120.0
+
+
 def _discovery_worker(is_master, port, ready_evt, announced_evt, out):
     try:
         import torch.distributed as dist
@@ -45,11 +61,15 @@ def _discovery_worker(is_master, port, ready_evt, announced_evt, out):
             first_look = pending_join(store, candidate_rank=2)
             out.put(("rank0_before", first_look))
 
-            announced_evt.wait(timeout=15)
-            second_look = pending_join(store, candidate_rank=2)
-            out.put(("rank0_after", second_look))
+            if not announced_evt.wait(timeout=SPAWN_GRACE):
+                out.put(("rank0_after", "the candidate never announced itself"))
+            else:
+                second_look = pending_join(store, candidate_rank=2)
+                out.put(("rank0_after", second_look))
         else:
-            ready_evt.wait(timeout=15)
+            if not ready_evt.wait(timeout=SPAWN_GRACE):
+                out.put(("EXC", "rank 0 never opened the store"))
+                return
             store = dist.TCPStore(
                 "127.0.0.1", port, world_size=None, is_master=False, use_libuv=False
             )
@@ -83,7 +103,7 @@ def test_a_candidate_with_no_process_group_can_still_announce_itself():
     try:
         for _ in range(3):
             try:
-                key, value = out.get(timeout=20)
+                key, value = out.get(timeout=SPAWN_GRACE + 30)
             except Exception:
                 break
             messages[key] = value
