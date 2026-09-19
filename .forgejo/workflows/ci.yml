@@ -131,15 +131,42 @@ jobs:
         run: |
           . "$HOME/.cargo/env"
           pip install --quiet --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple torch
-          pip install --quiet maturin pytest
+          pip install --quiet maturin pytest pytest-xdist
           git clone --depth 1 \
             ${{ forgejo.server_url }}/${{ forgejo.repository_owner }}/moonclip.git /tmp/moonclip
           pip install --quiet /tmp/moonclip
           pip install --quiet -e .
           python -c "import moonclip; print('moonclip', moonclip.__version__)"
-          # With Moonclip present the backend tests stop skipping: this is the
-          # only job where the default write path is exercised at all.
-          pytest tests -v
+          # With Moonclip present the backend tests stop skipping: this is
+          # the only job where the default write path is exercised at all -
+          # and not only the tests that name Moonclip. `get_backend` falls
+          # back to `torch.save` when it is absent, so with it installed the
+          # *whole* suite writes by a different road. That is why this job
+          # runs all of it rather than a selection of it.
+          #
+          # **On four workers, because it had run out of room.** This job was
+          # cancelled at the ten-minute wall on every push from 6bc008c - the
+          # commit that added `test_outer_rendezvous.py` - while the last
+          # green before it finished at 9m37s, twenty-three seconds under.
+          # The suite is the cost and not the build: in a container with this
+          # runner's shape, building Moonclip takes 59 s and the whole setup
+          # 167.
+          #
+          # Two tests are half of what is left, and both of them mostly wait -
+          # for a node that died not to come back, and for enough steps to
+          # prove that a round will never close. They are in different files,
+          # so on separate workers their waits overlap instead of adding up:
+          # 258 s becomes 96 s, with the same 1017 passed and 45 skipped.
+          #
+          # `--dist loadfile`, not the default: these tests are isolated at
+          # the file - a store, a port, a working directory belong to the file
+          # that sets them up - so a file kept on one worker behaves as it
+          # does serially. `-n 4` is spelled out rather than `auto` because
+          # the label says four cores while a count read from the host would
+          # be larger. `OMP_NUM_THREADS=1` because four workers each taking
+          # four threads is how a parallel suite ends up slower than a serial
+          # one.
+          OMP_NUM_THREADS=1 pytest tests -v -n 4 --dist loadfile
 
   # What the unit suite structurally cannot reach: config discovery from the
   # working directory, a resume that starts from a genuinely empty interpreter,
