@@ -362,6 +362,30 @@
 
 ### Fixed
 
+- **A peer that is behind is waited for until the round's deadline, not for 30
+  seconds (GPU-120, under GPU-113).**
+
+  Found on two RunPod boxes, EU and US, on 2026-09-15 — the first real round
+  between continents. The American node spent 56 s in its first round; the
+  European one waited exactly 30 s for that report, closed round 1 without it
+  (*"closed without rank(s) 1"*), and the American node then found the European
+  report published and averaged it in. From that round the two held two
+  different models a fixed distance apart, and every later round closed "over 2
+  node(s)" as if nothing had happened.
+
+  The cause is `_recv_exactly`. The greeting's answer is held back until the
+  peer has the round, so that call is where a node ahead waits for one behind
+  — and every `recv` had a 30-second ceiling that *raised*, which `fetch` read
+  as "no report". A slice running out now means only "look at the deadline and
+  read again", and the limit is `outer_deadline` again: the number a user sets
+  for exactly this question. The slice is a module constant, `RECV_SLICE`, so a
+  test can shorten it — the new one sets it to 0.2 s against a peer one second
+  late, and without the fix it fails with the message seen on the boxes.
+
+  Still true, and not fixed here: a deadline that falls between A's report
+  reaching B and B's not reaching A produces the same asymmetry. It can now
+  only happen at `outer_deadline`, not at 30 s.
+
 - **An elastic regroup crashed on an image without NumPy, after the transfer
   had already been paid for (GPU-126).**
 
@@ -505,6 +529,15 @@
   was rented.
 
 ### Changed
+
+- **The Moonclip floor is `moonclip>=0.1.1`.**
+
+  This release uses two things that version is the first to have: `describe()`
+  reporting `hash_raw`, which is what the audit trail fingerprints a checkpoint
+  with, and a manifest persist that on Windows no longer costs the checkpoint
+  being written (GPU-128). Below the floor the audit trail records `null` where
+  the fingerprint belongs, so the requirement is declared rather than left to
+  be discovered one checkpoint at a time.
 
 - **One report directory per round, and the publish lock is gone (GPU-119).**
 
