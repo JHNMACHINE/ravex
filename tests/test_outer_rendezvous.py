@@ -236,7 +236,27 @@ def a_node(address, job, min_nodes, root, name, role, queue):
             outer_rendezvous=address,
             outer_job=job,
             outer_min_nodes=min_nodes,
-            outer_inner_steps=4,
+            # Not 4, and the number is the point. A joiner announces itself
+            # `JOIN_MARGIN` rounds ahead, so the whole exchange - the joiner
+            # reading which round the run is on, then writing its key, then
+            # every member reading that key at a round boundary - has two
+            # rounds to complete. On real hardware a round is seconds and that
+            # is a wide window.
+            #
+            # With four inner steps on a model this small it was 156 ms. The
+            # CI runner closed **191 rounds** while the third process was
+            # still importing torch, about 78 ms each, and the round trip did
+            # not fit: `MembershipError`, rank 2 announcing for round 191 and
+            # a node first seeing it at 191. Ravex was right to stop - a node
+            # that averaged a different set is two models, and it says so -
+            # but what it caught was this test running the outer loop faster
+            # than the machine answers a question about it.
+            #
+            # 256 costs seven seconds in this file, measured, and makes the
+            # window about 64 times what failed. Before changing it down,
+            # note that what matters is not the step count but that a round
+            # outlasts a store round trip on the slowest box this runs on.
+            outer_inner_steps=256,
             outer_root=os.path.join(workdir, "rounds"),
             outer_deadline=60,
             enabled=True,
