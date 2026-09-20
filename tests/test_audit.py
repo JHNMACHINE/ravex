@@ -286,6 +286,46 @@ class TestAWholeRun:
         assert [entry["step"] for entry in entries] == [3, 6]
         assert all(entry["fingerprint"] for entry in entries)
 
+    def test_the_writer_is_told_to_hash_before_the_first_save(self, tmp_path):
+        """The invariant the test above rests on, asserted without a race.
+
+        That test is the real scenario and it is the one that failed in CI, but
+        what it catches it catches by timing: the entry for step 3 is written
+        on the audit thread while the writer thread is pruning step 3's file,
+        and which of them gets there first decides whether the fingerprint is
+        a hash or `null`. On an idle machine the audit thread wins every time,
+        which is why this went unnoticed until a loaded runner ran it.
+
+        The cause is not the race, it is that the first checkpoint was hashed
+        from disk at all: the writer caches the hash between the rename and
+        the prune, but only once `fingerprints` is a dict, and that used to be
+        turned on by the first audit entry - after the first save had already
+        been written. So the assertion here is the ordering itself, and it
+        fails deterministically if the arming ever moves back.
+        """
+        from ravex._backends import TorchSaveBackend
+
+        config = RavexConfig()
+        config.storage.path = str(tmp_path)
+        config.audit_log = True
+        config._normalize()
+
+        assert TorchSaveBackend(config).fingerprints == {}, (
+            "the writer must be caching hashes before the first save, not from "
+            "the first audit entry onwards"
+        )
+
+    def test_a_run_with_no_audit_log_pays_for_no_hashing(self, tmp_path):
+        """And the other half: nobody asked, so the writer hashes nothing."""
+        from ravex._backends import TorchSaveBackend
+
+        config = RavexConfig()
+        config.storage.path = str(tmp_path)
+        config.audit_log = False
+        config._normalize()
+
+        assert TorchSaveBackend(config).fingerprints is None
+
     def test_a_moonclip_run_loses_no_checkpoint_and_records_what_moonclip_reports(
         self, storage
     ):

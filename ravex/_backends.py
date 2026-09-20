@@ -568,9 +568,24 @@ class TorchSaveBackend(CheckpointBackend):
         )
         self._pending: Optional[Future] = None
         self.store_root = self.directory
-        #: Step -> SHA-256 of its file, filled by the writer when the audit
-        #: trail asks for it (``None`` means nobody asked). See `_write`.
-        self.fingerprints: Optional[Dict[int, str]] = None
+        #: Step -> SHA-256 of its file, filled by the writer while the file
+        #: is certainly still there (``None`` means nobody will ask). See
+        #: `_write`.
+        #:
+        #: Armed here, from the config, and not at the first audit entry -
+        #: which is what it used to be, and it left a hole. `_record_audit`
+        #: builds the audit trail lazily and turns this dict on there, but it
+        #: runs *after* `save()` has returned, so the **first** checkpoint of
+        #: every audited run was written with this still `None` and never had
+        #: its hash taken. Its entry then fell back to hashing the file off
+        #: disk, and with `keep_last: 1` that file is deleted by the very next
+        #: write: a race the audit thread wins on an idle machine and loses on
+        #: a loaded one, leaving `fingerprint: null` in a record whose whole
+        #: purpose is to say what was written (GPU-93). The config knows from
+        #: the start whether anyone will ask, so it is asked from the start.
+        self.fingerprints: Optional[Dict[int, str]] = (
+            {} if getattr(config, "audit_log", False) else None
+        )
 
     def save(
         self, step: int, state: Dict[str, Any], metadata: Dict[str, str]
