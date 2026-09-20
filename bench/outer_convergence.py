@@ -46,6 +46,54 @@ included. Two extra arms:
     step. The arm reproduces it to show what it was worth, and the spread column
     is where it shows — see ``DeltaExchange.as_published``.
 
+**Nodes at different speeds, and why this is the arm that matters.** GPU-113
+says the one thing not already done elsewhere is heterogeneity — nodes five
+times apart in speed, nobody waiting for anybody — and that it is also where a
+mistake is silent: a badly weighted average does not crash, it converges worse.
+`ravex._dist.outer.combine` carries the derivation for why the plain mean
+already holds the work-proportionality (a delta is as large as the steps behind
+it), and `bench/outer_loop.py` compares the three modes with one node 5x
+slower.
+
+But that bench is a four-feature regression, and the comment on `combine` says
+of its own numbers that on iid shards `step_weighted` comes out ahead "not
+because the argument is wrong, it is the bench being blind": where every node
+draws from the same distribution, over-weighting the fast node has nothing to
+bias *toward*. Here there is something to bias toward — contiguous shards, a
+real corpus, nodes that have read different code — which makes this the place
+the comparison can mean something.
+
+`--speeds 1 0.2` gives node 1 a fifth of the round, and the section that opens
+runs each mode in `--combine` against a single-node baseline at **the tokens
+the group actually saw**, which is no longer `steps * nodes`: the slow node
+contributed less, and a baseline that pretends otherwise flatters the group
+with work nobody did.
+
+**Measured**, 2026-09-20, the skew arm: 2 nodes with node 1 at a fifth of the
+round, H=64, contiguous shards, 0.48M parameters, 1200 nominal local steps.
+Held-out cross entropy, nats per byte, three seeds:
+
+============== ======== ======== ========
+arm            seed 0   seed 1   seed 2
+============== ======== ======== ========
+one node, 1386  1.7535   1.7801   1.6610
+mean            1.9873   2.1301   1.9649
+step_weighted  **1.8602**  **1.9623**  **1.8545**
+normalized      2.5616   2.6466   2.6517
+============== ======== ======== ========
+
+**`step_weighted` wins all three**, by 0.13, 0.17 and 0.11, and the comparison
+is paired — same seed, same shards, same initialisation — so the spread between
+seeds does not enter it. That is the opposite of what `ravex._dist.outer.combine`
+argues and of what `bench/outer_loop.py` measured on the regression, and it is
+the reason this arm exists. What it does **not** say is that the derivation's
+algebra is wrong: it says the conclusion drawn from it, that the plain mean is
+the better default, does not survive a real task with data that differs per
+node. One skew ratio, one H, two nodes, 0.48M parameters — a direction.
+
+Every arm still loses to one node that saw the same tokens, by 0.11 to 0.18.
+Heterogeneity costs something whatever the average.
+
 **The cast arms are the slow ones.** Each writes both nodes' deltas to a
 moonclip store and reads them back, every round — which is the point, since a
 cast simulated in torch is not the cast that crosses the wire, but it means an
@@ -236,7 +284,7 @@ class Model(torch.nn.Module):
 
 
 def model_for(args, seed=5):
-    torch.manual_seed(seed)
+    torch.manual_seed(seed + 1000 * getattr(args, "seed", 0))
     return Model(dim=args.dim, depth=args.depth, heads=args.heads, block=args.block)
 
 
@@ -344,25 +392,42 @@ def spread(models):
     return worst
 
 
-def run(shards, args, inner, dtype=None, feedback=False, own="published"):
-    """N nodes on one process, exchanging every ``inner`` steps."""
+def steps_per_round(inner, speeds, count):
+    """How many local steps each node gets through in one round.
+
+    A round ends on a clock, not on a step count - that is the whole of
+    GPU-113's first point - so a node at half the speed does half the steps and
+    hands in a delta half the size. ``speeds`` is that ratio, and the fastest
+    node is the one that defines ``inner``.
+    """
+    if not speeds:
+        return [inner] * count
+    return [max(1, int(round(inner * speed))) for speed in speeds]
+
+
+def run(shards, args, inner, dtype=None, feedback=False, own="published",
+        speeds=None, combine_mode="mean"):
+    """N nodes on one process, exchanging every ``inner`` steps of the fastest."""
     base = model_for(args)
     models = [copy.deepcopy(base) for _ in shards]
     optimizers = [
         torch.optim.AdamW(model.parameters(), lr=args.lr) for model in models
     ]
+    locals_ = steps_per_round(inner, speeds, len(shards))
     loops = [
         OuterLoop(
             models[index],
-            inner_steps=inner,
+            inner_steps=locals_[index],
             lr=args.outer_lr,
             momentum=args.outer_momentum,
             node=str(index),
+            combine_mode=combine_mode,
         )
         for index in range(len(shards))
     ]
     generators = [
-        torch.Generator().manual_seed(100 + index) for index in range(len(shards))
+        torch.Generator().manual_seed(100 + index + 1000 * getattr(args, "seed", 0))
+        for index in range(len(shards))
     ]
 
     root = tempfile.mkdtemp(prefix="ravex-convergence-")
@@ -371,9 +436,9 @@ def run(shards, args, inner, dtype=None, feedback=False, own="published"):
         for round_number in range(max(1, args.steps // inner)):
             mine = []
             for index, shard in enumerate(shards):
-                train(models[index], optimizers[index], shard, inner, args,
-                      generators[index])
-                for _ in range(inner):
+                train(models[index], optimizers[index], shard, locals_[index],
+                      args, generators[index])
+                for _ in range(locals_[index]):
                     loops[index].record_step()
                 mine.append(loops[index].contribution())
 
@@ -408,7 +473,8 @@ def alone(shard, args, steps):
     """One node, one model, no rounds."""
     model = model_for(args)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    train(model, optimizer, shard, steps, args, torch.Generator().manual_seed(100))
+    train(model, optimizer, shard, steps, args,
+          torch.Generator().manual_seed(100 + 1000 * getattr(args, "seed", 0)))
     return model
 
 
@@ -428,6 +494,18 @@ def main():
     parser.add_argument("--iid", action="store_true",
                         help="interleave the shards instead of splitting the "
                              "corpus into blocks")
+    parser.add_argument("--seed", type=int, default=0,
+                        help="shifts the model init and every batch stream. A "
+                             "bench that cannot be re-run with another seed "
+                             "cannot tell a finding from noise")
+    parser.add_argument("--speeds", type=float, nargs="+", default=None,
+                        metavar="RATIO",
+                        help="one ratio per node: how much of the round each "
+                             "gets through. `--speeds 1 0.2` is a node five "
+                             "times slower. Adds the heterogeneity section")
+    parser.add_argument("--combine", type=str, nargs="+",
+                        default=["mean", "step_weighted", "normalized"],
+                        help="which outer averages to compare in that section")
     parser.add_argument("--own-delta", type=str, default="published",
                         choices=("published", "exact", "both"),
                         help="whether a node averages its own delta as its "
@@ -499,6 +577,38 @@ def main():
                 models = run(shards, args, inner, dtype=cast,
                              feedback=feedback, own=own)
                 report(label, models[0], models, time.perf_counter() - started)
+
+    if args.speeds:
+        if len(args.speeds) != args.nodes:
+            parser.error("--speeds wants one ratio per node: %d given, %d nodes"
+                         % (len(args.speeds), args.nodes))
+        print()
+        print("nodes at different speeds: %s"
+              % ", ".join("node %d at %.2f" % (i, s)
+                          for i, s in enumerate(args.speeds)))
+
+        for inner in args.h:
+            locals_ = steps_per_round(inner, args.speeds, args.nodes)
+            rounds = max(1, args.steps // inner)
+            totals = [count * rounds for count in locals_]
+            print("H=%d: %s local steps per round, %s in the whole run"
+                  % (inner, locals_, totals), flush=True)
+
+            # The honest baseline for a lopsided group is the tokens the group
+            # actually saw, which is no longer `steps * nodes`: the slow node
+            # contributed less, and a baseline that pretends otherwise flatters
+            # the group by giving it credit for work nobody did.
+            started = time.perf_counter()
+            model = alone(torch.cat(shards), args, sum(totals))
+            report("H=%-5d one node, %d steps" % (inner, sum(totals)), model,
+                   None, time.perf_counter() - started)
+
+            for mode in args.combine:
+                started = time.perf_counter()
+                models = run(shards, args, inner, speeds=args.speeds,
+                             combine_mode=mode)
+                report("H=%-5d skewed %s" % (inner, mode), models[0], models,
+                       time.perf_counter() - started)
 
     if args.json:
         with open(args.json, "w", encoding="utf-8") as handle:
