@@ -44,8 +44,16 @@
   reaches its port can read the job token — so it belongs on a private network.
   It is still a single point, moved off a rented GPU, and restarting it loses
   the job's state. A run that has lost one of its starting nodes still cannot
-  take a new one, because the lost node never acknowledges. And a node is one
-  process: FSDP inside a box under the outer loop is not part of this.
+  take a new one, because the lost node never acknowledges. And a machine that
+  disappears **between publishing a round and the last peer fetching it**
+  leaves the survivors having averaged different sets of contributions, which
+  is two models a fixed distance apart for the rest of the run, silently — the
+  same failure `adopt_outer_state` prevents, through a door the protocol does
+  not close yet (GPU-140). A node that stops on its own waits for its peers to
+  take its last round before it shuts its listener, so an announced preemption
+  — SIGTERM, which is how a spot instance goes — is covered; a kernel panic or
+  a cut cable is not. And a node is one process: FSDP inside a box under the
+  outer loop is not part of this.
 
 - **An audit trail of checkpoints: `audit_log: true` (GPU-93).**
 

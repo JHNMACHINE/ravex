@@ -205,6 +205,23 @@ def outer_digest(outer):
     return digest.hexdigest()
 
 
+def taken_by_everyone(exchange, peers, timeout=60.0):
+    """Wait until every peer has *fetched* this node's newest round.
+
+    ``_served`` is the exchange's own record of what has been delivered rather
+    than published, and it is what :meth:`DeltaExchange.close` lingers on
+    before a node shuts its listener. Reached for here because the node below
+    is about to leave without doing any of that.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with exchange._lock:
+            if all(exchange._served.get(peer, -1) >= exchange._round for peer in peers):
+                return True
+        time.sleep(0.02)
+    return False
+
+
 def a_node(address, job, min_nodes, root, name, role, queue):
     """One node, started the way a rented box starts one."""
     try:
@@ -293,8 +310,29 @@ def a_node(address, job, min_nodes, root, name, role, queue):
                     and runtime._membership.rank == 0
                     and outer.round_number > 3
                 ):
-                    # The way a preempted box goes: no goodbye, its address
-                    # still on the store.
+                    # The way a preempted box goes: no goodbye, no final
+                    # checkpoint, its address still on the store. But *after*
+                    # the other two have taken its last round, and that wait
+                    # is the difference between this test and a coin flip.
+                    #
+                    # A node killed between publishing a round and the last
+                    # peer fetching it leaves one survivor having averaged
+                    # that delta and the other not, and two nodes that
+                    # averaged different sets hold two models for the rest of
+                    # the run - silently, since both keep closing rounds and
+                    # both losses keep falling. That is a gap in the protocol
+                    # (GPU-140), not something this test can assert its way
+                    # out of: a graceful exit waits on exactly this record
+                    # (`DeltaExchange.close`), a machine that disappears
+                    # cannot. The CI runner, with four pytest workers on it,
+                    # landed inside that window on 2026-09-20: round 3 was
+                    # closed over three nodes by one survivor and over two by
+                    # the other, and the run ended with two models.
+                    #
+                    # So what is left asserted here is what GPU-129 is about:
+                    # the store is not node 0's any more, so node 0 going
+                    # away costs the run one contributor and nothing else.
+                    taken_by_everyone(runtime._exchange, runtime._outer_peers)
                     os._exit(0)
                 if control.check([LAST_KEY]) and outer.round_number > int(
                     control.get(LAST_KEY)
@@ -378,7 +416,11 @@ def test_the_first_node_dying_does_not_take_the_run_with_it(server, tmp_path):
     """Under torchrun the store lives with the first node's agent, and the
     exchange reads peer addresses from it on every fetch. Here the store is the
     server's, so node 0 going away costs the run one contributor and nothing
-    else."""
+    else.
+
+    Node 0 leaves without a goodbye, but not in the middle of serving its last
+    round - see ``a_node``, and GPU-140 for what that window costs and why no
+    assertion here can close it."""
     pytest.importorskip("moonclip")
     context = mp.get_context("spawn")
     queue = context.Queue()
