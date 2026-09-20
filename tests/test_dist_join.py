@@ -50,11 +50,40 @@ class Plan:
         self.last_round = None
 
 
+def serve_until_everyone_is_done(finished):
+    """Hold this node's exchange open until the last node has its last round.
+
+    Every node closes its exchange when its own loop ends, and a node that has
+    closed does not serve - which is correct, and `test_dist_round` leans on
+    it. But here all three are meant to be present for every round up to
+    `plan.last_round`, and they were only kept that way by `linger=5`: the
+    fastest node finished, lingered five seconds, and left.
+
+    On a CI runner that starves a thread for longer than that, rank 1 came
+    back for round 14 and found ranks 0 and 2 gone. It closed that round over
+    its own delta alone - "Round 14 closed without rank(s) 0, 2" - and ended
+    holding a model the other two did not, which is what
+    `test_every_node_including_the_one_that_joined_holds_one_model` then
+    reported as a divergence. The other test in this file saw the same moment
+    from the other side, as a member counting two nodes in the last round
+    instead of three.
+
+    So the barrier, rather than a longer linger: the round every node is
+    asserted to have shared is a round no node may walk out of, and how slow
+    the slowest thread is stops being part of the test.
+    """
+    try:
+        finished.wait(timeout=120)
+    except threading.BrokenBarrierError:  # pragma: no cover - a node already failed
+        pass
+
+
 class Member(threading.Thread):
     """One of the nodes the run started with."""
 
-    def __init__(self, rank, store, shard, plan, inner, root):
+    def __init__(self, rank, store, shard, plan, inner, root, finished):
         super().__init__(daemon=True)
+        self.finished = finished
         self.rank = rank
         self.store = store
         self.shard = shard
@@ -103,14 +132,16 @@ class Member(threading.Thread):
         except BaseException as exc:
             self.error = exc
         finally:
+            serve_until_everyone_is_done(self.finished)
             self.exchange.close(linger=5)
 
 
 class Joiner(threading.Thread):
     """The node that was not there when the run started."""
 
-    def __init__(self, rank, store, shard, rounds, inner, root, plan, after=0.0):
+    def __init__(self, rank, store, shard, rounds, inner, root, plan, finished, after=0.0):
         super().__init__(daemon=True)
+        self.finished = finished
         self.rank = rank
         self.store = store
         self.shard = shard
@@ -169,6 +200,7 @@ class Joiner(threading.Thread):
                 # A join that never happened still has to release the members,
                 # or they run to the cap waiting for a round that is not coming.
                 self.plan.last_round = -1
+            serve_until_everyone_is_done(self.finished)
             self.exchange.close(linger=5)
 
 
@@ -181,13 +213,14 @@ def a_run(root, cap=40, inner=6, joiner_rounds=3, after=0.3):
         for i in range(3)
     ]
     plan = Plan(cap)
+    finished = threading.Barrier(BASE_WORLD + 1)
     members = [
-        Member(rank, store, shards[rank], plan, inner, root)
+        Member(rank, store, shards[rank], plan, inner, root, finished)
         for rank in range(BASE_WORLD)
     ]
     joiner = Joiner(
         BASE_WORLD, store, shards[BASE_WORLD], joiner_rounds, inner, root,
-        plan, after=after,
+        plan, finished, after=after,
     )
 
     for node in members + [joiner]:
@@ -300,8 +333,9 @@ def test_a_joiner_publishes_nothing_until_every_member_acknowledged(tmp_path):
     root = str(tmp_path)
 
     plan = Plan(40)
+    finished = threading.Barrier(BASE_WORLD + 1)
     members = [
-        Member(rank, store, (x[:half], y[:half]), plan, 6, root)
+        Member(rank, store, (x[:half], y[:half]), plan, 6, root, finished)
         for rank in range(BASE_WORLD)
     ]
     # Rank 1 takes announcements in but never writes an acknowledgement: the
@@ -310,7 +344,8 @@ def test_a_joiner_publishes_nothing_until_every_member_acknowledged(tmp_path):
     members[1].membership.acknowledged_joiners.add(BASE_WORLD)
 
     joiner = Joiner(
-        BASE_WORLD, store, (x[half:], y[half:]), 2, 6, root, plan, after=0.4
+        BASE_WORLD, store, (x[half:], y[half:]), 2, 6, root, plan, finished,
+        after=0.4,
     )
     joiner_deadline_hit = []
 
