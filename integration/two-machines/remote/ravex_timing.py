@@ -52,7 +52,16 @@ def install():
         return
     _sink = _Sink(_OUT)
 
-    from ravex import _backends, _replication, _runtime
+    from ravex import _backends, _runtime
+
+    # `ravex._replication` until GPU-105, when the replication transport moved
+    # under `_dist` and its manifest arithmetic went to Rust. This import is
+    # the whole of GPU-130: the kit is not installed with the package and no
+    # test imports it, so nothing said the name had gone - it said it on a
+    # rented box, at the start of a session that had already been paid for.
+    # `encoded_size` and `exchange_stores` are both still here, the first now
+    # re-exported from the compiled core.
+    from ravex._dist import replication as _replication
 
     original_consolidate = _backends.MoonclipBackend.consolidate
 
