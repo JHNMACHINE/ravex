@@ -362,6 +362,27 @@
 
 ### Fixed
 
+- **The first checkpoint of an audited run had no fingerprint of its own, and
+  with `keep_last: 1` could end up with none at all (GPU-93).**
+
+  The `torch_save` writer hashes each file between the rename and the prune,
+  on purpose: the prune may delete the *previous* file, and with `keep_last: 1`
+  the audit trail would otherwise go looking for a checkpoint that is no longer
+  there. But it only did so once the cache it writes into existed, and that was
+  created when the first audit entry was recorded — after the first save had
+  already been written. So the first checkpoint of every audited run was never
+  hashed by the writer.
+
+  Its entry then fell back to hashing the file off disk, which is a race
+  against the very next write's prune: won on an idle machine, which is why
+  this went unseen, and lost on a loaded CI runner, where the entry was written
+  as `fingerprint: null` with `fingerprint_kind: "unavailable"`. A compliance
+  record that cannot say what was written is the one thing this feature exists
+  to prevent.
+
+  The cache is now armed from `audit_log` when the backend is built, before any
+  save. A run with the audit trail off still hashes nothing.
+
 - **A peer that is behind is waited for until the round's deadline, not for 30
   seconds (GPU-120, under GPU-113).**
 
