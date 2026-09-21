@@ -45,9 +45,15 @@ import torch.nn as nn
 #: rendered text so the numbers arrive unrounded.
 ROUND_LINE = "Outer round %d took %.1fs over %d node(s)"
 
+#: In the order ``_close_outer_round`` passes them. Zipped against the
+#: record's args, so a field the runtime adds has to be added here in its
+#: place: when GPU-140 put `decide` and `recover` before `apply`, a list that
+#: had not moved would have read the decision time as the outer step, with
+#: nothing to say so.
 FIELDS = (
     "round", "total_seconds", "nodes", "gather_seconds", "gather_wait_seconds",
-    "delta_seconds", "publish_seconds", "publish_wait_seconds", "apply_seconds",
+    "delta_seconds", "publish_seconds", "publish_wait_seconds",
+    "decide_seconds", "recover_seconds", "apply_seconds",
 )
 
 
@@ -114,6 +120,11 @@ class Rounds(logging.Handler):
     def emit(self, record):
         message = record.msg if isinstance(record.msg, str) else ""
         if message.startswith(ROUND_LINE) and record.args:
+            if len(record.args) != len(FIELDS):
+                raise RuntimeError(
+                    "the runtime's round line has %d fields and this reads %d; "
+                    "update FIELDS" % (len(record.args), len(FIELDS))
+                )
             entry = dict(zip(FIELDS, record.args))
             entry["at"] = time.time()
             self.seen.append(entry)
@@ -424,14 +435,15 @@ def main():
         json.dump(payload, handle, indent=2)
 
     print()
-    print("round  nodes   total   network  (waiting)   delta  publish   apply")
+    print("round  nodes   total   network  (waiting)   delta  publish  decide  recover   apply")
     for entry in rounds.seen:
         print(
-            "%5d  %5d  %6.2f  %8.2f  %9.2f  %6.2f  %7.2f  %6.2f"
+            "%5d  %5d  %6.2f  %8.2f  %9.2f  %6.2f  %7.2f  %6.2f  %7.2f  %6.2f"
             % (
                 entry["round"], entry["nodes"], entry["total_seconds"],
                 entry["gather_seconds"], entry["gather_wait_seconds"],
                 entry["delta_seconds"], entry["publish_seconds"],
+                entry["decide_seconds"], entry["recover_seconds"],
                 entry["apply_seconds"],
             )
         )

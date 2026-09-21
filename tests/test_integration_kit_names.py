@@ -121,3 +121,40 @@ def test_every_ravex_name_the_kit_uses_exists(source):
         source.relative_to(KIT).as_posix(),
         "\n".join(sorted(set(missing))),
     )
+
+
+def test_the_kit_reads_the_round_line_the_runtime_writes():
+    """``outer_run.py`` zips the round log record's args against ``FIELDS``.
+
+    A field the runtime adds shifts every name after it, silently: when
+    GPU-140 added the decision and the recovery before the outer step, the
+    kit would have reported the decision time as ``apply_seconds``. Read from
+    both sources, so neither has to be imported.
+    """
+    runtime = ast.parse((KIT.parent / "ravex" / "_runtime.py").read_text(encoding="utf-8"))
+    kit = ast.parse((KIT / "two-machines" / "remote" / "outer_run.py").read_text(encoding="utf-8"))
+
+    template = None
+    for node in ast.walk(kit):
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "ROUND_LINE" for t in node.targets
+        ):
+            template = node.value.value
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "FIELDS" for t in node.targets
+        ):
+            fields = [element.value for element in node.value.elts]
+
+    calls = [
+        node for node in ast.walk(runtime)
+        if isinstance(node, ast.Call)
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and isinstance(node.args[0].value, str)
+        and node.args[0].value.startswith(template)
+    ]
+    assert len(calls) == 1, "the runtime's round line was not found"
+    assert len(calls[0].args) - 1 == len(fields), (
+        "the runtime logs %d values per round and outer_run.py names %d"
+        % (len(calls[0].args) - 1, len(fields))
+    )
