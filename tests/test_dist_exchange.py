@@ -45,6 +45,10 @@ class FakeStore:
         with self.lock:
             return all(key in self.values for key in keys)
 
+    def delete_key(self, key):
+        with self.lock:
+            return self.values.pop(key, None) is not None
+
     def compare_set(self, key, expected, desired):
         """``TCPStore``'s semantics, checked against one on 2026-09-21: with
         ``expected`` empty the first writer wins and every later caller gets
@@ -599,3 +603,39 @@ def test_the_decision_holds_on_a_real_tcpstore_with_racing_proposers():
     assert len(decided) == 1, "the proposers disagree: %s" % decided
     members, by = next(iter(answers.values()))
     assert members == [by]
+
+
+def test_old_decisions_leave_the_store_and_recent_ones_stay():
+    """GPU-142: one key per round for the life of a run is not a leak worth
+    having on a server that outlives the run."""
+    from ravex._dist.exchange import (
+        APPLIED_KEY, KEEP_DECISIONS, ROUND_SET_KEY, _job_digest, decide_round,
+    )
+
+    store = FakeStore()
+    exchange = DeltaExchange(0, store, root=".", node="n0")
+    exchange.secret = b"t"
+    digest = _job_digest(b"t")
+    for round_number in range(1, KEEP_DECISIONS + 3):
+        decide_round(store, b"t", round_number, 0, {0}, time.monotonic() + 1)
+        exchange.applied(round_number)
+
+    assert not store.check([ROUND_SET_KEY % (digest, 1)])
+    assert not store.check([APPLIED_KEY % (digest, 2, 0)])
+    assert store.check([ROUND_SET_KEY % (digest, 3)])
+    assert store.check([APPLIED_KEY % (digest, KEEP_DECISIONS + 2, 0)])
+
+
+def test_a_member_that_left_is_not_waited_for_and_not_asked():
+    from ravex._dist.membership import Membership, acknowledge, acknowledged, leave
+
+    store = FakeStore()
+    acknowledge(store, 0, 5, 9)
+    assert acknowledged(store, 5, [0, 1, 2]) == [1, 2]
+    leave(store, 2, 7)
+    assert acknowledged(store, 5, [0, 1, 2]) == [1], (
+        "a joiner must not wait for a number that declared itself gone"
+    )
+
+    membership = Membership(store, 0, 3)
+    assert membership.peers_at(8) == [1]

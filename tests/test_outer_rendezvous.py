@@ -230,6 +230,22 @@ def die_after_serving_one(exchange, round_number):
     exchange._hold, exchange._release = hold, release
 
 
+def split_off_next_round(exchange):
+    """Make this node miss every report of the next round, and every relay.
+
+    It still publishes its own, so the others decide the round over all three
+    and apply it; this node cannot, and the only thing left that keeps it on
+    their model is to leave and come back (GPU-142). The two seconds are what
+    make the others decide first.
+    """
+    def gather_by_rank(peers, round_number, expected, deadline):
+        time.sleep(2.0)
+        return {}
+
+    exchange.gather_by_rank = gather_by_rank
+    exchange.recover = lambda *args, **kwargs: None
+
+
 def a_node(address, job, min_nodes, root, name, role, queue):
     """One node, started the way a rented box starts one."""
     try:
@@ -333,6 +349,14 @@ def a_node(address, job, min_nodes, root, name, role, queue):
                     # survivor missing a report gets it relayed by the one
                     # that has it, so they still end on one model.
                     die_after_serving_one(runtime._exchange, 3)
+                    armed = True
+                if (
+                    role == "splits"
+                    and runtime._membership.rank == 2
+                    and outer.round_number == 3
+                    and not armed
+                ):
+                    split_off_next_round(runtime._exchange)
                     armed = True
                 if control.check([LAST_KEY]) and outer.round_number > int(
                     control.get(LAST_KEY)
@@ -448,3 +472,39 @@ def test_the_first_node_dying_does_not_take_the_run_with_it(server, tmp_path):
         assert last == 8, "node %s stopped at round %s" % (name, last)
         assert rounds_over(said, 3), "node %s never had all three nodes" % name
         assert rounds_over(said, 2), "node %s never closed a round without node 0" % name
+
+
+@pytest.mark.skipif(sys.platform == "darwin", reason="spawn is slow on macOS")
+def test_a_node_that_falls_off_the_model_rejoins_without_a_relaunch(server, tmp_path):
+    """GPU-142, end to end: node 2 cannot average round 3, which the others
+    decided over all three. It declares its number gone, takes a new one, comes
+    back in through the join, and the run ends on one model - with the
+    training script never having stopped."""
+    pytest.importorskip("moonclip")
+    context = mp.get_context("spawn")
+    queue = context.Queue()
+    job = "splits"
+    rendezvous.connect(server, job + ".control").set(LAST_KEY, b"9")
+    nodes = [
+        context.Process(
+            target=a_node, args=(server, job, 3, str(tmp_path), name, "splits", queue)
+        )
+        for name in ("a", "b", "c")
+    ]
+    for node in nodes:
+        node.start()
+    try:
+        results = collect(queue, 3)
+    finally:
+        for node in nodes:
+            node.join(60)
+
+    digests = {name: digest for name, (digest, _, _) in results.items()}
+    assert len(set(digests.values())) == 1, (
+        "the nodes ended holding different models: %s" % digests
+    )
+    rejoined = [
+        name for name, (_, _, said) in results.items()
+        if any("Rejoined the run as node" in line for line in said)
+    ]
+    assert len(rejoined) == 1, results

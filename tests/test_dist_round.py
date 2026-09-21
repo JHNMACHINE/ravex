@@ -76,6 +76,7 @@ class Node(threading.Thread):
             node="n%d" % rank, patience=15.0, save_dtype=save_dtype,
         )
         self.loop = None
+        self.on_loop = None
         self.reports = []
         self.error = None
 
@@ -83,6 +84,8 @@ class Node(threading.Thread):
         try:
             assert self.exchange.start()
             self.loop = OuterLoop(self.model, inner_steps=self.inner, node="n%d" % self.rank)
+            if self.on_loop is not None:
+                self.on_loop(self.loop)
             optimizer = None
             for round_number in range(self.rounds):
                 if self.dies_after is not None and round_number >= self.dies_after:
@@ -287,6 +290,66 @@ def test_a_node_that_cannot_get_the_decided_set_stops_instead_of_diverging(tmp_p
     assert nodes[1].reports == [], "it applied a round it could not agree on"
     assert nodes[0].error is None
     assert nodes[0].reports[0]["nodes"] == 2
+
+
+def test_a_node_that_cannot_compute_its_delta_still_takes_the_others_step(tmp_path):
+    """GPU-142: a failure before the decision used to skip the round on this
+    node alone - the others took the step, this one did not, two models. Now
+    it offers nothing, is left out of the set, and applies the others'."""
+    store = FakeStore()
+    nodes = [Node(r, store, shard, 3, 10, 2, str(tmp_path), deadline=5)
+             for r, shard in enumerate(two_halves(2))]
+
+    failed = []
+
+    def install():
+        original = nodes[1].loop.contribution
+
+        def contribution():
+            if not failed:
+                failed.append(nodes[1].loop.round_number)
+                raise RuntimeError("a bug of ours")
+            return original()
+
+        nodes[1].loop.contribution = contribution
+
+    nodes[1].on_loop = lambda loop: install()
+
+    run_all(nodes)
+    for node in nodes:
+        if node.error is not None:
+            raise node.error
+
+    assert failed, "the failure was never injected"
+    assert [r["nodes"] for r in nodes[0].reports] == [r["nodes"] for r in nodes[1].reports]
+    assert 1 in [r["nodes"] for r in nodes[1].reports], "rank 1 was not left out"
+    same_model(*nodes)
+
+
+def test_a_step_that_fails_after_the_decision_is_a_split_not_a_skip():
+    """After the decision the others are applying the round: a node that
+    cannot is off their model, and says so instead of carrying on."""
+    from types import SimpleNamespace
+
+    from ravex._dist.exchange import RoundSplitError
+
+    class Loop:
+        round_number = 1
+        outer = {}
+
+        def contribution(self):
+            return SimpleNamespace(delta={}, steps=1)
+
+        def apply(self, contributions):
+            raise RuntimeError("out of memory")
+
+    exchange = SimpleNamespace(
+        rank=0, store=FakeStore(), secret=b"t", publish_wait=0.0, gather_wait=0.0,
+        publish=lambda *a: None, as_published=lambda delta, *a: delta,
+        gather_by_rank=lambda *a: {}, decided=lambda *a: None, applied=lambda *a: None,
+    )
+    with pytest.raises(RoundSplitError, match="could not apply round 1"):
+        close_round(Loop(), exchange, [], time.monotonic() + 1)
 
 
 def test_nodes_at_different_speeds_still_agree_on_one_model(tmp_path):

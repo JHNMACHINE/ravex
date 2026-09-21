@@ -654,7 +654,7 @@ class RavexRuntime:
         """
         from ravex._dist.agreement import rendezvous_store
         from ravex._dist.collectives import get_rank, get_world_size
-        from ravex._dist.exchange import SEED_ROUND, DeltaExchange, adopt_outer_state
+        from ravex._dist.exchange import SEED_ROUND, adopt_outer_state
         from functools import partial
 
         from ravex._dist import rendezvous as _rendezvous
@@ -711,18 +711,7 @@ class RavexRuntime:
         root = self.config.outer_root or os.path.join(
             self.config.storage.path, "rounds", str(rank)
         )
-
-        exchange = DeltaExchange(
-            rank,
-            store,
-            root=root,
-            node=str(rank),
-            compression_level=self.config.compression_level,
-            save_dtype=self.config.outer_save_dtype,
-            route_toward=_rendezvous.parse_address(address)[0] if address else None,
-        )
-        if not exchange.start():
-            raise RuntimeError("the round exchange could not open its listener")
+        exchange = self._open_exchange(rank, store, root)
         self._exchange = exchange
 
         loop = OuterLoop(
@@ -795,6 +784,98 @@ class RavexRuntime:
             root,
         )
         return loop
+
+    def _open_exchange(self, rank, store, root):
+        from ravex._dist import rendezvous as _rendezvous
+        from ravex._dist.exchange import DeltaExchange
+
+        address = self.config.outer_rendezvous
+        exchange = DeltaExchange(
+            rank,
+            store,
+            root=root,
+            node=str(rank),
+            compression_level=self.config.compression_level,
+            save_dtype=self.config.outer_save_dtype,
+            route_toward=_rendezvous.parse_address(address)[0] if address else None,
+        )
+        if not exchange.start():
+            raise RuntimeError("the round exchange could not open its listener")
+        return exchange
+
+    def _leave_and_rejoin(self, cause: Exception) -> None:
+        """This node cannot stay on the run's model: leave it, and come back.
+
+        GPU-142. Reached when a round was decided over a set this node cannot
+        average, or when anything else went wrong in a round in a way that
+        leaves it unknown whether this node took the step the others took.
+        Carrying on is two models; the only other honest outcome used to be
+        stopping the training script.
+
+        With a rendezvous of Ravex's own, a node can instead do what a
+        relaunched one would: declare its number gone (`membership.leave`, so
+        joins stop waiting for its acknowledgement), take a new number, and
+        come in through `membership.join`, which hands it the outer parameters
+        and momentum every member holds. The training loop sees a pause.
+
+        Under torchrun a rank is fixed for the life of the group and there is
+        no new number to take, so there it stops, and torchrun's own restart is
+        what brings it back.
+        """
+        from functools import partial
+
+        from ravex._dist import rendezvous as _rendezvous
+        from ravex._dist.membership import Membership, leave
+        from ravex._dist.membership import join as join_run
+
+        if not self.config.outer_rendezvous or self.store_for_joins is None:
+            raise cause
+        store = self.store_for_joins
+        old = self._membership.rank
+        base = self._membership.base_world
+        logger.warning(
+            "Leaving the run as node %d at round %d and rejoining under a new "
+            "number: %s",
+            old, self._outer.round_number, cause,
+        )
+        try:
+            leave(store, old, self._outer.round_number)
+        except Exception as exc:
+            logger.warning("Could not declare node %d gone: %s", old, exc)
+        # Lingering first: a peer may still need a report relayed from here.
+        try:
+            self._exchange.close(
+                linger=min(60, self.config.outer_deadline), expect=self._outer_peers
+            )
+        except Exception:
+            pass
+
+        node = _rendezvous.register(store)
+        membership = Membership(
+            store, node, base, ceiling=partial(_rendezvous.registered, store)
+        )
+        root = (
+            os.path.join(self.config.outer_root, "node%d" % node)
+            if self.config.outer_root
+            else os.path.join(self.config.storage.path, "rounds", str(node))
+        )
+        exchange = self._open_exchange(node, store, root)
+        self._exchange = exchange
+        self._outer.node = str(node)
+        deadline = time.monotonic() + self.config.outer_deadline
+        if not join_run(
+            store, exchange, self._outer, node, base, deadline,
+            window=membership.span(),
+        ):
+            exchange.close()
+            raise cause
+        membership.take_in_joined()
+        self._membership = membership
+        self._outer_joined = True
+        self._outer_peers = membership.peers_at(self._outer.round_number)
+        logger.warning(
+            "Rejoined the run as node %d at round %d.", node, self._outer.round_number
+        )
 
     def _join_rendezvous(self, address):
         """Reach a ``ravex rendezvous`` and take a node number there (GPU-129).
@@ -871,18 +952,22 @@ class RavexRuntime:
     def _close_outer_round(self) -> None:
         """Exchange deltas with the peers and take the outer step.
 
-        Never raises. A round that could not be closed leaves the model exactly
-        where the local training put it and the next round carries on from
-        there — which is worse than a round that worked and is very much better
-        than a training script that stops because a peer's disk was full.
+        A round has two acceptable outcomes for a node, and only two (GPU-140,
+        GPU-142): it applies exactly the set the store decided, or it leaves
+        the run. Skipping the step while the others take it - which is what
+        this used to do on any failure, calling it a lost round - is a second
+        model. So anything that goes wrong before the decision is absorbed
+        (`close_round` then offers nothing and applies the others'), and
+        anything that leaves this node off the others' model goes to
+        :meth:`_leave_and_rejoin`.
         """
-        from ravex._dist.exchange import close_round
+        from ravex._dist.exchange import RoundSplitError, close_round
         from ravex._dist.membership import MembershipError, serve_joins
 
         if not self._outer or self._exchange is None:
             return
+        started = time.monotonic()
         try:
-            started = time.monotonic()
             if self._membership is not None:
                 # At the boundary, before the round's own work: writing the
                 # outer parameters down for a candidate and taking in an
@@ -893,61 +978,70 @@ class RavexRuntime:
                     # protocol takes the state and the acknowledgements from
                     # the base members (`membership.acknowledged`), so a node
                     # that joined itself would write snapshots nobody asks for.
-                    serve_joins(
-                        self.store_for_joins, self._exchange, self._outer,
-                        self._membership,
+                    try:
+                        serve_joins(
+                            self.store_for_joins, self._exchange, self._outer,
+                            self._membership,
+                        )
+                    except MembershipError:
+                        raise
+                    except Exception as exc:
+                        # A joiner waits for every acknowledgement and takes
+                        # state from any member, so one member failing here
+                        # costs it a retry, not a split.
+                        logger.warning("Could not serve joins this round: %s", exc)
+                try:
+                    self._outer_peers = self._membership.peers_at(
+                        self._outer.round_number
                     )
-                self._outer_peers = self._membership.peers_at(
-                    self._outer.round_number
-                )
+                except MembershipError:
+                    raise
+                except Exception as exc:
+                    # Last round's peers. Who is asked no longer decides what
+                    # is averaged; the store does.
+                    logger.warning("Could not refresh the peer set: %s", exc)
             report = close_round(
                 self._outer,
                 self._exchange,
                 self._outer_peers,
                 time.monotonic() + self.config.outer_deadline,
             )
-            # The split, not just the total. On loopback this line read
-            # "took 0.0s" every time, which is the one number the whole
-            # architecture is chosen around and it was never observed - see
-            # `close_round` and GPU-117. `network` is what a slower link makes
-            # bigger; the rest is the model's size, not the link's speed.
-            logger.info(
-                "Outer round %d took %.1fs over %d node(s): %.1fs network "
-                "(%.1fs of it waiting for a peer to reach the round), "
-                "%.1fs delta, %.1fs publish (%.1fs waiting on a fetch), "
-                "%.1fs outer step.",
-                report["round"],
-                time.monotonic() - started,
-                report["nodes"],
-                report.get("gather_seconds", 0.0),
-                report.get("gather_wait_seconds", 0.0),
-                report.get("delta_seconds", 0.0),
-                report.get("publish_seconds", 0.0),
-                report.get("publish_wait_seconds", 0.0),
-                report.get("apply_seconds", 0.0),
-            )
-        except MembershipError:
-            # **Not swallowed like the rest.** Every other failure here leaves
-            # this node's own parameters where its training put them and costs
-            # the run one round; this one says the averages have already
-            # differed between nodes, so there is no round to carry on to and
-            # the honest thing is to stop rather than keep training a second
-            # model that looks like the first.
-            #
-            # `RoundSplitError` (GPU-140) is one of these: the round was
-            # decided over a set this node cannot average. Abandoning it would
-            # mean skipping the step the others took, which is the same split.
-            raise
+        except MembershipError as exc:
+            # `RoundSplitError` among them. Not swallowed and not abandoned:
+            # the averages have differed, or would if this node carried on.
+            self._leave_and_rejoin(exc)
+            return
         except Exception as exc:
-            logger.warning("Outer round failed: %s", exc)
-            # Advance anyway. A node that stays on a number its peers have left
-            # behind is asking for a round they retired while they ask for one
-            # it never reaches - both still running, both still logging closed
-            # rounds, permanently invisible to each other.
-            try:
-                self._outer.abandon_round()
-            except Exception:
-                pass
+            # Nothing is expected here any more - `close_round` absorbs what
+            # it can - so whatever this is, it is unknown whether the others
+            # took the step. Same answer.
+            split = RoundSplitError("outer round failed: %s" % exc)
+            split.__cause__ = exc
+            self._leave_and_rejoin(split)
+            return
+
+        # The split, not just the total. On loopback this line read "took
+        # 0.0s" every time, which is the one number the whole architecture is
+        # chosen around and it was never observed - see `close_round` and
+        # GPU-117. `network` is what a slower link makes bigger; the rest is
+        # the model's size, not the link's speed.
+        logger.info(
+            "Outer round %d took %.1fs over %d node(s): %.1fs network "
+            "(%.1fs of it waiting for a peer to reach the round), "
+            "%.1fs delta, %.1fs publish (%.1fs waiting on a fetch), "
+            "%.1fs deciding, %.1fs recovering, %.1fs outer step.",
+            report["round"],
+            time.monotonic() - started,
+            report["nodes"],
+            report.get("gather_seconds", 0.0),
+            report.get("gather_wait_seconds", 0.0),
+            report.get("delta_seconds", 0.0),
+            report.get("publish_seconds", 0.0),
+            report.get("publish_wait_seconds", 0.0),
+            report.get("decide_seconds", 0.0),
+            report.get("recover_seconds", 0.0),
+            report.get("apply_seconds", 0.0),
+        )
 
     def should_stop(self) -> bool:
         """Whether the configured step budget has been spent.

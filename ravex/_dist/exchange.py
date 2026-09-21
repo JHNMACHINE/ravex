@@ -117,6 +117,14 @@ ROUND_SET_KEY = "ravex/gpu140/set/%s/%d"
 #: report relayed from this node.
 APPLIED_KEY = "ravex/gpu140/applied/%s/%d/%d"
 
+#: How many rounds a decision stays on the store (GPU-142). They are a few
+#: bytes each but one per round for the life of the run, on a server that may
+#: outlive many runs. Generous on purpose: a node that found the decision for
+#: a round it still has to close already deleted would propose its own, and
+#: that is the split all of this exists to prevent. Sixty-four rounds behind,
+#: its peers stopped serving it that round long ago (:data:`KEEP_ROUNDS`).
+KEEP_DECISIONS = 64
+
 #: Response status bytes.
 OK = 0
 GONE = 1  #: the round asked for is behind the one this node has published
@@ -276,25 +284,37 @@ def close_round(loop, exchange: "DeltaExchange", peers, deadline: float):
     # A round's whole budget, reused for the steps after the gather: the
     # decision and a recovery are each allowed as long as the gather was.
     budget = max(deadline - started, 1.0)
-    mine = loop.contribution()
-    expected = _report.expectation(mine.delta)
-    subtracted = time.monotonic()
-    offered = True
+    # Nothing before the decision may end this round early (GPU-142). A node
+    # that stops here skips the outer step its peers are about to take, and
+    # that is two models. So a failure only means this node offers nothing:
+    # nobody can have fetched a report that was never offered, the decided
+    # set will not name it, and it still applies the others'.
+    mine = None
     try:
-        exchange.publish(mine.delta, round_number, mine.steps)
-        # What the peers will average, which under `save_dtype` is not what
-        # was just handed over. See `DeltaExchange.as_published`.
-        mine.delta = exchange.as_published(mine.delta, round_number, expected)
+        mine = loop.contribution()
+        expected = _report.expectation(mine.delta)
     except Exception as exc:
-        # A full disk here used to fail the round on this node alone, which
-        # then skipped the outer step its peers took. Now it only means this
-        # node proposes itself to nobody: nobody can have fetched a report
-        # that was never offered, so the decided set will not name it, and
-        # this node still applies the others'.
-        logger.warning("Could not publish round %d: %s", round_number, exc)
-        offered = False
+        logger.warning("Could not compute this node's round %d delta: %s", round_number, exc)
+        # The delta has the outer parameters' names and shapes by
+        # construction, so that is what the peers' reports are checked against.
+        expected = _report.expectation(loop.outer)
+    subtracted = time.monotonic()
+    offered = mine is not None
+    if offered:
+        try:
+            exchange.publish(mine.delta, round_number, mine.steps)
+            # What the peers will average, which under `save_dtype` is not
+            # what was just handed over. See `DeltaExchange.as_published`.
+            mine.delta = exchange.as_published(mine.delta, round_number, expected)
+        except Exception as exc:
+            logger.warning("Could not publish round %d: %s", round_number, exc)
+            offered = False
     published = time.monotonic()
-    received = exchange.gather_by_rank(peers, round_number, expected, deadline)
+    try:
+        received = exchange.gather_by_rank(peers, round_number, expected, deadline)
+    except Exception as exc:
+        logger.warning("Could not gather round %d: %s", round_number, exc)
+        received = {}
     gathered = time.monotonic()
 
     collected = set(received) | ({exchange.rank} if offered else set())
@@ -343,7 +363,16 @@ def close_round(loop, exchange: "DeltaExchange", peers, deadline: float):
     ]
     exchange.decided(round_number, members)
     if contributions:
-        report = loop.apply(contributions)
+        try:
+            report = loop.apply(contributions)
+        except Exception as exc:
+            # After the decision there is no way back: the others are taking
+            # this step, and a node that cannot is no longer holding their
+            # model. Out, and - with a rendezvous - back in (GPU-142).
+            raise RoundSplitError(
+                "could not apply round %d, which the others are applying: %s"
+                % (round_number, exc)
+            ) from exc
         exchange.applied(round_number)
     else:
         # Decided empty: the proposer held nothing it could vouch for. Every
@@ -726,14 +755,23 @@ class DeltaExchange:
         """Say on the store that this node has applied ``round_number``.
 
         Best effort: it only shortens how long a peer lingers on its way out.
+        Also where the old round's keys go (:data:`KEEP_DECISIONS`): every
+        node deletes the decision and its own mark from that far back, which
+        is idempotent, so nobody has to be the one that does it.
         """
+        digest = _job_digest(self.secret)
         try:
-            self.store.set(
-                APPLIED_KEY % (_job_digest(self.secret), int(round_number), self.rank),
-                b"1",
-            )
+            self.store.set(APPLIED_KEY % (digest, int(round_number), self.rank), b"1")
         except Exception as exc:
             logger.debug("Could not record round %d as applied: %s", round_number, exc)
+        old = int(round_number) - KEEP_DECISIONS
+        if old < 0:
+            return
+        for key in (ROUND_SET_KEY % (digest, old), APPLIED_KEY % (digest, old, self.rank)):
+            try:
+                self.store.delete_key(key)
+            except Exception:
+                pass
 
     def _linger_for_relays(self, deadline: float) -> None:
         """Keep serving until every member of the last round has applied it.

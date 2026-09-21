@@ -87,6 +87,18 @@ STATE_AT_KEY = "ravex/gpu121/state-at"
 #: of averaging a contributor its peer never saw.
 ACK_KEY = "ravex/gpu121/ack/%d/%d"
 
+#: A node number that has left the run on its own account, holding the round
+#: it left at (GPU-142). Written once, never taken back: a node that comes back
+#: comes back under a new number.
+#:
+#: **Why a departure can be declared at all now.** Membership used to have to
+#: be identical on every node, because each node averaged whoever it reached
+#: and two views of who was in meant two models. Since GPU-140 the round's set
+#: is decided on the store, so views may differ without the averages doing so,
+#: and the one place a departed number still mattered is the acknowledgement a
+#: joiner waits for: a number that left will never give it.
+LEFT_KEY = "ravex/gpu142/left/%d"
+
 #: Rounds between a joiner observing the run and first contributing to it.
 #: One would be a race with the members' own boundary read; two leaves a whole
 #: round for a key already on the store to be noticed. It is not a tuning knob
@@ -183,6 +195,10 @@ class Membership:
         #: the rest of the run.
         self.acknowledged_joiners: set = set()
 
+        #: Base numbers that declared they left (GPU-142). Only ever grows, so
+        #: a number seen here is never asked about again.
+        self.departed: set = set()
+
         #: For each candidate, the last round this node will write its outer
         #: parameters down for. A candidate that announces itself and then dies
         #: would otherwise cost every member a full model snapshot per round
@@ -276,7 +292,16 @@ class Membership:
             if admit <= round_number
         ]
         base = [peer for peer in range(self.base_world) if peer != self.rank]
-        return [peer for peer in base + joined if peer != self.rank]
+        # Not a correctness matter since GPU-140 - a departed number that is
+        # still asked just does not answer - but asking it every round costs a
+        # dial and a warning line for the rest of the run.
+        for peer in base:
+            if peer not in self.departed and has_left(self.store, peer):
+                self.departed.add(peer)
+        return [
+            peer for peer in base + joined
+            if peer != self.rank and peer not in self.departed
+        ]
 
     def refresh(self, round_number: int) -> None:
         """Take in any join keys written since the last look.
@@ -345,6 +370,18 @@ def gave_up(store, rank: int) -> None:
         pass
 
 
+def leave(store, rank: int, round_number: int) -> None:
+    """Declare that ``rank`` has left the run, at ``round_number``. For good."""
+    store.set(LEFT_KEY % rank, json.dumps(int(round_number)).encode("utf-8"))
+
+
+def has_left(store, rank: int) -> bool:
+    try:
+        return bool(store.check([LEFT_KEY % rank]))
+    except Exception:
+        return False
+
+
 def acknowledge(store, member: int, joiner: int, admit_round: int) -> None:
     """One member records that it has accepted one joiner, at which round."""
     store.set(
@@ -360,11 +397,17 @@ def acknowledged(store, joiner: int, members: List[int]) -> List[int]:
     acknowledges, so a run that has lost a node cannot take a new one until
     something declares the lost one gone — **a real limit, and named rather
     than worked around**: the alternative is the joiner deciding for itself
-    that a silent member is dead, and a member that is merely slow would then
-    be averaging without the newcomer while everyone else averages with it.
+    that a silent member is dead.
+
+    A member that declared its own departure (:func:`leave`, GPU-142) is not
+    waited for. That is the declaration this limit was asking for, made by the
+    only node that can make it without guessing. A member that died without
+    making it still blocks joins.
     """
     missing = []
     for member in members:
+        if has_left(store, member):
+            continue
         try:
             if not store.check([ACK_KEY % (member, joiner)]):
                 missing.append(member)

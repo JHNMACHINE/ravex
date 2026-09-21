@@ -24,6 +24,21 @@
   A failed publish (a full disk, for instance) no longer makes a node skip
   the outer step its peers took.
 
+- **A node that cannot stay on the run's model rejoins it instead of
+  stopping (GPU-142).** A round now ends in one of two ways for every node:
+  it applies exactly the set the store decided, or it leaves. Failures
+  before the decision (computing the delta, serving a join, refreshing the
+  peer set, the gather) no longer skip the outer step the others take: the
+  node offers nothing and applies the others' average. When a node cannot
+  apply the decided round, and it runs under `ravex rendezvous`, it declares
+  its number gone, takes a new one and comes back in through the join. It
+  gets the outer parameters and momentum every member holds, and the training
+  script only sees a pause. Under torchrun, where a rank cannot change, it
+  stops as before and torchrun restarts it. A number that declared itself
+  gone no longer blocks joins while they wait for acknowledgements, and is
+  no longer asked for reports. Decisions older than 64 rounds are removed
+  from the store.
+
 - **`audit_log` with `keep_last: 1` on the Moonclip backend records a
   fingerprint for every checkpoint (GPU-136).** An entry is written once the
   next save returns, and that next save's retention is what removes the
