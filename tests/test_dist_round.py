@@ -170,6 +170,63 @@ def test_a_node_that_dies_mid_run_does_not_stop_the_others(tmp_path):
     assert loss_of(survivors[0].model, x, y) < loss_of(a_model(), x, y) / 2
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="GPU-140: each node closes the round over whoever it reached, so "
+    "a one-way timeout between two live nodes leaves them on two models",
+)
+def test_a_one_way_timeout_between_live_nodes_does_not_split_the_model(tmp_path):
+    """GPU-140 without anyone dying.
+
+    The rule the round rests on is that a node which did not contribute is
+    missing from *everybody's* list at once. That holds for a node that is
+    gone; it does not hold for a link that is slow in one direction. Here
+    rank 1's fetch of rank 0's first report runs out of time - through the real
+    `fetch`, handed a deadline already spent, which is the branch a slow
+    intercontinental link takes - while rank 0 fetches rank 1's normally. Both
+    nodes are alive for the whole run and every round closes.
+
+    Rank 0 averages {0, 1}, rank 1 averages {1}, and from then on they apply
+    the same pseudo-gradients to different parameters: a fixed distance apart,
+    both losses falling, nothing raised. Strict xfail until the round's set is
+    agreed rather than observed; when it passes, remove the mark.
+    """
+    store = FakeStore()
+    x, y = a_problem()
+    half = len(x) // 2
+    nodes = [
+        Node(rank, store, (x[rank * half:(rank + 1) * half], y[rank * half:(rank + 1) * half]),
+             3, 10, 2, str(tmp_path))
+        for rank in range(2)
+    ]
+
+    original = nodes[1].exchange.fetch
+    missed = []
+
+    def slow_one_way(peer, round_number, expected, deadline, kind=0):
+        if peer == 0 and kind == 0 and not missed:
+            missed.append(round_number)
+            return original(peer, round_number, expected, time.monotonic(), kind)
+        return original(peer, round_number, expected, deadline, kind)
+
+    nodes[1].exchange.fetch = slow_one_way
+
+    for node in nodes:
+        node.start()
+    for node in nodes:
+        node.join(180)
+        assert not node.is_alive(), "rank %d never finished" % node.rank
+        if node.error is not None:
+            raise node.error
+
+    assert missed, "the one-way timeout was never injected"
+    assert [r["nodes"] for r in nodes[1].reports][0] == 1, "rank 1 did miss rank 0"
+
+    left = dict(nodes[0].model.named_parameters())
+    for name, right in nodes[1].model.named_parameters():
+        assert torch.allclose(left[name], right, atol=1e-5), name
+
+
 def test_nodes_at_different_speeds_still_agree_on_one_model(tmp_path):
     """The heterogeneous round, end to end: different step counts, one model."""
     store = FakeStore()
