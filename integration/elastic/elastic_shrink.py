@@ -32,13 +32,15 @@ TRACE = os.environ.get("TRACE", "trace.jsonl")
 TIMEOUT = int(os.environ.get("GLOO_TIMEOUT", "1800"))
 
 
+# The explicit entry since ravex 0.1.0: `ravex.activate()` went with the
+# autoloader, and this line was still calling it (caught by
+# tests/test_integration_kit_names.py, GPU-130).
+@ravex.train_loop()
 def main() -> None:
     dist.init_process_group(
         "gloo", timeout=datetime.timedelta(seconds=TIMEOUT)
     )
     rank, world = dist.get_rank(), dist.get_world_size()
-
-    ravex.activate()
 
     torch.manual_seed(0)
     model = nn.Sequential(nn.Linear(64, 64), nn.ReLU(), nn.Linear(64, 64))
