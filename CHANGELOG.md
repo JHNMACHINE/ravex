@@ -4,6 +4,19 @@
 
 ### Fixed
 
+- **A node that dies right after its round no longer strands the others
+  (found on two continents, 2026-09-21).** The node that proposes a round's
+  set now names itself only once every peer it names has taken its report.
+  Before, on a RunPod pair (EU + US), node 0 decided round 3 over both nodes,
+  applied it and died before node 1 had fetched its report. Nobody alive held
+  that report, so node 1 could neither average the decided set nor rejoin,
+  because the only other member was the dead one, and the run ended. Now the
+  proposer waits for that delivery, within the round's budget, and stops
+  waiting as soon as someone else has decided. If the delivery does not
+  happen it leaves itself out, which costs one contribution for one round.
+  Measured on the same pair, the whole decision including that wait takes
+  0.1-0.4 s per round.
+
 - **Nodes no longer end up holding two models when they disagree on who
   was in a round (GPU-140).** Every node used to close the outer round over
   the reports it had managed to fetch. That gives one model only while every

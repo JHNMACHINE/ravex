@@ -69,6 +69,11 @@ class Node(threading.Thread):
         self.inner = inner
         self.peers = [r for r in range(world) if r != rank]
         self.dies_after = dies_after
+        #: Apply this round, then vanish at once: listener shut, no linger -
+        #: what `os._exit` right after a round looks like to the peers.
+        self.vanish_after = None
+        self.vanished = False
+        self.model_at_vanish = None
         self.deadline = deadline
         self.model = a_model()
         self.exchange = DeltaExchange(
@@ -102,12 +107,21 @@ class Node(threading.Thread):
                         time.monotonic() + self.deadline,
                     )
                 )
+                if self.vanish_after is not None and round_number >= self.vanish_after:
+                    self.model_at_vanish = {
+                        k: v.detach().clone() for k, v in self.model.state_dict().items()
+                    }
+                    self.vanished = True
+                    return
         except BaseException as exc:  # surfaced on the test's thread
             self.error = exc
         finally:
             # A node that stops serving the moment it is done takes its last
             # report with it - see DeltaExchange.close.
-            self.exchange.close(linger=5, expect=self.peers)
+            if self.vanished:
+                self.exchange.close()
+            else:
+                self.exchange.close(linger=5, expect=self.peers)
 
 
 def run_nodes(root, world=2, rounds=4, inner=15, dies_after=None):
@@ -270,26 +284,34 @@ def test_a_report_the_owner_cannot_hand_over_is_relayed_by_one_that_holds_it(tmp
 def test_a_node_that_cannot_get_the_decided_set_stops_instead_of_diverging(tmp_path):
     """And when nobody can hand it over: out, loudly, rather than a second model.
 
-    Two nodes, so there is no third to relay through, and rank 1's every
-    direct fetch of rank 0 runs out of time. Rank 0 decides the round over
-    both; rank 1 cannot average that set, and the only non-divergent move left
-    to it is to leave - which is a departure, and a departure is safe.
+    Three nodes. Rank 2 reaches nobody for rank 0's report - not rank 0, not a
+    relay - and gives up late, so the round is decided by a node that holds it.
+    Rank 2 cannot average that set, and the only non-divergent move left to it
+    is to leave, which is a departure, and a departure is safe.
+
+    It used to be two nodes, with rank 0 proposing a set that named its own
+    report while rank 1 could not fetch it. That can no longer happen: a
+    proposer names itself only once every peer it names has its report, so
+    there rank 1 proposes {1}, rank 0 applies that, and nobody leaves.
     """
     from ravex._dist.exchange import RoundSplitError
     from ravex._dist.membership import MembershipError
 
     store = FakeStore()
-    nodes = [Node(r, store, shard, 2, 10, 2, str(tmp_path), deadline=4)
-             for r, shard in enumerate(two_halves(2))]
-    failing_fetch(nodes[1], owner=0, stall=1.0)
+    nodes = [Node(r, store, shard, 2, 10, 3, str(tmp_path), deadline=6)
+             for r, shard in enumerate(two_halves(3))]
+    failing_fetch(nodes[2], owner=0, stall=1.0)
+    nodes[2].exchange.recover = lambda *args, **kwargs: None
 
     run_all(nodes)
 
-    assert isinstance(nodes[1].error, RoundSplitError)
-    assert isinstance(nodes[1].error, MembershipError), "the runtime must not swallow it"
-    assert nodes[1].reports == [], "it applied a round it could not agree on"
-    assert nodes[0].error is None
-    assert nodes[0].reports[0]["nodes"] == 2
+    assert isinstance(nodes[2].error, RoundSplitError)
+    assert isinstance(nodes[2].error, MembershipError), "the runtime must not swallow it"
+    assert nodes[2].reports == [], "it applied a round it could not agree on"
+    for survivor in nodes[:2]:
+        assert survivor.error is None
+        assert survivor.reports[0]["nodes"] == 3
+    same_model(nodes[0], nodes[1])
 
 
 def test_a_node_that_cannot_compute_its_delta_still_takes_the_others_step(tmp_path):
@@ -350,6 +372,43 @@ def test_a_step_that_fails_after_the_decision_is_a_split_not_a_skip():
     )
     with pytest.raises(RoundSplitError, match="could not apply round 1"):
         close_round(Loop(), exchange, [], time.monotonic() + 1)
+
+
+def test_the_proposer_vanishing_after_its_round_does_not_strand_the_survivor(tmp_path):
+    """Found on the EU+US pair, 2026-09-21, in `110-rendezvous.sh kill0`.
+
+    Node 0 decided round 3 over [0, 1], applied it and died before node 1 had
+    taken its report. Nobody alive held that report, so node 1 could neither
+    average the decided set nor rejoin - the run's only other member was the
+    dead one - and the run ended. With two nodes it did not have to: the other
+    model died with its node. The proposer now names itself only once every
+    peer it names has its report, so here node 0 waits for node 1's slow fetch
+    before proposing, and node 1 carries on alone on the model node 0 left.
+    """
+    store = FakeStore()
+    nodes = [Node(r, store, shard, 4, 10, 2, str(tmp_path), deadline=10)
+             for r, shard in enumerate(two_halves(2))]
+    nodes[0].vanish_after = 1
+
+    original = nodes[1].exchange.fetch
+
+    def slow_toward_zero(peer, round_number, expected, deadline, kind=0, owner=None):
+        if peer == 0 and kind == 0:
+            time.sleep(1.5)
+        return original(peer, round_number, expected, deadline, kind, owner=owner)
+
+    nodes[1].exchange.fetch = slow_toward_zero
+
+    run_all(nodes)
+    for node in nodes:
+        if node.error is not None:
+            raise node.error
+
+    assert nodes[0].vanished
+    survivor = nodes[1]
+    assert [r["nodes"] for r in survivor.reports] == [2, 2, 1, 1], survivor.reports
+    # Through the round node 0 last applied, they held one model.
+    assert len(nodes[0].reports) == 2
 
 
 def test_nodes_at_different_speeds_still_agree_on_one_model(tmp_path):

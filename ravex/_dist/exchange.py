@@ -317,7 +317,29 @@ def close_round(loop, exchange: "DeltaExchange", peers, deadline: float):
         received = {}
     gathered = time.monotonic()
 
-    collected = set(received) | ({exchange.rank} if offered else set())
+    # **This node proposes itself only once every peer it proposes has its
+    # report** (2026-09-21, found on the EU+US pair). A report in the decided
+    # set has to be recoverable by every member that lacks it, and one owned
+    # by a live node always is - from the owner. The proposer's own is the
+    # exception: kill0 decided round 3 over [0, 1] on node 0, applied it, and
+    # node 0 died before node 1 had taken its report. Nobody alive held it, so
+    # node 1 could neither average the decided set nor rejoin a run whose only
+    # other member was the dead one - and with two nodes it could have simply
+    # carried on, since the other model died with its node. So the proposer
+    # waits, inside the round's budget, for its own report to be delivered to
+    # everyone else it names; if that does not happen in time it leaves itself
+    # out, which costs one contribution for one round and nothing else.
+    self_included = offered
+    if offered and received:
+        self_included = exchange.wait_served(
+            round_number, sorted(received), max(deadline, time.monotonic() + 1.0)
+        )
+        if not self_included:
+            logger.info(
+                "Round %d: proposing without this node's own report, which not "
+                "every peer had taken by the deadline.", round_number,
+            )
+    collected = set(received) | ({exchange.rank} if self_included else set())
     members, decided_by = decide_round(
         exchange.store, exchange.secret, round_number, exchange.rank, collected,
         time.monotonic() + budget,
@@ -745,6 +767,31 @@ class DeltaExchange:
             try:
                 listener.close()
             except OSError:
+                pass
+
+    def wait_served(self, round_number: int, peers: List[int], deadline: float) -> bool:
+        """Whether every one of ``peers`` has taken this node's ``round_number``
+        report by ``deadline``. See the proposal in :func:`close_round`.
+
+        Stops early, returning False, once the round is decided on the store:
+        this node's proposal no longer matters, and waiting on for a peer that
+        will never fetch (its own fetch of this node timed out) held the round
+        to its full deadline while the others moved on without this node - which
+        is how the relay test broke the first time this ran.
+        """
+        key = ROUND_SET_KEY % (_job_digest(self.secret), round_number)
+        while True:
+            with self._lock:
+                if all(self._served.get(p, -1) >= round_number for p in peers):
+                    return True
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return False
+                self._lock.wait(min(0.2, left))
+            try:
+                if self.store.check([key]):
+                    return False
+            except Exception:
                 pass
 
     def decided(self, round_number: int, members: List[int]) -> None:

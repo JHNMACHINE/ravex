@@ -231,14 +231,23 @@ def die_after_serving_one(exchange, round_number):
 
 
 def split_off_next_round(exchange):
-    """Make this node miss every report of the next round, and every relay.
+    """Make this node lose every report of the next round, and every relay.
 
     It still publishes its own, so the others decide the round over all three
     and apply it; this node cannot, and the only thing left that keeps it on
-    their model is to leave and come back (GPU-142). The two seconds are what
-    make the others decide first.
+    their model is to leave and come back (GPU-142).
+
+    It really does fetch the others' reports first, and only then throws them
+    away. A proposer names itself only once every peer it names has taken its
+    report, so a node that never fetched would leave the others unable to
+    propose themselves - and then it is this node that decides, over itself
+    alone, and nobody has to leave. The two seconds make the others decide
+    first.
     """
+    original = exchange.gather_by_rank
+
     def gather_by_rank(peers, round_number, expected, deadline):
+        original(peers, round_number, expected, deadline)
         time.sleep(2.0)
         return {}
 
