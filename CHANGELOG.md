@@ -4,6 +4,26 @@
 
 ### Fixed
 
+- **Nodes no longer end up holding two models when they disagree on who
+  was in a round (GPU-140).** Every node used to close the outer round over
+  the reports it had managed to fetch. That gives one model only while every
+  node fetches the same set, and it takes little for them not to: a node
+  killed after serving one peer and before the next, or a link that is slow
+  in one direction between two nodes that are both alive. One node averaged
+  {A, B}, the other {B}. From then on they applied the same pseudo-gradients
+  to different parameters, both losses kept falling, and nothing raised.
+
+  The round's set is now **decided on the rendezvous store**: the first node
+  to finish gathering proposes what it holds, with an atomic `compare_set`,
+  and every node applies exactly that set. A node with extra reports leaves
+  them out. A node missing one gets it relayed by a node that holds it (the
+  proposer always does). A node that cannot get it stops with
+  `RoundSplitError` instead of averaging something else; relaunched, it
+  rejoins as a new node. The cost is one store round trip per round, a few
+  bytes. Nodes also stay up long enough to relay a report before they leave.
+  A failed publish (a full disk, for instance) no longer makes a node skip
+  the outer step its peers took.
+
 - **`audit_log` with `keep_last: 1` on the Moonclip backend records a
   fingerprint for every checkpoint (GPU-136).** An entry is written once the
   next save returns, and that next save's retention is what removes the

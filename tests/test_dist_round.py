@@ -60,7 +60,7 @@ class Node(threading.Thread):
     """One participant: a model, a shard, a listener, and its own clock."""
 
     def __init__(self, rank, store, shard, rounds, inner, world, root,
-                 dies_after=None, save_dtype=None):
+                 dies_after=None, save_dtype=None, deadline=30):
         super().__init__(daemon=True)
         self.rank = rank
         self.store = store
@@ -69,6 +69,7 @@ class Node(threading.Thread):
         self.inner = inner
         self.peers = [r for r in range(world) if r != rank]
         self.dies_after = dies_after
+        self.deadline = deadline
         self.model = a_model()
         self.exchange = DeltaExchange(
             rank, store, root=os.path.join(root, "rank%d" % rank),
@@ -95,7 +96,7 @@ class Node(threading.Thread):
                 self.reports.append(
                     close_round(
                         self.loop, self.exchange, self.peers,
-                        time.monotonic() + 30,
+                        time.monotonic() + self.deadline,
                     )
                 )
         except BaseException as exc:  # surfaced on the test's thread
@@ -170,61 +171,122 @@ def test_a_node_that_dies_mid_run_does_not_stop_the_others(tmp_path):
     assert loss_of(survivors[0].model, x, y) < loss_of(a_model(), x, y) / 2
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="GPU-140: each node closes the round over whoever it reached, so "
-    "a one-way timeout between two live nodes leaves them on two models",
-)
-def test_a_one_way_timeout_between_live_nodes_does_not_split_the_model(tmp_path):
-    """GPU-140 without anyone dying.
-
-    The rule the round rests on is that a node which did not contribute is
-    missing from *everybody's* list at once. That holds for a node that is
-    gone; it does not hold for a link that is slow in one direction. Here
-    rank 1's fetch of rank 0's first report runs out of time - through the real
-    `fetch`, handed a deadline already spent, which is the branch a slow
-    intercontinental link takes - while rank 0 fetches rank 1's normally. Both
-    nodes are alive for the whole run and every round closes.
-
-    Rank 0 averages {0, 1}, rank 1 averages {1}, and from then on they apply
-    the same pseudo-gradients to different parameters: a fixed distance apart,
-    both losses falling, nothing raised. Strict xfail until the round's set is
-    agreed rather than observed; when it passes, remove the mark.
-    """
-    store = FakeStore()
+def two_halves(world):
     x, y = a_problem()
-    half = len(x) // 2
-    nodes = [
-        Node(rank, store, (x[rank * half:(rank + 1) * half], y[rank * half:(rank + 1) * half]),
-             3, 10, 2, str(tmp_path))
-        for rank in range(2)
-    ]
+    size = len(x) // world
+    return [(x[r * size:(r + 1) * size], y[r * size:(r + 1) * size]) for r in range(world)]
 
-    original = nodes[1].exchange.fetch
-    missed = []
 
-    def slow_one_way(peer, round_number, expected, deadline, kind=0):
-        if peer == 0 and kind == 0 and not missed:
-            missed.append(round_number)
-            return original(peer, round_number, expected, time.monotonic(), kind)
-        return original(peer, round_number, expected, deadline, kind)
-
-    nodes[1].exchange.fetch = slow_one_way
-
+def run_all(nodes):
     for node in nodes:
         node.start()
     for node in nodes:
         node.join(180)
         assert not node.is_alive(), "rank %d never finished" % node.rank
+
+
+def same_model(a, b):
+    left = dict(a.model.named_parameters())
+    for name, right in b.model.named_parameters():
+        assert torch.allclose(left[name], right, atol=1e-5), name
+
+
+def failing_fetch(node, owner, times=None, stall=0.0):
+    """Make ``node``'s direct fetches of ``owner``'s rounds run out of time.
+
+    Through the real ``fetch``, handed a deadline already spent - the branch a
+    slow link takes. ``stall`` first, so this node reaches the round's decision
+    after the others have made it. Relays go through untouched.
+    """
+    original = node.exchange.fetch
+    failed = []
+
+    def fetch(peer, round_number, expected, deadline, kind=0, owner_=None, **kw):
+        relay_owner = kw.pop("owner", owner_)
+        if peer == owner and kind == 0 and (times is None or len(failed) < times):
+            failed.append(round_number)
+            time.sleep(stall)
+            return original(peer, round_number, expected, time.monotonic(), kind)
+        return original(peer, round_number, expected, deadline, kind, owner=relay_owner)
+
+    node.exchange.fetch = fetch
+    return failed
+
+
+def test_a_one_way_timeout_between_live_nodes_does_not_split_the_model(tmp_path):
+    """GPU-140 without anyone dying.
+
+    The rule the round rested on was that a node which did not contribute is
+    missing from *everybody's* list at once. That holds for a node that is
+    gone; it does not hold for a link that is slow in one direction. Here
+    rank 1's fetch of rank 0's first report runs out of time while rank 0
+    fetches rank 1's normally, and both are alive for the whole run.
+
+    Before the round's set was decided on the store, rank 0 averaged {0, 1},
+    rank 1 averaged {1}, and they held two models from then on - both losses
+    falling, nothing raised. Now both apply the one set the store decided.
+    """
+    store = FakeStore()
+    nodes = [Node(r, store, shard, 3, 10, 2, str(tmp_path))
+             for r, shard in enumerate(two_halves(2))]
+    failed = failing_fetch(nodes[1], owner=0, times=1)
+
+    run_all(nodes)
+    for node in nodes:
         if node.error is not None:
             raise node.error
 
-    assert missed, "the one-way timeout was never injected"
-    assert [r["nodes"] for r in nodes[1].reports][0] == 1, "rank 1 did miss rank 0"
+    assert failed, "the one-way timeout was never injected"
+    assert [r["nodes"] for r in nodes[0].reports] == [r["nodes"] for r in nodes[1].reports]
+    same_model(*nodes)
 
-    left = dict(nodes[0].model.named_parameters())
-    for name, right in nodes[1].model.named_parameters():
-        assert torch.allclose(left[name], right, atol=1e-5), name
+
+def test_a_report_the_owner_cannot_hand_over_is_relayed_by_one_that_holds_it(tmp_path):
+    """The recovery half: rank 2 never reaches rank 0, rank 1 always does.
+
+    Rank 2 stalls before giving up on rank 0, so the round is decided by a
+    node that holds rank 0's report and names it. Rank 2 then has to average a
+    report it cannot fetch from its owner, and gets it from a node that has it.
+    """
+    store = FakeStore()
+    nodes = [Node(r, store, shard, 2, 10, 3, str(tmp_path))
+             for r, shard in enumerate(two_halves(3))]
+    failing_fetch(nodes[2], owner=0, stall=1.0)
+
+    run_all(nodes)
+    for node in nodes:
+        if node.error is not None:
+            raise node.error
+
+    assert [r["nodes"] for r in nodes[2].reports] == [3, 3]
+    assert sum(r["recovered"] for r in nodes[2].reports) == 2
+    same_model(nodes[0], nodes[2])
+    same_model(nodes[1], nodes[2])
+
+
+def test_a_node_that_cannot_get_the_decided_set_stops_instead_of_diverging(tmp_path):
+    """And when nobody can hand it over: out, loudly, rather than a second model.
+
+    Two nodes, so there is no third to relay through, and rank 1's every
+    direct fetch of rank 0 runs out of time. Rank 0 decides the round over
+    both; rank 1 cannot average that set, and the only non-divergent move left
+    to it is to leave - which is a departure, and a departure is safe.
+    """
+    from ravex._dist.exchange import RoundSplitError
+    from ravex._dist.membership import MembershipError
+
+    store = FakeStore()
+    nodes = [Node(r, store, shard, 2, 10, 2, str(tmp_path), deadline=4)
+             for r, shard in enumerate(two_halves(2))]
+    failing_fetch(nodes[1], owner=0, stall=1.0)
+
+    run_all(nodes)
+
+    assert isinstance(nodes[1].error, RoundSplitError)
+    assert isinstance(nodes[1].error, MembershipError), "the runtime must not swallow it"
+    assert nodes[1].reports == [], "it applied a round it could not agree on"
+    assert nodes[0].error is None
+    assert nodes[0].reports[0]["nodes"] == 2
 
 
 def test_nodes_at_different_speeds_still_agree_on_one_model(tmp_path):

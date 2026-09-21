@@ -237,6 +237,12 @@ def publish_round(
     return path
 
 
+def mark_complete(path: str) -> None:
+    """Mark a round directory servable. Idempotent."""
+    with open(os.path.join(path, ROUND_OK), "wb"):
+        pass
+
+
 def round_is_complete(root: str, round_number: int) -> bool:
     return os.path.exists(os.path.join(round_path(root, round_number), ROUND_OK))
 

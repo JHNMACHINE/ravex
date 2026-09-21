@@ -27,7 +27,7 @@ from ravex._dist.exchange import ADDRESS_KEY, DeltaExchange  # noqa: E402
 
 
 class FakeStore:
-    """The three methods this module asks of a rendezvous store."""
+    """The methods this module asks of a rendezvous store."""
 
     def __init__(self):
         self.values = {}
@@ -44,6 +44,22 @@ class FakeStore:
     def check(self, keys):
         with self.lock:
             return all(key in self.values for key in keys)
+
+    def compare_set(self, key, expected, desired):
+        """``TCPStore``'s semantics, checked against one on 2026-09-21: with
+        ``expected`` empty the first writer wins and every later caller gets
+        the stored value back; a missing key with ``expected`` set is left
+        missing and ``expected`` comes back."""
+        with self.lock:
+            current = self.values.get(key)
+            if current is None:
+                if expected == "":
+                    self.values[key] = desired.encode("utf-8")
+                    return self.values[key]
+                return expected.encode("utf-8")
+            if current == expected.encode("utf-8"):
+                self.values[key] = desired.encode("utf-8")
+            return self.values[key]
 
 
 def a_delta(scale=1.0):
@@ -509,3 +525,77 @@ def test_a_round_is_not_servable_until_its_marker_lands(nodes, tmp_path):
 
     _report.publish_round(root, 7, a_delta(), 3, "n0")
     assert _report.round_is_complete(root, 7)
+
+
+# -- the round's decision (GPU-140) ------------------------------------------
+
+
+def test_the_first_proposal_is_the_round_every_node_applies():
+    from ravex._dist.exchange import decide_round
+
+    store = FakeStore()
+    deadline = time.monotonic() + 5
+    assert decide_round(store, b"t", 3, 1, {1, 0}, deadline) == ([0, 1], 1)
+    # A later node holding more, or less, still gets the first answer.
+    assert decide_round(store, b"t", 3, 0, {0}, deadline) == ([0, 1], 1)
+    assert decide_round(store, b"t", 3, 2, {0, 1, 2}, deadline) == ([0, 1], 1)
+    # Another round, and another incarnation of the job, are other keys.
+    assert decide_round(store, b"t", 4, 0, {0}, deadline) == ([0], 0)
+    assert decide_round(store, b"u", 3, 2, {2}, deadline) == ([2], 2)
+
+
+def test_a_store_that_does_not_answer_stops_the_node_instead_of_guessing():
+    from ravex._dist.exchange import RoundSplitError, decide_round
+
+    class Down(FakeStore):
+        def compare_set(self, key, expected, desired):
+            raise ConnectionError("rendezvous unreachable")
+
+    started = time.monotonic()
+    with pytest.raises(RoundSplitError, match="could not read round 3"):
+        decide_round(Down(), b"t", 3, 0, {0}, started + 0.5)
+    assert time.monotonic() - started < 5
+
+
+def test_an_unreadable_decision_is_not_applied():
+    from ravex._dist.exchange import ROUND_SET_KEY, RoundSplitError, _job_digest, decide_round
+
+    store = FakeStore()
+    store.set(ROUND_SET_KEY % (_job_digest(b"t"), 3), b"not json")
+    with pytest.raises(RoundSplitError, match="unreadable"):
+        decide_round(store, b"t", 3, 0, {0}, time.monotonic() + 1)
+
+
+def test_the_decision_holds_on_a_real_tcpstore_with_racing_proposers():
+    """``FakeStore`` imitates ``compare_set``; this is the real one, raced."""
+    import datetime
+
+    dist = pytest.importorskip("torch.distributed")
+    from ravex._dist.exchange import decide_round
+
+    server = dist.TCPStore(
+        "127.0.0.1", 0, 1, True, timeout=datetime.timedelta(seconds=10),
+        use_libuv=False,
+    )
+    answers = {}
+
+    def propose(rank):
+        client = dist.TCPStore(
+            "127.0.0.1", server.port, 1, False,
+            timeout=datetime.timedelta(seconds=10), use_libuv=False,
+        )
+        answers[rank] = decide_round(
+            client, b"t", 7, rank, {rank}, time.monotonic() + 10
+        )
+
+    threads = [threading.Thread(target=propose, args=(r,)) for r in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(30)
+
+    assert len(answers) == 8
+    decided = set(map(repr, answers.values()))
+    assert len(decided) == 1, "the proposers disagree: %s" % decided
+    members, by = next(iter(answers.values()))
+    assert members == [by]

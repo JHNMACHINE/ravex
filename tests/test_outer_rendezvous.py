@@ -205,21 +205,29 @@ def outer_digest(outer):
     return digest.hexdigest()
 
 
-def taken_by_everyone(exchange, peers, timeout=60.0):
-    """Wait until every peer has *fetched* this node's newest round.
+def die_after_serving_one(exchange, round_number):
+    """Serve ``round_number`` to the first peer that asks, then vanish.
 
-    ``_served`` is the exchange's own record of what has been delivered rather
-    than published, and it is what :meth:`DeltaExchange.close` lingers on
-    before a node shuts its listener. Reached for here because the node below
-    is about to leave without doing any of that.
+    The window GPU-140 is about, made deterministic: one survivor holds this
+    node's last report and the other never gets it. The first delivery runs to
+    its last byte (``_release`` is called after the transport returns); a
+    second request that arrives meanwhile is held until the process is gone,
+    and one that arrives after finds nobody.
     """
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        with exchange._lock:
-            if all(exchange._served.get(peer, -1) >= exchange._round for peer in peers):
-                return True
-        time.sleep(0.02)
-    return False
+    serving = threading.Lock()
+    original_hold, original_release = exchange._hold, exchange._release
+
+    def hold(wanted):
+        if wanted == round_number and not serving.acquire(blocking=False):
+            threading.Event().wait()  # the process exits before this returns
+        original_hold(wanted)
+
+    def release(wanted):
+        original_release(wanted)
+        if wanted == round_number:
+            os._exit(0)
+
+    exchange._hold, exchange._release = hold, release
 
 
 def a_node(address, job, min_nodes, root, name, role, queue):
@@ -294,6 +302,7 @@ def a_node(address, job, min_nodes, root, name, role, queue):
             optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
             loss_fn = torch.nn.MSELoss()
             runtime = get_runtime()
+            armed = False
             for step in range(20000):
                 begin = (step * 32) % len(x)
                 optimizer.zero_grad()
@@ -308,32 +317,23 @@ def a_node(address, job, min_nodes, root, name, role, queue):
                 if (
                     role == "first-dies"
                     and runtime._membership.rank == 0
-                    and outer.round_number > 3
+                    and outer.round_number == 3
+                    and not armed
                 ):
                     # The way a preempted box goes: no goodbye, no final
-                    # checkpoint, its address still on the store. But *after*
-                    # the other two have taken its last round, and that wait
-                    # is the difference between this test and a coin flip.
+                    # checkpoint, its address still on the store - and in the
+                    # worst moment, having handed its round 3 report to one
+                    # survivor and not the other.
                     #
-                    # A node killed between publishing a round and the last
-                    # peer fetching it leaves one survivor having averaged
-                    # that delta and the other not, and two nodes that
-                    # averaged different sets hold two models for the rest of
-                    # the run - silently, since both keep closing rounds and
-                    # both losses keep falling. That is a gap in the protocol
-                    # (GPU-140), not something this test can assert its way
-                    # out of: a graceful exit waits on exactly this record
-                    # (`DeltaExchange.close`), a machine that disappears
-                    # cannot. The CI runner, with four pytest workers on it,
-                    # landed inside that window on 2026-09-20: round 3 was
-                    # closed over three nodes by one survivor and over two by
-                    # the other, and the run ended with two models.
-                    #
-                    # So what is left asserted here is what GPU-129 is about:
-                    # the store is not node 0's any more, so node 0 going
-                    # away costs the run one contributor and nothing else.
-                    taken_by_everyone(runtime._exchange, runtime._outer_peers)
-                    os._exit(0)
+                    # Until GPU-140 that left the two survivors averaging
+                    # different sets and holding two models for the rest of
+                    # the run, silently. The CI runner landed in this window
+                    # by chance on 2026-09-20; this puts the test in it every
+                    # time. The round's set is now decided on the store and a
+                    # survivor missing a report gets it relayed by the one
+                    # that has it, so they still end on one model.
+                    die_after_serving_one(runtime._exchange, 3)
+                    armed = True
                 if control.check([LAST_KEY]) and outer.round_number > int(
                     control.get(LAST_KEY)
                 ):
@@ -418,9 +418,9 @@ def test_the_first_node_dying_does_not_take_the_run_with_it(server, tmp_path):
     server's, so node 0 going away costs the run one contributor and nothing
     else.
 
-    Node 0 leaves without a goodbye, but not in the middle of serving its last
-    round - see ``a_node``, and GPU-140 for what that window costs and why no
-    assertion here can close it."""
+    Node 0 leaves without a goodbye, in the middle of serving its last round:
+    one survivor has its report and the other does not (GPU-140). They must
+    still end on one model."""
     pytest.importorskip("moonclip")
     context = mp.get_context("spawn")
     queue = context.Queue()

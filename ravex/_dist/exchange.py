@@ -57,15 +57,18 @@ transferred nothing.
 from __future__ import annotations
 
 import logging
+import hashlib
+import json
 import os
 import socket as _socket
 import struct
 import sys
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from ravex._dist import report as _report
+from ravex._dist.membership import MembershipError
 
 logger = logging.getLogger("ravex")
 
@@ -95,6 +98,24 @@ REQUEST_MAGIC = b"RVXROUND"
 #: What a greeting is asking for.
 KIND_ROUND = 0  #: a round's delta report, the ordinary case
 KIND_STATE = 1  #: the outer parameters themselves, for a node joining (GPU-121)
+KIND_RELAY = 2  #: another node's report for a round, held by this one (GPU-140)
+
+#: What follows a :data:`KIND_RELAY` greeting: whose report is wanted. Sent
+#: after the greeting rather than folded into it, so the greeting keeps its
+#: size and a request of either older kind reads exactly as it always did.
+OWNER = struct.Struct("<I")
+
+#: Where a round's contributors are decided (GPU-140): the job token's digest,
+#: then the round. The digest scopes the key to one incarnation of the job -
+#: rank 0 makes a new token every time it starts - so a job that restarts on a
+#: store that outlived it does not find the sets its previous life decided.
+ROUND_SET_KEY = "ravex/gpu140/set/%s/%d"
+
+#: A node saying it has applied a round: job digest, round, rank. What
+#: :meth:`DeltaExchange.close` waits on before it stops serving, because until
+#: every member of the round has applied it, one of them may still need a
+#: report relayed from this node.
+APPLIED_KEY = "ravex/gpu140/applied/%s/%d/%d"
 
 #: Response status bytes.
 OK = 0
@@ -130,6 +151,71 @@ KEEP_ROUNDS = 3
 #: that it is asking for a moment the run has left, and the answer is to read
 #: the store again rather than to be handed history.
 KEEP_STATE = 2
+
+
+class RoundSplitError(MembershipError):
+    """This node cannot apply the round everyone else is applying (GPU-140).
+
+    A :class:`MembershipError`, so the runtime stops instead of abandoning the
+    round: abandoning means *not* taking the outer step the others took, which
+    is the two-model outcome this exists to prevent. A node that stops is a
+    departure, and a departure is safe; relaunched, it comes back as a joiner
+    and takes the run's current state (GPU-121).
+    """
+
+
+def _job_digest(secret: Optional[bytes]) -> str:
+    digest = hashlib.sha256()
+    digest.update(secret or b"")
+    digest.update(b"ravex-round-set")
+    return digest.hexdigest()[:16]
+
+
+def decide_round(store, secret, round_number: int, rank: int, collected,
+                 deadline: float) -> Tuple[List[int], int]:
+    """The round's contributors, as the store decided them, and who proposed.
+
+    **Why a decision and not an observation.** Every node used to close the
+    round over the reports *it* managed to fetch. That is only one model while
+    every node fetches the same set, and it takes very little for them not to:
+    a node killed between serving one peer and the next, or a link slow in one
+    direction, and one node averages {A, B} while the other averages {B}. From
+    then on they apply the same pseudo-gradients to different parameters, both
+    losses fall, and nothing raises.
+
+    So the first node to finish gathering proposes what it holds, with
+    ``compare_set`` against an empty key: the store applies it atomically, the
+    first proposal is the one that stays, and every later caller gets it back
+    instead of writing its own. Every node then applies exactly that set. The
+    proposer holds every report in it, which is what makes the set something
+    the others can always recover - see :meth:`DeltaExchange.recover`.
+
+    Retried on a store error until ``deadline``, then :class:`RoundSplitError`:
+    a node that cannot learn the decision cannot know whether the others took
+    the step, and guessing either way is the failure this closes.
+    """
+    key = ROUND_SET_KEY % (_job_digest(secret), round_number)
+    proposal = json.dumps({"by": int(rank), "set": sorted(int(r) for r in collected)})
+    while True:
+        try:
+            raw = store.compare_set(key, "", proposal)
+            break
+        except Exception as exc:
+            if time.monotonic() >= deadline:
+                raise RoundSplitError(
+                    "could not read round %d's decision off the rendezvous "
+                    "store (%s); stopping rather than guessing whether the "
+                    "other nodes took the step" % (round_number, exc)
+                ) from exc
+            time.sleep(0.2)
+    try:
+        text = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
+        decided = json.loads(text)
+        return [int(r) for r in decided["set"]], int(decided["by"])
+    except Exception as exc:
+        raise RoundSplitError(
+            "round %d's decision on the store is unreadable (%r)" % (round_number, raw)
+        ) from exc
 
 
 def close_round(loop, exchange: "DeltaExchange", peers, deadline: float):
@@ -173,35 +259,110 @@ def close_round(loop, exchange: "DeltaExchange", peers, deadline: float):
         depending on which of the two it was.
     ``apply_seconds``
         combining and the outer step.
+
+    **The set that is averaged is decided, not observed (GPU-140).** After the
+    gather, :func:`decide_round` fixes the round's contributors on the store,
+    and this node applies exactly those: reports it holds beyond them are left
+    out, reports it is missing are recovered from a node that has them
+    (:meth:`DeltaExchange.recover`), and if one cannot be recovered it raises
+    :class:`RoundSplitError` rather than apply a different average. Two more
+    spans come with it: ``decide_seconds`` and ``recover_seconds``, the second
+    zero unless this node's gather came up short of the decision.
     """
     from ravex._dist.outer import Contribution
 
+    round_number = loop.round_number
     started = time.monotonic()
+    # A round's whole budget, reused for the steps after the gather: the
+    # decision and a recovery are each allowed as long as the gather was.
+    budget = max(deadline - started, 1.0)
     mine = loop.contribution()
     expected = _report.expectation(mine.delta)
     subtracted = time.monotonic()
-    exchange.publish(mine.delta, loop.round_number, mine.steps)
-    # What the peers will average, which under `save_dtype` is not what was
-    # just handed over. See `DeltaExchange.as_published`.
-    mine.delta = exchange.as_published(mine.delta, loop.round_number, expected)
+    offered = True
+    try:
+        exchange.publish(mine.delta, round_number, mine.steps)
+        # What the peers will average, which under `save_dtype` is not what
+        # was just handed over. See `DeltaExchange.as_published`.
+        mine.delta = exchange.as_published(mine.delta, round_number, expected)
+    except Exception as exc:
+        # A full disk here used to fail the round on this node alone, which
+        # then skipped the outer step its peers took. Now it only means this
+        # node proposes itself to nobody: nobody can have fetched a report
+        # that was never offered, so the decided set will not name it, and
+        # this node still applies the others'.
+        logger.warning("Could not publish round %d: %s", round_number, exc)
+        offered = False
     published = time.monotonic()
-    reports = exchange.gather(peers, loop.round_number, expected, deadline)
+    received = exchange.gather_by_rank(peers, round_number, expected, deadline)
     gathered = time.monotonic()
-    report = loop.apply(
-        [mine]
-        + [
-            Contribution(delta=r.delta, steps=r.steps, node=r.node)
-            for r in reports
-        ]
+
+    collected = set(received) | ({exchange.rank} if offered else set())
+    members, decided_by = decide_round(
+        exchange.store, exchange.secret, round_number, exchange.rank, collected,
+        time.monotonic() + budget,
     )
+    decided = time.monotonic()
+
+    if exchange.rank in members and not offered:
+        raise RoundSplitError(
+            "round %d was decided with this node's report in it, and this node "
+            "never finished offering one" % round_number
+        )
+    missing = [r for r in members if r != exchange.rank and r not in received]
+    recovery_deadline = time.monotonic() + budget
+    for owner in missing:
+        holders = [decided_by] + [r for r in members if r != decided_by]
+        recovered = exchange.recover(
+            owner, round_number, expected, holders, recovery_deadline
+        )
+        if recovered is None:
+            raise RoundSplitError(
+                "round %d was decided over ranks %s and this node could not "
+                "get rank %d's report from anyone that holds it; stopping "
+                "rather than averaging a different set. Relaunched, it rejoins "
+                "the run from the current state."
+                % (round_number, members, owner)
+            )
+        received[owner] = recovered
+    recovered_at = time.monotonic()
+
+    dropped = sorted(set(received) - set(members))
+    if dropped:
+        logger.info(
+            "Round %d: leaving out rank(s) %s, which this node reached but the "
+            "round was decided without.",
+            round_number,
+            ", ".join(str(r) for r in dropped),
+        )
+
+    contributions = ([mine] if exchange.rank in members else []) + [
+        Contribution(delta=received[r].delta, steps=received[r].steps, node=received[r].node)
+        for r in members
+        if r != exchange.rank
+    ]
+    exchange.decided(round_number, members)
+    if contributions:
+        report = loop.apply(contributions)
+        exchange.applied(round_number)
+    else:
+        # Decided empty: the proposer held nothing it could vouch for. Every
+        # node reads the same empty set, so every node skips the same step,
+        # which is the one case where not applying keeps them together.
+        loop.abandon_round()
+        report = {"round": round_number, "nodes": 0, "steps": []}
     report.update(
         {
+            "decided_by": decided_by,
+            "recovered": len(missing),
             "delta_seconds": subtracted - started,
             "publish_seconds": published - subtracted,
             "publish_wait_seconds": exchange.publish_wait,
             "gather_seconds": gathered - published,
             "gather_wait_seconds": exchange.gather_wait,
-            "apply_seconds": time.monotonic() - gathered,
+            "decide_seconds": decided - gathered,
+            "recover_seconds": recovered_at - decided,
+            "apply_seconds": time.monotonic() - recovered_at,
         }
     )
     return report
@@ -413,6 +574,12 @@ class DeltaExchange:
         #: retention, so retention is the only thing that has to ask — and it
         #: asks with a set lookup instead of a lock held across a transfer.
         self._serving: Dict[int, int] = {}
+        #: The same, for other nodes' reports going out as relays (GPU-140),
+        #: by (owner, round).
+        self._relaying: Dict[Tuple[int, int], int] = {}
+        #: The newest round this node has seen decided, and over whom. Who is
+        #: still owed a relay when this node leaves - see :meth:`close`.
+        self._last_decided: Optional[Tuple[int, List[int]]] = None
 
         #: Seconds the most recent :meth:`publish` spent waiting for anything.
         #:
@@ -538,6 +705,9 @@ class DeltaExchange:
                     linger,
                 )
 
+        if linger > 0 and self._last_decided is not None:
+            self._linger_for_relays(time.monotonic() + linger)
+
         self._stop.set()
         with self._lock:
             self._lock.notify_all()
@@ -547,6 +717,53 @@ class DeltaExchange:
                 listener.close()
             except OSError:
                 pass
+
+    def decided(self, round_number: int, members: List[int]) -> None:
+        """Remember the newest decided round, for :meth:`close`."""
+        self._last_decided = (int(round_number), [int(m) for m in members])
+
+    def applied(self, round_number: int) -> None:
+        """Say on the store that this node has applied ``round_number``.
+
+        Best effort: it only shortens how long a peer lingers on its way out.
+        """
+        try:
+            self.store.set(
+                APPLIED_KEY % (_job_digest(self.secret), int(round_number), self.rank),
+                b"1",
+            )
+        except Exception as exc:
+            logger.debug("Could not record round %d as applied: %s", round_number, exc)
+
+    def _linger_for_relays(self, deadline: float) -> None:
+        """Keep serving until every member of the last round has applied it.
+
+        GPU-140. A member that did not reach some node gets that node's report
+        relayed by one that did, and the ones that did include this node. The
+        original linger waits only for this node's *own* report to be taken,
+        so a node leaving after its last round could close the listener on a
+        peer still asking it for a relay - which is exactly what the test for
+        the relay did the first time it ran, on the run's last round.
+        """
+        round_number, members = self._last_decided
+        digest = _job_digest(self.secret)
+        waiting = [m for m in members if m != self.rank]
+        while waiting and time.monotonic() < deadline:
+            try:
+                waiting = [
+                    m for m in waiting
+                    if not self.store.check([APPLIED_KEY % (digest, round_number, m)])
+                ]
+            except Exception:
+                return
+            if waiting:
+                time.sleep(0.1)
+        if waiting:
+            logger.info(
+                "Leaving before rank(s) %s applied round %d.",
+                ", ".join(str(m) for m in waiting),
+                round_number,
+            )
 
     # -- publishing -------------------------------------------------------
 
@@ -657,9 +874,24 @@ class DeltaExchange:
         minutes is a link to pay for or a peer to wait less for, and which one
         it is cannot be read off a total (GPU-117).
         """
+        answered = self.gather_by_rank(peers, round_number, expected, deadline)
+        return [answered[peer] for peer in peers if peer in answered]
+
+    def gather_by_rank(
+        self,
+        peers: List[int],
+        round_number: int,
+        expected,
+        deadline: float,
+    ) -> Dict[int, _report.Report]:
+        """:meth:`gather`, keyed by the rank each report was fetched from.
+
+        What :func:`close_round` needs to hold a report against the round's
+        decided set, which names ranks.
+        """
         if not peers:
             self.gather_wait = 0.0
-            return []
+            return {}
 
         answered: Dict[int, _report.Report] = {}
         self._waits = {}
@@ -687,18 +919,72 @@ class DeltaExchange:
         # a fact this node knows, and a report's own ``node`` field is written
         # by the peer. Trusting the latter to identify the former is how one
         # machine gets counted twice.
+        with found:
+            answered = dict(answered)
         silent = [peer for peer in peers if peer not in answered]
         if silent:
             logger.warning(
-                "Round %d closed without rank(s) %s. It goes on with %d of %d "
-                "peer(s) - a node that did not answer did not contribute, "
-                "which is an answer and not a failure.",
+                "Round %d: no report from rank(s) %s before the deadline; %d of "
+                "%d peer(s) answered. A node that did not answer did not "
+                "contribute, which is an answer and not a failure - once every "
+                "node agrees on it, which the round's decision sees to.",
                 round_number,
                 ", ".join(str(peer) for peer in silent),
                 len(answered),
                 len(peers),
             )
-        return [answered[peer] for peer in peers if peer in answered]
+        return answered
+
+    def recover(self, owner: int, round_number: int, expected, holders,
+                deadline: float) -> Optional[_report.Report]:
+        """``owner``'s report for a round, from whichever holder still has it.
+
+        For a node the round was decided with and this node did not reach
+        (GPU-140). ``holders`` is asked in order and the first is the proposer,
+        which held every report in the set when it proposed it: the owner
+        itself may be the one that died, or the one whose link to this node was
+        the problem in the first place. The owner is asked for its own round
+        directly, everyone else for a relay. The deadline is split evenly, so a
+        holder that died without a reset cannot take the whole of it.
+        """
+        asked = [h for h in holders if h != self.rank]
+        if owner not in asked:
+            asked.append(owner)
+        # The gather's own fetch may have left half a directory behind, and a
+        # second transfer into it would be reconciling two shapes.
+        partial = _report.round_path(self._peer_path(owner), round_number)
+        if os.path.isdir(partial) and not _report.round_is_complete(
+            self._peer_path(owner), round_number
+        ):
+            import shutil
+
+            shutil.rmtree(partial, ignore_errors=True)
+        for index, holder in enumerate(asked):
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            until = time.monotonic() + left / (len(asked) - index)
+            try:
+                if holder == owner:
+                    report = self.fetch(owner, round_number, expected, until)
+                else:
+                    report = self.fetch(
+                        holder, round_number, expected, until,
+                        kind=KIND_RELAY, owner=owner,
+                    )
+            except Exception as exc:
+                logger.info(
+                    "Rank %s could not hand over rank %s's round %d: %s",
+                    holder, owner, round_number, exc,
+                )
+                continue
+            if report is not None:
+                logger.info(
+                    "Round %d: recovered rank %s's report from rank %s.",
+                    round_number, owner, holder,
+                )
+                return report
+        return None
 
     def _fetch_into(self, peer, round_number, expected, deadline, answered, found):
         try:
@@ -712,7 +998,7 @@ class DeltaExchange:
             answered[peer] = report
 
     def fetch(self, peer: int, round_number: int, expected, deadline: float,
-              kind: int = KIND_ROUND):
+              kind: int = KIND_ROUND, owner: Optional[int] = None):
         """One peer's report, or None if it did not arrive before ``deadline``.
 
         ``kind`` picks which of the two things this peer serves is being asked
@@ -720,6 +1006,10 @@ class DeltaExchange:
         parameters a joining node needs (:data:`KIND_STATE`, GPU-121). The two
         land in different trees on this side as well, so a join in flight can
         never evict a round a peer is still going to be asked for.
+
+        :data:`KIND_RELAY` asks ``peer`` for ``owner``'s report rather than its
+        own (GPU-140), and it lands where a direct fetch from ``owner`` would
+        have: to everything after this, a relayed report is that node's report.
         """
         from ravex._dist.replication import RingLink
 
@@ -746,6 +1036,8 @@ class DeltaExchange:
                     int(kind),
                 )
             )
+            if kind == KIND_RELAY:
+                connection.sendall(OWNER.pack(int(owner)))
 
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -781,10 +1073,11 @@ class DeltaExchange:
             # `create_connection` is cleared for the same reason.
             connection.settimeout(None)
             set_deadline(connection, max(1.0, deadline - time.monotonic()))
+            source = owner if kind == KIND_RELAY else peer
             destination = (
                 self._peer_state_round_path(peer, round_number)
                 if kind == KIND_STATE
-                else self._peer_round_path(peer, round_number)
+                else self._peer_round_path(source, round_number)
             )
             _core = _rust_core()
             if not _core.prestage_receive(connection.fileno(), destination):
@@ -815,7 +1108,14 @@ class DeltaExchange:
             if kind == KIND_STATE:
                 _report.drop_rounds(self._peer_state_path(peer), KEEP_STATE)
             else:
-                _report.drop_rounds(self._peer_path(peer), KEEP_ROUNDS)
+                # Marked servable here as well, once it has been read whole:
+                # a report this node holds is one it can relay (GPU-140), and
+                # "complete" has to mean the same thing on both sides.
+                _report.mark_complete(destination)
+                _report.drop_rounds(
+                    self._peer_path(source), KEEP_ROUNDS,
+                    protect=self._relaying_rounds(source),
+                )
         except _report.ReportError as exc:
             # Not "absent": absent is silence. This peer said something this
             # node will not act on, and that is worth a louder line, because it
@@ -927,6 +1227,13 @@ class DeltaExchange:
             if kind == KIND_STATE:
                 self._serve_state(connection, peer, wanted)
                 return
+            if kind == KIND_RELAY:
+                owner = OWNER.unpack(
+                    _recv_exactly(connection, OWNER.size,
+                                  time.monotonic() + SERVE_PATIENCE)
+                )[0]
+                self._serve_relay(connection, peer, owner, wanted)
+                return
 
             if not self._await_round(wanted):
                 connection.sendall(
@@ -971,6 +1278,45 @@ class DeltaExchange:
                 connection.close()
             except OSError:
                 pass
+
+    def _serve_relay(self, connection, peer: int, owner: int, wanted: int) -> None:
+        """Hand ``peer`` the report ``owner`` sent this node for round ``wanted``.
+
+        GPU-140: the round was decided over a set that includes ``owner``, and
+        ``peer`` did not get ``owner``'s report itself. Not a wait, for the
+        reason :meth:`_serve_state` is not one: either this node holds the
+        report whole or it does not, and ``GONE`` lets the asker try the next
+        holder instead of holding a handler on a report that is not coming.
+        """
+        from ravex._dist.replication import RingLink
+
+        acknowledgement = RingLink._acknowledgement(self.secret, peer)
+        root = self.mine_path if owner == self.rank else self._peer_path(owner)
+        key = (owner, wanted)
+        with self._lock:
+            self._relaying[key] = self._relaying.get(key, 0) + 1
+        try:
+            if not _report.round_is_complete(root, wanted):
+                connection.sendall(RESPONSE.pack(acknowledgement, GONE, 0))
+                return
+            connection.sendall(RESPONSE.pack(acknowledgement, OK, 0))
+            connection.settimeout(None)
+            set_deadline(connection, SERVE_PATIENCE)
+            _rust_core().prestage_send(
+                connection.fileno(), _report.round_path(root, wanted), CHUNK
+            )
+        finally:
+            with self._lock:
+                left = self._relaying.get(key, 0) - 1
+                if left > 0:
+                    self._relaying[key] = left
+                else:
+                    self._relaying.pop(key, None)
+
+    def _relaying_rounds(self, owner: int):
+        """Rounds of ``owner``'s this node is relaying right now, for retention."""
+        with self._lock:
+            return tuple(r for (o, r) in self._relaying if o == owner)
 
     def _serve_state(self, connection, peer: int, wanted: int) -> None:
         """Hand a joining node the outer parameters for round ``wanted``.

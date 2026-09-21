@@ -933,6 +933,10 @@ class RavexRuntime:
             # differed between nodes, so there is no round to carry on to and
             # the honest thing is to stop rather than keep training a second
             # model that looks like the first.
+            #
+            # `RoundSplitError` (GPU-140) is one of these: the round was
+            # decided over a set this node cannot average. Abandoning it would
+            # mean skipping the step the others took, which is the same split.
             raise
         except Exception as exc:
             logger.warning("Outer round failed: %s", exc)
