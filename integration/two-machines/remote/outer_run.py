@@ -288,6 +288,16 @@ def main():
         # Built inside the decorated function, which is where Ravex can see it.
         torch.manual_seed(3)  # same weights on both nodes to start
         model, layers = build_model(args.params, args.hidden)
+        if args.task == "teacher":
+            # **No GELU at the end** (2026-09-21). The target is a symmetric
+            # linear map, half of it negative, and a GELU output cannot go
+            # below -0.17. With it - and with lr 1e-3 and batch 8, the
+            # defaults then - the task did not learn on ONE node with no Ravex
+            # anywhere: held-out loss 1.0035 at step 0, 1.0038 at step 5000.
+            # The first `learn` run on two continents reported that as a
+            # plateau, which said nothing about the outer loop. Without it, at
+            # lr 1e-4 and batch 64, one node goes 1.00 -> 0.61 in 1000 steps.
+            model = model[:-1]
         model = model.to(device)
         if args.task == "teacher":
             # Adam where there is something to learn: SGD at this lr barely
