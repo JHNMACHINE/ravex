@@ -72,6 +72,24 @@ except Exception:
 PY
 }
 
+# **Too old is its own failure** (2026-09-21). The RunPod images still ship
+# torch 2.4.1, whose kernels run fine on a 4090 - so the check above passes -
+# and whose `torch.distributed.fsdp` has no `fully_shard` yet (2.6). The
+# training scripts import it, so every phase failed at its first line with an
+# ImportError, after setup had said everything was ready. The version asked for
+# is PyPI's, which was 7x faster than the pytorch.org index from a European
+# box, and whose default wheel is cu128 - the newest CUDA a 570 driver runs,
+# which is what one of the two pods had that day.
+TORCH_SPEC="${TORCH_SPEC:-torch==2.8.0}"
+if ! python -c "from torch.distributed.fsdp import fully_shard" 2>/dev/null; then
+    echo "-- torch $(python -c 'import torch; print(torch.__version__)' 2>/dev/null) predates fully_shard: installing $TORCH_SPEC"
+    pip install --quiet --root-user-action=ignore "$TORCH_SPEC"
+    python -c "from torch.distributed.fsdp import fully_shard" || {
+        echo "** still no fully_shard after installing $TORCH_SPEC **" >&2
+        exit 1
+    }
+fi
+
 if ! arch_ok; then
     echo "-- torch has no kernels for this GPU: reinstalling from $TORCH_INDEX"
     pip install -U --quiet --root-user-action=ignore \

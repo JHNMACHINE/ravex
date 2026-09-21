@@ -94,14 +94,37 @@ def install():
 
     _replication.encoded_size = encoded_size
 
+    # **That hook sees only the collective road** (2026-09-21). Since GPU-109
+    # the runtime replicates over `RingLink.round`, Ravex's own sockets with
+    # the framing in Rust, and that road never calls the module's
+    # `encoded_size`: every exchange on the EU+US pair that day came back with
+    # `sent_bytes: 0` beside five seconds of transfer. The socket road's
+    # figure is what `prestage_send` returns - the bytes it wrote, skip list
+    # applied (`send_store` in src/transport.rs) - so it is read there, and
+    # summed, because a recovery pass can send more than once in a round.
+    original_prestage_send = _replication._core.prestage_send
+    socket_sent = {"value": None}
+
+    def prestage_send(fileno, source, chunk=_replication.CHUNK):
+        written = original_prestage_send(fileno, source, chunk)
+        if socket_sent["value"] is not None:
+            socket_sent["value"] += int(written)
+        return written
+
+    _replication._core.prestage_send = prestage_send
+
     original_exchange = _replication.exchange_stores
 
     def exchange_stores(source, destination, send_to, receive_from, **kwargs):
         last_outgoing["value"] = None
+        socket_sent["value"] = 0
         started = time.perf_counter()
-        ok = original_exchange(source, destination, send_to, receive_from, **kwargs)
-        seconds = time.perf_counter() - started
-        sent = last_outgoing["value"] or 0
+        try:
+            ok = original_exchange(source, destination, send_to, receive_from, **kwargs)
+        finally:
+            seconds = time.perf_counter() - started
+            by_socket, socket_sent["value"] = socket_sent["value"], None
+        sent = by_socket or last_outgoing["value"] or 0
         # The store's current size on disk, not "bytes pulled this round" —
         # a skipped file is already there and never crosses the wire, but it
         # is still part of what this replica now holds.
