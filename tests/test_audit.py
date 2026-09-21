@@ -230,6 +230,75 @@ class TestMoonclipBackendFingerprint:
             logger.removeHandler(caplog.handler)
         assert caplog.text.count("does not report tensor hashes") == 1
 
+    def test_the_previous_step_is_fingerprinted_before_the_next_save_starts(self):
+        """GPU-136, asserted without a race.
+
+        The entry for a step is written after the next save returns, and that
+        next save's retention is what removes it - with ``keep_last: 1``, every
+        time. So the fingerprint has to be taken before Moonclip is handed the
+        next step, and this checks the order of the calls rather than hoping
+        a whole run happens to lose the race.
+        """
+        from ravex._backends import MoonclipBackend
+
+        calls = []
+        store = {}
+
+        def save_tensors(step, tensors, metadata):
+            calls.append(("save", step))
+            store.clear()  # keep_last: 1 - the new one replaces the old
+            store[step] = "id%d" % step
+
+        def describe(snapshot_id):
+            calls.append(("describe", snapshot_id))
+            return {"tensors": [described("w", snapshot_id)]}
+
+        backend = MoonclipBackend.__new__(MoonclipBackend)
+        backend._moonclip = SimpleNamespace(
+            __version__="0.1.1", flatten_state_dict=lambda state, prefix, as_tensors: ({}, None)
+        )
+        backend._manager = SimpleNamespace(
+            save_tensors=save_tensors,
+            describe=describe,
+            list_snapshots=lambda: [{"step": k, "id": v} for k, v in store.items()],
+            last_queue_wait=lambda: 0.0,
+        )
+        backend.fingerprints = {}
+        backend._last_saved_step = None
+
+        backend.save(3, {}, {})
+        phases = backend.save(6, {}, {})
+
+        assert calls == [("save", 3), ("describe", "id3"), ("save", 6)]
+        assert backend.fingerprint(3) == (
+            audit.tensor_fingerprint([described("w", "id3")]),
+            "sha256:tensor-xxh3",
+        )
+        assert "fingerprint" in phases
+
+    def test_without_the_audit_log_nothing_is_described(self):
+        from ravex._backends import MoonclipBackend
+
+        described_ids = []
+        backend = MoonclipBackend.__new__(MoonclipBackend)
+        backend._moonclip = SimpleNamespace(
+            flatten_state_dict=lambda state, prefix, as_tensors: ({}, None)
+        )
+        backend._manager = SimpleNamespace(
+            save_tensors=lambda step, tensors, metadata: None,
+            describe=described_ids.append,
+            list_snapshots=lambda: [],
+            last_queue_wait=lambda: 0.0,
+        )
+        backend.fingerprints = None
+        backend._last_saved_step = None
+
+        backend.save(3, {}, {})
+        phases = backend.save(6, {}, {})
+
+        assert described_ids == []
+        assert "fingerprint" not in phases
+
 
 def audited_run(backend, keep_last=5, steps=6, audit_log=True, seed=0):
     """Six steps checkpointed at 3 and 6, with the audit log as asked."""
@@ -348,6 +417,41 @@ class TestAWholeRun:
                 )
         finally:
             store.close()
+
+    def test_a_moonclip_snapshot_retention_removes_straight_away_was_fingerprinted_first(
+        self, tmp_path, monkeypatch
+    ):
+        """GPU-136: ``keep_last: 1`` with the default backend and the audit log.
+
+        Step 3's snapshot is gone by the time its entry is written, so its
+        fingerprint has to have been taken earlier - and it has to be the same
+        one a run that kept step 3 would record, or it is a fingerprint of
+        something else. The store keeping step 6 rather than step 3 is GPU-141,
+        Moonclip's retention, without which there is nothing to audit.
+        """
+        pytest.importorskip("moonclip")
+
+        def run(name, keep_last):
+            monkeypatch.setenv("RAVEX_STORAGE_PATH", str(tmp_path / name))
+            audited_run("moonclip", keep_last=keep_last)
+            return audit.read_entries(str(tmp_path / name / audit.AUDIT_FILE))
+
+        kept = run("kept", keep_last=5)
+        if kept[0]["fingerprint"] is None:
+            pytest.skip("the installed Moonclip does not report tensor hashes")
+        tight = run("tight", keep_last=1)
+
+        assert [entry["step"] for entry in tight] == [3, 6]
+        assert [entry["fingerprint"] for entry in tight] == [
+            entry["fingerprint"] for entry in kept
+        ]
+
+        store = open_moonclip_store(tmp_path / "tight")
+        try:
+            steps = [s["step"] for s in store._manager.list_snapshots()]
+        finally:
+            store.close()
+        assert steps == [6], "keep_last: 1 must keep the newest step"
 
     def test_the_same_training_fingerprints_the_same_and_different_training_does_not(
         self, tmp_path, monkeypatch

@@ -39,7 +39,7 @@ import re
 import time
 from abc import ABC, abstractmethod
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 logger = logging.getLogger("ravex")
 
@@ -308,6 +308,18 @@ class MoonclipBackend(CheckpointBackend):
         self._manager = moonclip.MoonclipManager(**kwargs)
         self.store_root = storage.path
 
+        #: Fingerprints taken while their snapshot still existed, by step. The
+        #: audit entry for a step is written after the *next* save returns,
+        #: and that next save is the one whose retention can remove it - with
+        #: `keep_last: 1` it always does. So each step is fingerprinted at the
+        #: start of the save after it, before Moonclip is handed anything
+        #: (GPU-136). Armed from the config, before the first save, for the
+        #: reason `TorchSaveBackend.fingerprints` is.
+        self.fingerprints: Optional[Dict[int, str]] = (
+            {} if getattr(config, "audit_log", False) else None
+        )
+        self._last_saved_step: Optional[int] = None
+
     def save(
         self, step: int, state: Dict[str, Any], metadata: Dict[str, str]
     ) -> Dict[str, float]:
@@ -324,8 +336,11 @@ class MoonclipBackend(CheckpointBackend):
         started = time.perf_counter()
         tensors, _ = self._moonclip.flatten_state_dict(state, _PREFIX, as_tensors=True)
         flattened = time.perf_counter()
+        waited_here, fingerprinted = self._fingerprint_previous()
+        handed = time.perf_counter()
         self._manager.save_tensors(step=step, tensors=tensors, metadata=metadata)
-        inside_save = time.perf_counter() - flattened
+        inside_save = time.perf_counter() - handed
+        self._last_saved_step = step
 
         # Neither of these is the write — that runs in the background. They are
         # the two things the calling thread pays for before it gets back:
@@ -348,12 +363,46 @@ class MoonclipBackend(CheckpointBackend):
         # `max` because the two are read off different clocks — Moonclip's
         # `Instant` against `perf_counter` here — and a phase reported as
         # slightly negative would be a worse lie than a rounding error.
+        #
+        # With the audit log on, most of that wait moves out of `save_tensors`
+        # and into `_fingerprint_previous`, which has to see the previous
+        # snapshot durable before it can describe it. It is the same wait, so
+        # it is added back here rather than left to vanish from the phases.
         waited = self._manager.last_queue_wait()
-        return {
+        phases = {
             "flatten": flattened - started,
             "store": max(inside_save - waited, 0.0),
-            "backpressure": waited,
+            "backpressure": waited + waited_here,
         }
+        if self.fingerprints is not None:
+            phases["fingerprint"] = fingerprinted
+        return phases
+
+    def _fingerprint_previous(self) -> Tuple[float, float]:
+        """Fingerprint the last step saved while it is still in the store.
+
+        Returns the time spent waiting for its writer and the time spent
+        describing it, separately: the first is backpressure the next save
+        would have paid anyway, the second is what the audit log costs -
+        measured at 0.7 ms for 300 tensors and 4 ms for 2000, on 1.1 GiB,
+        against 65-115 ms for the save itself.
+        """
+        step = self._last_saved_step
+        if self.fingerprints is None or step is None or step in self.fingerprints:
+            return 0.0, 0.0
+        started = time.perf_counter()
+        snapshots = self._manager.list_snapshots()  # waits for the writer
+        listed = time.perf_counter()
+        try:
+            found, _ = self._describe_fingerprint(step, snapshots)
+        except Exception as exc:
+            # The audit trail must never cost a checkpoint; the entry falls
+            # back to asking again later, and says `unavailable` if it can't.
+            logger.warning("Audit: could not fingerprint step %d: %s", step, exc)
+            found = None
+        if found is not None:
+            self.fingerprints[step] = found
+        return listed - started, time.perf_counter() - listed
 
     def _rebuild(self, raw) -> Optional[Dict[str, Any]]:
         """Ravex's own payload out of a snapshot's flat tensor map.
@@ -495,15 +544,26 @@ class MoonclipBackend(CheckpointBackend):
         next manifest over it fail, and the save being written was lost —
         measured on 2026-09-14, five runs in five.
 
-        ``None`` when retention has already merged the snapshot away (keep
-        ``keep_last`` above one with the audit log on), or when this Moonclip
-        does not report tensor hashes — ``hash_raw`` arrives in 0.1.1 — which
-        is said once rather than per checkpoint.
+        Usually answered from ``fingerprints``, filled at the start of the next
+        save while the snapshot still existed; asked of Moonclip directly only
+        for the last step of a run, which nothing comes after.
+
+        ``None`` when the snapshot is gone and was never fingerprinted, or when
+        this Moonclip does not report tensor hashes — ``hash_raw`` arrives in
+        0.1.1 — which is said once rather than per checkpoint.
         """
+        known = (getattr(self, "fingerprints", None) or {}).get(step)
+        if known is not None:
+            return known, "sha256:tensor-xxh3"
+        return self._describe_fingerprint(step, self._manager.list_snapshots())
+
+    def _describe_fingerprint(
+        self, step: int, snapshots: List[Dict[str, Any]]
+    ) -> Tuple[Optional[str], str]:
         from ravex._audit import tensor_fingerprint
 
         snapshot = None
-        for candidate in self._manager.list_snapshots():
+        for candidate in snapshots:
             if candidate.get("step") == step:
                 snapshot = candidate
         if snapshot is None:

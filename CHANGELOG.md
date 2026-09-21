@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **`audit_log` with `keep_last: 1` on the Moonclip backend records a
+  fingerprint for every checkpoint (GPU-136).** An entry is written once the
+  next save returns, and that next save's retention is what removes the
+  snapshot. With `keep_last: 1` it always did, so every entry but the last
+  had `fingerprint: null`, with no warning. The previous step is now
+  fingerprinted at the start of each save, before Moonclip is handed the new
+  one. It costs `describe()`: 0.7 ms for 300 tensors and 4 ms for 2000 on
+  1.1 GiB, against 65-115 ms for the save. It is reported as its own
+  `fingerprint` phase, and the wait for the previous writer it now absorbs
+  stays under `backpressure`. Runs without the audit log do none of this.
+
+- **`keep_last: 1` on the Moonclip backend kept the first checkpoint instead
+  of the last (GPU-141).** The bug was in Moonclip's retention and is fixed in
+  Moonclip; it needs the next Moonclip release. Until then, keep `keep_last`
+  at 2 or more with the default backend.
+
+- The two-machine kit and the elastic probe no longer call names ravex
+  removed (`ravex._replication`, `ravex.activate`), and a test reads the kit
+  to keep it that way (GPU-130).
+
 ## 0.2.0 — 2026-09-20
 
 ### Added
