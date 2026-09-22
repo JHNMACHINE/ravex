@@ -631,6 +631,16 @@ class RavexConfig:
     #: a crash can lose. A week at 15 s is about 40,000 objects per process.
     metrics_chunk_every: float = 15.0
 
+    #: The platform's backend, if there is one: the run document, its status,
+    #: every metrics chunk and the list of checkpoints are posted to it as the
+    #: run goes (GPU-156). Unset, the run writes only to its store, as always.
+    #: See ``ravex._ship`` for what happens while it is unreachable.
+    metrics_endpoint: Optional[str] = None
+
+    #: Sent as a bearer token with every request to ``metrics_endpoint``.
+    #: Never written to ``run.json`` or the audit trail.
+    metrics_token: Optional[str] = None
+
     source: Optional[str] = None  # path of the yaml this came from, if any
 
     #: Values that had to be replaced while loading. Logged by the runtime once
@@ -826,6 +836,10 @@ class RavexConfig:
             self.system_metrics_every = _as_float(value, self.system_metrics_every)
         if (value := get("METRICS_CHUNK_EVERY")) is not None:
             self.metrics_chunk_every = _as_float(value, self.metrics_chunk_every)
+        if (value := get("METRICS_ENDPOINT")) is not None:
+            self.metrics_endpoint = value or None
+        if (value := get("METRICS_TOKEN")) is not None:
+            self.metrics_token = value or None
 
         # Storage
         if (value := get("STORAGE_TYPE")) is not None:

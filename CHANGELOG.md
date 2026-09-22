@@ -17,6 +17,24 @@
   what the error above lists, and what a dashboard draws as the points a run
   can be resumed or forked from.
 
+- **A run can report to the platform while it trains (GPU-156).** With
+  `metrics_endpoint` (and optionally `metrics_token`, sent as a bearer token
+  and never written to `run.json`), the run document, its status, every
+  metrics chunk and the list of checkpoints are posted to that backend from a
+  thread of their own. The training loop never waits for the network. The
+  chunks already on disk are the queue: a `.shipped` ledger beside them says
+  which ones the backend confirmed, so a backend that was down gets the
+  backlog when it answers, and chunks a dead process left unsent go first the
+  next time a run opens the store. Without an endpoint nothing changes.
+
+### Fixed
+
+- **A run that raised is no longer recorded as `finished`.** `status.json`
+  now says `failed`, or `interrupted` for Ctrl-C and a stop sent by whoever
+  launched the run.
+- On Windows, `status.json` could fail to update while something was reading
+  it; the write now waits out the reader.
+
 ## 0.3.0 — 2026-09-22
 
 ### Added

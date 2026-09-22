@@ -135,6 +135,15 @@ def train_loop(
             _activate(**overrides)
             try:
                 return function(*args, **kwargs)
+            except BaseException as exc:
+                # So `status.json`, and the dashboard reading it, says how the
+                # run ended rather than that it finished.
+                from ravex._runtime import get_runtime
+
+                runtime = get_runtime(create=False)
+                if runtime is not None:
+                    runtime.exit_state = _exit_state(exc)
+                raise
             finally:
                 deactivate()
 
@@ -145,6 +154,15 @@ def train_loop(
         # fine — `ravex.yaml` and the environment still apply.
         return decorate(_function)
     return decorate
+
+
+def _exit_state(exc: BaseException) -> str:
+    if isinstance(exc, KeyboardInterrupt):
+        # Ctrl-C, or a stop sent by whoever launched it: not a bug in the run.
+        return "interrupted"
+    if isinstance(exc, SystemExit) and exc.code in (None, 0):
+        return "finished"
+    return "failed"
 
 
 def track(

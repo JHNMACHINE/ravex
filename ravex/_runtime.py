@@ -204,6 +204,12 @@ class RavexRuntime:
         #: writes it: one store, one document, and eight ranks racing to create
         #: it would mean eight ids for one run.
         self._run_record: Any = None
+        #: Sends the run to the platform's backend (GPU-156). None without
+        #: `metrics_endpoint`.
+        self._shipper: Any = None
+        #: How the run ended, for `status.json`: set by the train_loop wrapper
+        #: when the function raised, so a crash does not read as "finished".
+        self.exit_state = "finished"
         #: For the automatic step metrics: the step and the clock at the last
         #: record, so the time per step is an average over the interval rather
         #: than the one step that happened to land on the cadence.
@@ -686,6 +692,43 @@ class RavexRuntime:
             self._upload_store_file(STATUS_FILE)
         except Exception as exc:
             logger.debug("Cannot update the run's status: %s", exc)
+        self._ship_checkpoints()
+
+    def _open_shipper(self) -> Any:
+        """Start sending this run to the platform's backend, if one is configured.
+
+        Returns the shipper's ``notify``, which takes the same paths the bucket
+        uploader does. The first process on each machine also picks up what an
+        earlier execution on this store left unsent (GPU-156).
+        """
+        if not self.config.metrics_endpoint or self._shipper is not None:
+            return self._shipper.notify if self._shipper is not None else None
+        try:
+            from ravex._metrics import _environment_rank
+            from ravex._ship import Shipper, describe_store
+
+            path, uri = describe_store(self.config.storage)
+            self._shipper = Shipper(
+                self.config.metrics_endpoint,
+                path,
+                token=self.config.metrics_token,
+                store_uri=uri,
+                recover=(_environment_rank("LOCAL_RANK") or 0) == 0,
+            )
+            logger.info("Sending this run to %s", self.config.metrics_endpoint)
+        except Exception as exc:
+            logger.warning("Cannot send this run to %s: %s", self.config.metrics_endpoint, exc)
+            return None
+        return self._shipper.notify
+
+    def _ship_checkpoints(self) -> None:
+        """Tell the backend which steps the store holds: what a resume can pick."""
+        if self._shipper is None or self._backend is None or not is_main_process():
+            return
+        try:
+            self._shipper.checkpoints(self._backend.known_steps())
+        except Exception as exc:
+            logger.debug("Cannot list the checkpoints for the backend: %s", exc)
 
     def _upload_store_file(self, name: str) -> None:
         uploader = getattr(self, "_run_uploader", None)
@@ -1246,7 +1289,9 @@ class RavexRuntime:
             # Whatever the resume did or did not do, the step it left is the
             # one this execution's metrics continue from - see
             # `ravex.metrics.read` for why the header has to say so.
-            uploader = self._store_uploader()
+            from ravex._ship import combine
+
+            uploader = combine(self._store_uploader(), self._open_shipper())
             self._open_run_record(uploader)
             if self._metrics is not None:
                 self._metrics.begin(
@@ -2484,7 +2529,7 @@ class RavexRuntime:
                 else:
                     self.checkpoint(final=True)
             self.registry.release_pins()
-            self._record_status("finished")
+            self._record_status(self.exit_state)
             if self._metrics is not None:
                 # After the final checkpoint, whose duration is a metric, and
                 # before the backend closes: closing is what writes the last
@@ -2494,6 +2539,12 @@ class RavexRuntime:
                 self._metrics = None
             if self._backend is not None:
                 self._backend.close()
+            if self._shipper is not None:
+                # After the backend closed, so the final checkpoint is in the
+                # list; then whatever is still queued gets a last chance.
+                self._ship_checkpoints()
+                self._shipper.close()
+                self._shipper = None
             if self._audit is not None:
                 # After the backend closed: every write it had queued is on
                 # disk now, so the last pending entries can be written.

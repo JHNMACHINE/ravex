@@ -45,7 +45,7 @@ FORMAT_VERSION = 1
 #: Configuration fields that never reach disk here. The same list the audit
 #: trail scrubs, for the same reason: this file is meant to be read by a
 #: dashboard, which means it is meant to be shared.
-_EXCLUDED = {"access_key", "secret_key", "source", "problems"}
+_EXCLUDED = {"access_key", "secret_key", "metrics_token", "source", "problems"}
 
 
 def new_run_id() -> str:
@@ -96,6 +96,24 @@ def read_json(path: str) -> Optional[Dict[str, Any]]:
     return payload if isinstance(payload, dict) else None
 
 
+def _replace(source: str, target: str, attempts: int = 20) -> None:
+    """``os.replace``, a few more times on Windows.
+
+    There a file open for reading cannot be replaced, and something reads
+    these while they are written - the thread that sends them to the backend,
+    a dashboard. The reader holds the file for a millisecond; waiting that out
+    is better than a status that stays "running" after the run has ended.
+    """
+    for attempt in range(attempts):
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError:
+            if os.name != "nt" or attempt == attempts - 1:
+                raise
+            time.sleep(0.01)
+
+
 def write_json(path: str, payload: Dict[str, Any]) -> bool:
     """Write the file atomically. Returns whether it landed.
 
@@ -108,7 +126,7 @@ def write_json(path: str, payload: Dict[str, Any]) -> bool:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(partial, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, sort_keys=True)
-        os.replace(partial, path)
+        _replace(partial, path)
         return True
     except OSError as exc:
         logger.warning("Cannot write %s: %s", path, exc)
