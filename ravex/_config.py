@@ -233,6 +233,14 @@ class RavexConfig:
     checkpoint_on_exit: bool = True
     resume: bool = True
 
+    #: Come back at this step instead of the newest one. For going back to a
+    #: point a run has passed - the last checkpoint before the loss went bad -
+    #: and the same machinery a fork starts from (GPU-148). A step this store
+    #: does not hold stops the run rather than training from scratch: somebody
+    #: typed a number, and ignoring it would silently discard the history they
+    #: asked to continue.
+    resume_step: Optional[int] = None
+
     # Optional hard stop, in optimizer steps. Without it, a resumed script runs
     # its own loop bounds again from the top and overshoots the intended
     # budget; with it, Ravex ends the run at the right step no matter how many
@@ -806,6 +814,8 @@ class RavexConfig:
             self.run_id = value
         if (value := get("NAME")) is not None:
             self.name = value or None
+        if (value := get("RESUME_STEP")) is not None:
+            self.resume_step = _as_int(value, 0) if value else None
         if (value := get("AUDIT_LOG")) is not None:
             self.audit_log = _as_bool(value, self.audit_log)
         if (value := get("METRICS")) is not None:
@@ -901,6 +911,14 @@ class RavexConfig:
 
         if self.max_steps is not None:
             self.max_steps = _as_int(self.max_steps, 0) or None
+        if self.resume_step is not None:
+            coerced = _as_int(self.resume_step, -1)
+            if coerced < 0:
+                self.problems.append(
+                    f"resume_step={self.resume_step!r} is not a step; ignoring it"
+                )
+                coerced = None
+            self.resume_step = coerced
 
         for name in (
             "backend",

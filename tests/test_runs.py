@@ -209,3 +209,66 @@ def test_the_document_lands_whatever_the_backend(storage, backend):
 
     train()
     assert ravex.runs.describe(str(storage))["status"]["step"] == 2
+
+
+class TestComingBackAtAStep:
+    """`resume_step`: the point somebody names, not the newest (GPU-148)."""
+
+    def run_to(self, storage, steps, *, backend="torch_save", **options):
+        @ravex.train_loop(backend=backend, checkpoint_every=2, **options)
+        def train():
+            tiny(steps)
+
+        train()
+
+    def test_a_named_step_is_where_the_run_comes_back(self, storage):
+        self.run_to(storage, 6)
+        seen = {}
+
+        @ravex.train_loop(backend="torch_save", checkpoint_every=2, resume_step=2)
+        def again():
+            seen["at_start"] = ravex.step()
+            tiny(1)
+            seen["after"] = ravex.step()
+
+        again()
+        assert seen["after"] == 3, "continued from step 2, not from 6"
+
+    def test_a_step_the_store_does_not_hold_stops_the_run(self, storage):
+        """Falling back to the newest would resume the history being left behind."""
+        self.run_to(storage, 6)
+
+        @ravex.train_loop(backend="torch_save", checkpoint_every=2, resume_step=5)
+        def again():
+            tiny(1)
+
+        with pytest.raises(Exception) as caught:
+            again()
+        assert "resume_step=5" in str(caught.value)
+        assert "2, 4, 6" in str(caught.value), "the message says what is there"
+
+    def test_the_store_says_which_steps_it_holds(self, storage):
+        self.run_to(storage, 6)
+        from ravex._backends import get_backend
+        from ravex._config import RavexConfig
+
+        config = RavexConfig.load()
+        config.backend = "torch_save"
+        config.storage.path = str(storage)
+        backend = get_backend(config)
+        try:
+            assert backend.known_steps() == [2, 4, 6]
+        finally:
+            backend.close()
+
+    def test_it_works_on_the_moonclip_backend_too(self, storage):
+        self.run_to(storage, 6, backend="moonclip")
+        seen = {}
+
+        @ravex.train_loop(backend="moonclip", checkpoint_every=2, resume_step=4)
+        def again():
+            tiny(1)
+            seen["after"] = ravex.step()
+
+        again()
+        assert seen["after"] == 5

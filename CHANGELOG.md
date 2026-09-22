@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`resume_step`: come back at the step you name (GPU-148).** For going back
+  to a point a run has passed — the last checkpoint before the loss went bad —
+  and the machinery a fork will start from. A step the store does not hold
+  **stops the run** instead of falling back to the newest: the number was
+  typed, and the reason to type it is that the newest is not wanted, so a
+  fallback would resume the very history the request was leaving behind. The
+  error lists the steps the store does hold, because after retention a number
+  remembered from a log is often just past the edge of what survives.
+
+- **`backend.known_steps()`**: every step a store holds, oldest first. It is
+  what the error above lists, and what a dashboard draws as the points a run
+  can be resumed or forked from.
+
 ## 0.3.0 — 2026-09-22
 
 ### Added

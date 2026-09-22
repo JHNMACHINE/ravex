@@ -77,11 +77,22 @@ class CheckpointBackend(ABC):
     def load_step(self, step: int) -> Optional[Dict[str, Any]]:
         """Return the checkpoint written at ``step``, or None.
 
-        Only per-rank checkpointing needs this: the ranks have to agree on a
-        step every one of them holds, and "the latest" is not that step when a
-        kill landed between two ranks' writes.
+        Per-rank checkpointing needs this - the ranks have to agree on a step
+        every one of them holds, and "the latest" is not that step when a kill
+        landed between two ranks' writes - and so does `resume_step`, which is
+        somebody naming the point to come back to.
         """
         return None
+
+    def known_steps(self) -> List[int]:
+        """Every step this store holds, oldest first.
+
+        For telling somebody what they can actually ask for: `resume_step: 900`
+        on a store whose retention kept 1000 and 1050 is a mistake worth
+        answering with the list rather than with "not found". The dashboard
+        draws the same list as the points a run can be forked from.
+        """
+        return []
 
     def describe_step(self, step: int) -> Optional[Dict[str, Any]]:
         """The shape of the checkpoint at ``step``, with no tensors in it.
@@ -439,6 +450,15 @@ class MoonclipBackend(CheckpointBackend):
         steps = [int(s["step"]) for s in snapshots if s.get("step") is not None]
         return max(steps) if steps else None
 
+    def known_steps(self) -> List[int]:
+        try:
+            snapshots = self._manager.list_snapshots()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Could not list snapshots: %s", exc)
+            return []
+        steps = {int(s["step"]) for s in snapshots if s.get("step") is not None}
+        return sorted(steps)
+
     def load_step(self, step: int) -> Optional[Dict[str, Any]]:
         try:
             snapshots = self._manager.list_snapshots()
@@ -728,6 +748,9 @@ class TorchSaveBackend(CheckpointBackend):
         if not files:
             return None
         return _step_of(files[-1])
+
+    def known_steps(self) -> List[int]:
+        return [_step_of(path) for path in self._files()]
 
     def load_step(self, step: int) -> Optional[Dict[str, Any]]:
         import torch

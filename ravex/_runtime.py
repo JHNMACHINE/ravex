@@ -38,7 +38,7 @@ from ravex._dist.collectives import (
 )
 from ravex._patches import install_all_patches
 from ravex._registry import ObjectRegistry
-from ravex._resume import ResumeManager
+from ravex._resume import ResumeManager, ResumeStepMissing
 
 logger = logging.getLogger("ravex")
 
@@ -1294,6 +1294,10 @@ class RavexRuntime:
                 defer_rng=defer_rng, per_rank=self._per_rank_active()
             )
             self._restore_extra_state(resume_manager.restored_extra)
+        except ResumeStepMissing:
+            # Not caught here: `resume_step` is a number somebody typed, and
+            # "starting from scratch" is the one outcome they did not ask for.
+            raise
         except Exception as exc:
             logger.warning("Resume failed (%s) - starting from scratch", exc)
         finally:

@@ -221,6 +221,22 @@ def _drop_per_rank_randomness(state: Dict[str, Any], old_world: int, world: int)
         )
 
 
+class ResumeStepMissing(Exception):
+    """``resume_step`` named a step the store does not hold.
+
+    Carries the steps it *does* hold, because the answer somebody needs is not
+    "no" but "these": retention keeps the last few, so a number remembered from
+    a log is often just past the edge of what survives.
+    """
+
+    def __init__(self, message: str, step: int, available) -> None:
+        available = list(available or [])
+        shown = ", ".join(str(value) for value in available[-10:]) or "none"
+        super().__init__("%s. Steps in this store: %s" % (message, shown))
+        self.step = step
+        self.available = available
+
+
 class ResumeManager:
     def __init__(self, backend, registry, config=None):
         self.backend = backend
@@ -244,7 +260,7 @@ class ResumeManager:
         self.run_id: Optional[str] = None
 
     def try_resume(self, defer_rng: bool = False, per_rank: bool = False) -> bool:
-        """Restore the latest checkpoint into the live objects.
+        """Restore a checkpoint into the live objects. The newest, or a named one.
 
         Returns True if state was applied. ``defer_rng`` is set when resuming
         from ``DataLoader.__iter__``; see :meth:`ObjectRegistry.restore_state`.
@@ -252,6 +268,10 @@ class ResumeManager:
         makes "the latest" a question the ranks have to answer together.
         """
         self.attempted = True
+
+        requested = getattr(self.config, "resume_step", None)
+        if requested is not None:
+            return self._resume_at(requested, defer_rng, per_rank)
 
         if per_rank:
             return self._resume_per_rank(defer_rng)
@@ -266,6 +286,36 @@ class ResumeManager:
             return False
 
         return self._apply(state, defer_rng)
+
+    def _resume_at(self, step: int, defer_rng: bool, per_rank: bool) -> bool:
+        """Come back at the step somebody named, or stop.
+
+        Not "try that step and fall back to the newest": the number was typed,
+        and the reason to type it is that the newest is *not* wanted - the run
+        went somewhere bad and this is the point before it. Falling back would
+        resume the very history the request was trying to leave behind, and the
+        log line saying so would arrive after hours of GPU. So a step this
+        store does not hold raises, and the message lists what it does hold.
+        """
+        from ravex._dist.collectives import all_ranks_agree
+
+        state = self.backend.load_step(step)
+        if per_rank and not all_ranks_agree(bool(state)):
+            raise ResumeStepMissing(
+                "resume_step=%d is not on every rank" % step, step, self.backend.known_steps()
+            )
+        if not state:
+            raise ResumeStepMissing(
+                "resume_step=%d is not in this store" % step, step, self.backend.known_steps()
+            )
+
+        try:
+            applied = self._apply(state, defer_rng)
+            if applied:
+                logger.info("Resumed at step %d, as asked, not at the newest", step)
+            return applied
+        finally:
+            self._settle_run_identity(True)
 
     def _resume_per_rank(self, defer_rng: bool) -> bool:
         """Resume from per-rank stores, at a step every rank actually holds.
