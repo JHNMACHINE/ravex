@@ -81,7 +81,13 @@ dependencies = ["PyYAML>=5.1"]
 #            which the audit trail fingerprints a Moonclip checkpoint by, and
 #            on Windows a reader holding the manifest open no longer costs the
 #            checkpoint being written.
-moonclip = ["moonclip>=0.1.1"]
+#            0.1.2 since GPU-141 and GPU-152: retention under `keep_last: 1`
+#            keeps the newest snapshot instead of the first, and
+#            `sync_prefix` is what carries the metrics to the bucket while a
+#            run goes on. Without it the metrics stay local, which `_runtime`
+#            says, but `keep_last: 1` silently resuming from the first
+#            checkpoint is not something to leave reachable.
+moonclip = ["moonclip>=0.1.2"]
 dev = ["pytest>=7", "numpy"]
 
 [project.urls]
