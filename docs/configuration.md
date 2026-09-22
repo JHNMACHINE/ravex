@@ -49,6 +49,9 @@ ravex status
 | `log_level` | `RAVEX_LOG_LEVEL` | `INFO` | |
 | `run_id` | `RAVEX_RUN_ID` | `null` | Recorded in checkpoint metadata; also used as the storage prefix when none is set. |
 | `audit_log` | `RAVEX_AUDIT_LOG` | `false` | Append one hash-chained entry per durable checkpoint to `audit.jsonl` in the store: step, content fingerprint, config digest. See [Audit trail](#audit-trail). |
+| `metrics` | `RAVEX_METRICS` | `true` | Write what `ravex.log_metrics` is given, and the metrics Ravex takes on its own, to `metrics/` in the store. See [Metrics](#metrics). |
+| `metrics_every` | `RAVEX_METRICS_EVERY` | `10` | Steps between two records of the automatic step metrics: learning rate per param group, and time per step. |
+| `system_metrics_every` | `RAVEX_SYSTEM_METRICS_EVERY` | `30` | Seconds between two samples of the machine: GPU utilisation and memory, CPU, RAM. `0` turns them off. |
 | `frameworks.auto_detect` | — | `true` | Whether to identify the training framework in use. File only: there is no environment variable for it. |
 
 ### Sharded models
@@ -552,6 +555,62 @@ What else to know:
 - **Not recorded: the loss or the data.** Ravex never sees the loss, and only
   the training script knows what its dataset is. Put a dataset hash in `run_id`
   if you have one — `run_id` is in every entry's metadata.
+
+### Metrics
+
+```python
+ravex.log_metrics({"train/loss": loss, "train/acc": acc})   # at Ravex's step
+ravex.log_metrics({"eval/loss": v}, step=1200)               # at a step you choose
+
+@ravex.log_metrics                                           # logs what it returns
+def evaluate():
+    return {"eval/loss": ..., "eval/acc": ...}
+```
+
+A number or a one-element tensor is a **scalar**. A tensor, array or sequence
+with more than one element is a **histogram**: 64 equal bins between its finite
+minimum and maximum, with NaN and infinity counted apart so one of them cannot
+flatten the rest into a single bar.
+
+**What it costs.** Nothing that waits for the GPU. A CUDA tensor is not read
+back on the training thread, which would synchronise the stream on every call:
+the reduction is queued on the device and a writer thread brings the result
+home. On CPU, measured: 7 µs to log a float, 63 µs a one-element tensor, 4 ms a
+histogram of a million elements.
+
+**Who writes.** Rank 0. The other ranks' calls do nothing, so a script needs no
+`if rank == 0` around them. System metrics are per machine, taken by the first
+process on each.
+
+**Automatic metrics**, with nothing in the script: `ravex/lr` (or
+`ravex/lr/group<N>` with several param groups) and `ravex/step_seconds` every
+`metrics_every` steps, `ravex/checkpoint_seconds` at every checkpoint, and every
+`system_metrics_every` seconds `sys/gpu<N>/…`, `sys/cpu_percent`,
+`sys/ram_percent` and `sys/process_rss_mb`. GPU utilisation needs
+`nvidia-ml-py`; without it only this process's GPU memory is reported. CPU and
+RAM need `psutil`.
+
+**Reading them back.**
+
+```python
+import ravex.metrics
+
+history = ravex.metrics.read("./checkpoints")      # the run's storage.path
+history["scalars"]["train/loss"]                  # {"step": [...], "time": [...], "value": [...]}
+history["histograms"]["weights"]                  # [{"step", "min", "max", "counts", ...}]
+history["system"]["<host>"]["sys/gpu0/utilization"]
+```
+
+**Across a resume there is one history, not two.** Every execution writes its
+own segment, `metrics/<segment>.jsonl`, headed by the step it resumed from. A
+run killed at step 700 with its last checkpoint at 500 comes back at 500, and
+what it logged between 501 and 700 describes a model that no longer exists:
+`read` keeps each segment only up to the step the next one resumed from. System
+metrics are kept whole, because they describe the machines, and the machines
+really did spend those 200 steps.
+
+**Not yet**: with `storage.type: s3` the metrics stay in the local staging
+directory and do not go up to the bucket.
 
 ### More than one machine
 

@@ -36,6 +36,7 @@ underneath code that does not know about it.
 from __future__ import annotations
 
 import functools
+from collections.abc import Mapping
 from typing import Any, Callable, Optional, TypeVar
 
 #: The version, written here and in ``Cargo.toml``, which is what maturin builds
@@ -50,6 +51,7 @@ __all__ = [
     "deactivate",
     "flush",
     "is_active",
+    "log_metrics",
     "status",
     "step",
     "track",
@@ -191,6 +193,80 @@ def track(
         registry.register_scheduler(scheduler)
     if scaler is not None:
         registry.register_scaler(scaler)
+
+
+def log_metrics(values: Any = None, *, step: Optional[int] = None) -> Any:
+    """Record metrics for the current run. Or, as a decorator, record what a function returns.
+
+    ::
+
+        ravex.log_metrics({"train/loss": loss, "train/acc": acc})
+        ravex.log_metrics({"eval/loss": v}, step=1200)
+
+        @ravex.log_metrics
+        def evaluate():
+            return {"eval/loss": ..., "eval/acc": ...}
+
+    Names are namespaced with ``/``. A value is a number, a one-element tensor
+    or a numpy scalar - logged as a **scalar** - or a tensor, array or sequence
+    with more than one element, logged as a **histogram** of 64 bins between
+    its finite minimum and maximum.
+
+    ``step`` defaults to Ravex's step count, the number of ``optimizer.step()``
+    calls so far. Pass it when logging on another rhythm, an evaluation every
+    thousand steps say, that should land on a specific step.
+
+    **It does not wait for the GPU.** A CUDA tensor is not read back here:
+    that would synchronise the stream on every call. The reduction is queued
+    on the device and a writer thread brings the result home. So logging the
+    loss every step costs about what queueing a copy of it costs.
+
+    Where it goes: ``metrics/`` in the store, read back by
+    :func:`ravex.metrics.read`. Only rank 0 writes what is logged here; the
+    other ranks' calls return having done nothing, so a script needs no
+    ``if rank == 0`` around them.
+
+    Outside a ``train_loop`` there is no run to log to. The values are dropped
+    with a warning rather than raising: an evaluation after training that
+    raised here would lose a finished run's last output over a chart.
+    A value that cannot be charted - a string, a dict - raises ``TypeError``
+    on the call that logged it, which is where the mistake is.
+    """
+    if values is None:
+        return lambda function: log_metrics(function, step=step)
+    if callable(values) and not isinstance(values, Mapping):
+        function = values
+
+        @functools.wraps(function)
+        def wrapper(*args: object, **kwargs: object):
+            result = function(*args, **kwargs)
+            if result is not None:
+                log_metrics(result, step=step)
+            return result
+
+        return wrapper
+
+    from ravex._metrics import prepare_all
+    from ravex._runtime import get_runtime
+
+    prepared = prepare_all(values)
+    runtime = get_runtime(create=False)
+    if runtime is None:
+        global _warned_outside
+        if not _warned_outside:
+            _warned_outside = True
+            import logging
+
+            logging.getLogger("ravex").warning(
+                "ravex.log_metrics() outside a @ravex.train_loop function: "
+                "there is no run to record into, so these metrics are dropped"
+            )
+        return None
+    runtime.log_metrics(prepared, step)
+    return None
+
+
+_warned_outside = False
 
 
 def _activate(**overrides: object) -> None:

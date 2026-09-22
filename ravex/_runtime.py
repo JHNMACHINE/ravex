@@ -26,7 +26,7 @@ import signal
 import sys
 import threading
 import time
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from ravex._backends import get_backend
 from ravex._config import RavexConfig
@@ -198,6 +198,12 @@ class RavexRuntime:
         self._count_steps = True
         #: The audit trail, built at the first save when `audit_log` is on.
         self._audit: Any = None
+        #: Where `ravex.log_metrics` goes (GPU-147). None with `metrics: false`.
+        self._metrics: Any = None
+        #: For the automatic step metrics: the step and the clock at the last
+        #: record, so the time per step is an average over the interval rather
+        #: than the one step that happened to land on the cadence.
+        self._metrics_mark: Optional[Tuple[int, float]] = None
 
         self._setup_logging()
 
@@ -243,6 +249,12 @@ class RavexRuntime:
             self._resolve_step_interception()
             self._patches = install_all_patches(self.registry, self)
             self._install_signal_handler()
+            if self.config.metrics:
+                from ravex._metrics import MetricsSession
+
+                self._metrics = MetricsSession(
+                    self.config.storage.path, self.config.system_metrics_every
+                )
 
             logger.info(
                 "Ravex active - %s framework=%s rank=%d/%d",
@@ -544,6 +556,8 @@ class RavexRuntime:
             return
 
         self.registry.step_count += 1
+        if self._metrics is not None:
+            self._log_step_metrics(optimizer)
 
         if self.config.outer_loop:
             outer = self._outer_loop()
@@ -606,6 +620,45 @@ class RavexRuntime:
             return
         self._checkpoint_due = False
         self.checkpoint()
+
+    # ─── metrics, GPU-147 ───────────────────────────────────────────────
+
+    def log_metrics(self, values: Dict[str, Any], step: Optional[int] = None) -> None:
+        """Queue already-prepared metrics. See `ravex.log_metrics`."""
+        if self._metrics is None or not self._enabled:
+            return
+        self._metrics.log(self.registry.step_count if step is None else int(step), values)
+
+    def _log_step_metrics(self, optimizer: Any) -> None:
+        """The learning rates and the time per step, every `metrics_every` steps."""
+        step = self.registry.step_count
+        now = time.perf_counter()
+        if self._metrics_mark is None:
+            self._metrics_mark = (step, now)
+            return
+        if step % self.config.metrics_every != 0:
+            return
+        from ravex._metrics import prepare
+
+        mark_step, mark_time = self._metrics_mark
+        self._metrics_mark = (step, now)
+        values: Dict[str, Any] = {}
+        if step > mark_step:
+            values["ravex/step_seconds"] = prepare(
+                "ravex/step_seconds", (now - mark_time) / (step - mark_step)
+            )
+        groups = getattr(optimizer, "param_groups", None) or []
+        for index, group in enumerate(groups):
+            lr = group.get("lr") if isinstance(group, dict) else None
+            if lr is None:
+                continue
+            name = "ravex/lr" if len(groups) == 1 else "ravex/lr/group%d" % index
+            try:
+                values[name] = prepare(name, lr)
+            except (TypeError, ValueError):
+                continue
+        if values:
+            self._metrics.log(step, values)
 
     # ─── the outer loop, GPU-113 ────────────────────────────────────────
 
@@ -1081,6 +1134,16 @@ class RavexRuntime:
             self.registry.apply_pending_rng()
 
     def _try_resume(self, defer_rng: bool = False) -> None:
+        try:
+            self._try_resume_body(defer_rng)
+        finally:
+            # Whatever the resume did or did not do, the step it left is the
+            # one this execution's metrics continue from - see
+            # `ravex.metrics.read` for why the header has to say so.
+            if self._metrics is not None:
+                self._metrics.begin(self.registry.step_count, lambda: self.registry.step_count)
+
+    def _try_resume_body(self, defer_rng: bool) -> None:
         self._resume_attempted = True
         # The first moment the model, the optimizer and the loader all exist,
         # which is what makes it the first pin: a run shorter than one cadence
@@ -1436,6 +1499,10 @@ class RavexRuntime:
             ", ".join("%s %.3fs" % item for item in phases.items()),
         )
         self._warn_if_cadence_is_expensive(step, started, finished, phases)
+        if self._metrics is not None:
+            from ravex._metrics import Scalar
+
+            self.log_metrics({"ravex/checkpoint_seconds": Scalar(finished - started)}, step)
         return True
 
     def _record_audit(self, backend: Any, step: int, metadata: dict) -> None:
@@ -2304,6 +2371,10 @@ class RavexRuntime:
                 # disk now, so the last pending entries can be written.
                 self._audit.close()
                 self._audit = None
+            if self._metrics is not None:
+                # After the final checkpoint, whose duration is a metric.
+                self._metrics.close(self.registry.step_count)
+                self._metrics = None
             if self._ring_link:
                 self._ring_link.close()
                 self._ring_link = None
@@ -2348,6 +2419,12 @@ def reset_runtime() -> None:
             try:
                 if _runtime._backend is not None:
                     _runtime._backend.close()
+            except Exception:
+                pass
+            try:
+                if _runtime._metrics is not None:
+                    _runtime._metrics.close(_runtime.registry.step_count)
+                    _runtime._metrics = None
             except Exception:
                 pass
             import torch

@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Added
+
+- **`ravex.log_metrics`: a run records its metrics into its own store
+  (GPU-147).** Scalars and histograms, called directly or as a decorator on a
+  function that returns them, at Ravex's step or at one given explicitly.
+  Nothing on the training thread waits for the GPU: device tensors are reduced
+  where they live and read back by a writer thread. Ravex also records the
+  learning rate, the time per step, the checkpoint duration, and GPU, CPU and
+  RAM per machine without being asked. `ravex.metrics.read(path)` returns the
+  run's history as one timeline across resumes, dropping what an execution
+  logged after the checkpoint the next one resumed from. New options:
+  `metrics`, `metrics_every`, `system_metrics_every`.
+
 ### Fixed
 
 - **A node that dies right after its round no longer strands the others

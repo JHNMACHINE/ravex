@@ -595,6 +595,20 @@ class RavexConfig:
     #: runs are not asked to prove anything. See ``ravex._audit`` (GPU-93).
     audit_log: bool = False
 
+    #: Write what ``ravex.log_metrics`` is given, and the metrics Ravex takes
+    #: on its own, to ``metrics/`` in the store. See ``ravex._metrics``
+    #: (GPU-147). On by default: a metric nobody logged costs nothing, and the
+    #: automatic ones are one small record every ``metrics_every`` steps.
+    metrics: bool = True
+
+    #: Steps between two records of the automatic step metrics: the learning
+    #: rate of every param group and the average time per step.
+    metrics_every: int = 10
+
+    #: Seconds between two samples of the machine: GPU utilisation and memory,
+    #: CPU and RAM. Zero turns them off.
+    system_metrics_every: float = 30.0
+
     source: Optional[str] = None  # path of the yaml this came from, if any
 
     #: Values that had to be replaced while loading. Logged by the runtime once
@@ -778,6 +792,12 @@ class RavexConfig:
             self.run_id = value
         if (value := get("AUDIT_LOG")) is not None:
             self.audit_log = _as_bool(value, self.audit_log)
+        if (value := get("METRICS")) is not None:
+            self.metrics = _as_bool(value, self.metrics)
+        if (value := get("METRICS_EVERY")) is not None:
+            self.metrics_every = _as_int(value, self.metrics_every)
+        if (value := get("SYSTEM_METRICS_EVERY")) is not None:
+            self.system_metrics_every = _as_float(value, self.system_metrics_every)
 
         # Storage
         if (value := get("STORAGE_TYPE")) is not None:
@@ -821,6 +841,7 @@ class RavexConfig:
             "emergency_timeout",
             "outer_inner_steps",
             "outer_deadline",
+            "metrics_every",
         )
         boolean = (
             "enabled",
@@ -839,6 +860,7 @@ class RavexConfig:
             "fallback_on_error",
             "framework_auto_detect",
             "audit_log",
+            "metrics",
         )
 
         for name in numeric:
@@ -944,6 +966,16 @@ class RavexConfig:
             self.outer_round_seconds = 0.0
         if self.outer_deadline < 1:
             self.outer_deadline = 1
+        if self.metrics_every < 1:
+            self.metrics_every = 1
+        system_every = _as_float(self.system_metrics_every, -1.0)
+        if system_every < 0:
+            self.problems.append(
+                f"system_metrics_every={self.system_metrics_every!r} is not a "
+                "number of seconds; using 30"
+            )
+            system_every = 30.0
+        self.system_metrics_every = system_every
         if str(self.outer_combine) not in _OUTER_COMBINE_MODES:
             self.problems.append(
                 f"outer_combine={self.outer_combine!r} is not one of "
