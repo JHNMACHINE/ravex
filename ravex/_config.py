@@ -609,6 +609,12 @@ class RavexConfig:
     #: CPU and RAM. Zero turns them off.
     system_metrics_every: float = 30.0
 
+    #: Seconds between two metric chunks. A chunk is a file written once and
+    #: never touched again, which is what lets it go up to a bucket; so this is
+    #: also how late a dashboard reading the bucket sees a value, and the most
+    #: a crash can lose. A week at 15 s is about 40,000 objects per process.
+    metrics_chunk_every: float = 15.0
+
     source: Optional[str] = None  # path of the yaml this came from, if any
 
     #: Values that had to be replaced while loading. Logged by the runtime once
@@ -798,6 +804,8 @@ class RavexConfig:
             self.metrics_every = _as_int(value, self.metrics_every)
         if (value := get("SYSTEM_METRICS_EVERY")) is not None:
             self.system_metrics_every = _as_float(value, self.system_metrics_every)
+        if (value := get("METRICS_CHUNK_EVERY")) is not None:
+            self.metrics_chunk_every = _as_float(value, self.metrics_chunk_every)
 
         # Storage
         if (value := get("STORAGE_TYPE")) is not None:
@@ -976,6 +984,14 @@ class RavexConfig:
             )
             system_every = 30.0
         self.system_metrics_every = system_every
+        chunk_every = _as_float(self.metrics_chunk_every, -1.0)
+        if chunk_every < 0:
+            self.problems.append(
+                f"metrics_chunk_every={self.metrics_chunk_every!r} is not a "
+                "number of seconds; using 15"
+            )
+            chunk_every = 15.0
+        self.metrics_chunk_every = chunk_every
         if str(self.outer_combine) not in _OUTER_COMBINE_MODES:
             self.problems.append(
                 f"outer_combine={self.outer_combine!r} is not one of "

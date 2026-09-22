@@ -20,6 +20,11 @@ import ravex.metrics
 from ravex import _metrics
 
 
+def chunk_files(storage):
+    """Every finished chunk of every segment, in order."""
+    return sorted((storage / "metrics").glob("*/*.jsonl"))
+
+
 def loop(steps, log, start=0):
     model = torch.nn.Linear(4, 2)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
@@ -87,9 +92,7 @@ class TestLogging:
             ravex.log_metrics({"loss": float("inf")}, step=1)
 
         train()
-        (header,) = ravex.metrics.segments(str(storage))
-        with open(header["file"], encoding="utf-8") as handle:
-            text = handle.read()
+        text = "".join(path.read_text(encoding="utf-8") for path in chunk_files(storage))
         assert "Infinity" not in text and "NaN" not in text
         assert '"inf"' in text
 
@@ -227,16 +230,38 @@ class TestTimeline:
         assert loss["step"] == [1, 2]
         assert loss["value"] == [10.0, 20.0]
 
-    def test_a_torn_last_line_is_skipped(self, storage):
+    def test_a_chunk_still_being_written_is_not_read(self, storage):
         @ravex.train_loop(backend="torch_save", checkpoint_every=10_000)
         def train():
             loop(2, lambda step, _m: ravex.log_metrics({"loss": float(step)}))
 
         train()
-        (header,) = ravex.metrics.segments(str(storage))
-        with open(header["file"], "a", encoding="utf-8") as handle:
+        (segment,) = (storage / "metrics").iterdir()
+        (segment / "000099.jsonl.tmp").write_text(
+            '{"step": 3, "time": 1, "values": {"loss": 3.0}}\n', encoding="utf-8"
+        )
+        assert ravex.metrics.read(str(storage))["scalars"]["loss"]["step"] == [1, 2]
+
+    def test_a_torn_line_is_skipped(self, storage):
+        @ravex.train_loop(backend="torch_save", checkpoint_every=10_000)
+        def train():
+            loop(2, lambda step, _m: ravex.log_metrics({"loss": float(step)}))
+
+        train()
+        last = chunk_files(storage)[-1]
+        with open(last, "a", encoding="utf-8") as handle:
             handle.write('{"step": 3, "time": 1, "val')
         assert ravex.metrics.read(str(storage))["scalars"]["loss"]["step"] == [1, 2]
+
+    def test_a_segment_without_its_header_cuts_nothing(self):
+        """A header that has not reached the bucket yet: no resume step to cut at."""
+        chunks = {
+            "a/000000.jsonl": json.dumps({"segment": "a", "rank": 0, "start_step": 0, "time": 1.0}),
+            "a/000001.jsonl": json.dumps({"step": 5, "time": 1.0, "values": {"loss": 5.0}}),
+            "b/000001.jsonl": json.dumps({"step": 3, "time": 2.0, "values": {"loss": 30.0}}),
+        }
+        loss = ravex.metrics.resolve(chunks)["scalars"]["loss"]
+        assert loss["step"] == [5]
 
     def test_an_empty_store_reads_as_empty(self, tmp_path):
         history = ravex.metrics.read(str(tmp_path / "nothing"))
@@ -266,6 +291,100 @@ class TestHistogramOnTheDevice:
         writer = _metrics.MetricsWriter(str(tmp_path), rank=0, start_step=0)
         writer.put(1, 0.0, {"a": _metrics.Scalar(2.0)})
         writer.close()
-        (name,) = os.listdir(tmp_path / "metrics")
-        lines = (tmp_path / "metrics" / name).read_text(encoding="utf-8").splitlines()
-        assert json.loads(lines[1]) == {"step": 1, "time": 0.0, "values": {"a": 2.0}}
+        (segment,) = os.listdir(tmp_path / "metrics")
+        chunk = tmp_path / "metrics" / segment / "000001.jsonl"
+        (line,) = chunk.read_text(encoding="utf-8").splitlines()
+        assert json.loads(line) == {"step": 1, "time": 0.0, "values": {"a": 2.0}}
+
+
+class TestChunks:
+    """Why a segment is a directory of files written once (GPU-152).
+
+    Moonclip's sync skips a file the bucket already holds by name. A file that
+    kept growing would go up once and never again, so a dashboard reading the
+    bucket would see the first second of every run and nothing after.
+    """
+
+    def test_every_chunk_is_handed_to_the_uploader_once_it_is_whole(self, tmp_path):
+        seen = []
+
+        def uploader(relative):
+            # Called after the rename: the file is already there, complete.
+            assert (tmp_path / relative).is_file()
+            seen.append(relative)
+
+        writer = _metrics.MetricsWriter(
+            str(tmp_path), rank=0, start_step=0, chunk_every=0.0, uploader=uploader
+        )
+        writer.put(1, 0.0, {"a": _metrics.Scalar(1.0)})
+        writer.put(2, 0.0, {"a": _metrics.Scalar(2.0)})
+        writer.close()
+        segment = "metrics/" + writer.segment
+        assert seen[0] == segment + "/000000.jsonl"
+        assert len(seen) >= 2
+        assert all(path.startswith(segment + "/") and path.endswith(".jsonl") for path in seen)
+        assert len(set(seen)) == len(seen)
+
+    def test_a_chunk_is_closed_on_the_clock_not_only_at_the_end(self, tmp_path):
+        import time
+
+        writer = _metrics.MetricsWriter(str(tmp_path), rank=0, start_step=0, chunk_every=0.2)
+        writer.put(1, 0.0, {"a": _metrics.Scalar(1.0)})
+        time.sleep(1.5)
+        # Still open, and the record is already readable.
+        history = ravex.metrics.read(str(tmp_path))
+        writer.close()
+        assert history["scalars"]["a"]["step"] == [1]
+
+    def test_an_upload_that_fails_does_not_stop_the_local_copy(self, tmp_path):
+        def uploader(_relative):
+            raise RuntimeError("syncer is gone")
+
+        writer = _metrics.MetricsWriter(
+            str(tmp_path), rank=0, start_step=0, chunk_every=0.0, uploader=uploader
+        )
+        writer.put(1, 0.0, {"a": _metrics.Scalar(1.0)})
+        writer.close()
+        assert ravex.metrics.read(str(tmp_path))["scalars"]["a"]["value"] == [1.0]
+
+    def test_resolve_reads_bucket_keys_the_way_read_reads_a_directory(self, storage):
+        @ravex.train_loop(backend="torch_save", checkpoint_every=5, checkpoint_on_exit=False)
+        def first():
+            loop(8, lambda step, _m: ravex.log_metrics({"loss": float(step)}))
+            raise KeyboardInterrupt
+
+        with pytest.raises(KeyboardInterrupt):
+            first()
+
+        @ravex.train_loop(backend="torch_save", checkpoint_every=5)
+        def second():
+            loop(3, lambda step, _m: ravex.log_metrics({"loss": step + 100.0}))
+
+        second()
+        # As a Worker would list them: full object keys, forward slashes.
+        root = storage / "metrics"
+        chunks = {
+            "run-7/metrics/" + path.relative_to(root).as_posix(): path.read_text(encoding="utf-8")
+            for path in chunk_files(storage)
+        }
+        # The prefix above the store is the caller's to strip.
+        chunks = {key[len("run-7/"):]: text for key, text in chunks.items()}
+        from_bucket = ravex.metrics.resolve(chunks)
+        from_disk = ravex.metrics.read(str(storage))
+        assert from_bucket["scalars"] == from_disk["scalars"]
+        assert from_bucket["scalars"]["loss"]["step"] == [1, 2, 3, 4, 5, 6, 7, 8]
+
+
+def test_the_reader_imports_without_the_rust_core():
+    """The dashboard runs on Python Workers, which cannot load a compiled module."""
+    import subprocess
+    import sys
+
+    code = (
+        "import sys; sys.modules['ravex._core'] = None; sys.modules['torch'] = None\n"
+        "import ravex.metrics\n"
+        "print(ravex.metrics.resolve({})['scalars'])"
+    )
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "{}"

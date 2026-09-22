@@ -15,6 +15,14 @@
   logged after the checkpoint the next one resumed from. New options:
   `metrics`, `metrics_every`, `system_metrics_every`.
 
+- **Metrics reach the bucket while the run goes on (GPU-152).** A segment is
+  written as chunks, one every `metrics_chunk_every` seconds (default 15), each
+  a file written once; with `storage.type: s3` every chunk is queued on
+  Moonclip's sync thread through its new `sync_prefix` as soon as it lands.
+  `ravex.metrics.resolve(chunks)` resolves chunks fetched any other way, a
+  bucket listing say, into the same timeline, and `ravex.metrics` loads without
+  the Rust core. Uploading needs Moonclip 0.1.2.
+
 ### Fixed
 
 - **A node that dies right after its round no longer strands the others

@@ -9,9 +9,9 @@ work the device does asynchronously — a ``detach().clone()`` for a scalar, a
 min, a max and a ``bincount`` for a histogram — and a writer thread of its own
 brings the results home and appends them to disk.
 
-**Where they go.** ``<storage.path>/metrics/<segment>.jsonl``, one file per
-process per execution. A *segment* starts with a header that says which step it
-resumed from, and that header is what makes a run's history readable across a
+**Where they go.** ``<storage.path>/metrics/<segment>/``, one directory per
+process per execution, written as numbered chunks (see :class:`MetricsWriter`).
+A *segment* starts with a header that says which step it resumed from, and that header is what makes a run's history readable across a
 resume: a run killed at step 700 with its last checkpoint at 500 comes back at
 500, and the points its first execution logged between 501 and 700 belong to a
 timeline that no longer exists. :func:`ravex.metrics.read` keeps each segment
@@ -23,10 +23,10 @@ computes the same loss under data parallelism, or a meaningless partial one
 under anything else, and eight copies of either help nobody. System metrics are
 per machine, so the first process on each machine samples its own.
 
-**What is not here.** A remote store. With ``storage.type: s3`` the path is the
-staging directory, and nothing written beside the backend goes up to the
-bucket. On one cluster the store is a path everybody can read, which is the
-case this is built for.
+**A remote store** (GPU-152). With ``storage.type: s3`` the chunks are written
+into the staging directory, and each one is handed to Moonclip's
+``sync_prefix`` as it lands, so the bucket holds the metrics while the run is
+still going. That is what a dashboard that cannot see the machine reads.
 """
 
 from __future__ import annotations
@@ -217,15 +217,50 @@ def segment_id(started: float, host: str, pid: int, rank: int) -> str:
     )
 
 
-class MetricsWriter:
-    """Appends one segment to disk from a thread of its own."""
+#: Name of a segment's first chunk, which holds only its header.
+HEADER_CHUNK = "000000.jsonl"
 
-    def __init__(self, directory: str, rank: int, start_step: int) -> None:
+
+def chunk_name(sequence: int) -> str:
+    return "%06d.jsonl" % sequence
+
+
+class MetricsWriter:
+    """Writes one segment as a series of chunks, from a thread of its own.
+
+    **Chunks, not one growing file**, because of where they end up. A bucket
+    has no append, and Moonclip's sync skips a file the remote already holds
+    by name: a file that kept growing would go up once, at whatever length it
+    had, and never again. So a segment is a directory, ``000000.jsonl`` holds
+    its header, and every ``chunk_every`` seconds what has been logged since
+    becomes the next numbered file, written once and never touched after.
+
+    Each chunk appears atomically - written beside its final name and renamed
+    - so neither a reader nor the sync ever sees half of one. Once it is in
+    place ``uploader`` is told its path relative to the store, which with a
+    remote store is Moonclip's ``sync_prefix``.
+
+    What that costs: a reader sees a record up to ``chunk_every`` seconds
+    after it was logged, and a crash loses at most as much.
+    """
+
+    def __init__(
+        self,
+        directory: str,
+        rank: int,
+        start_step: int,
+        chunk_every: float = 15.0,
+        uploader: Optional[Callable[[str], None]] = None,
+    ) -> None:
         self.started = time.time()
         self.host = socket.gethostname()
         self.rank = rank
         self.segment = segment_id(self.started, self.host, os.getpid(), rank)
-        self.path = os.path.join(directory, METRICS_DIR, self.segment + ".jsonl")
+        self.directory = directory
+        self.relative = METRICS_DIR + "/" + self.segment
+        self.path = os.path.join(directory, METRICS_DIR, self.segment)
+        self.chunk_every = max(float(chunk_every), 0.0)
+        self._uploader = uploader
         self._header = {
             "segment": self.segment,
             "format": FORMAT_VERSION,
@@ -235,11 +270,13 @@ class MetricsWriter:
             "start_step": start_step,
             "time": self.started,
         }
+        self._sequence = 0
         self._queue: "queue.Queue[Optional[Tuple[int, float, Dict[str, Any]]]]" = queue.Queue(
             maxsize=QUEUE_LIMIT
         )
         self._dropped = 0
         self._failed = False
+        self._upload_failed = False
         self._thread = threading.Thread(target=self._run, name="ravex-metrics", daemon=True)
         self._thread.start()
 
@@ -262,29 +299,53 @@ class MetricsWriter:
         if self._dropped:
             logger.warning("%d metric record(s) were dropped", self._dropped)
 
-    def _run(self) -> None:
-        handle = None
+    def _write_chunk(self, name: str, lines: List[str]) -> None:
+        final = os.path.join(self.path, name)
+        partial = final + ".tmp"
         try:
-            os.makedirs(os.path.dirname(self.path), exist_ok=True)
-            # "x": a segment is never appended to. Finding the file already
-            # there means two executions think they are the same one.
-            handle = open(self.path, "x", encoding="utf-8")
-            handle.write(json.dumps(self._header) + "\n")
-            handle.flush()
+            # "x": a chunk is never written twice. Finding one already there
+            # means two executions think they are the same one.
+            with open(partial, "x", encoding="utf-8") as handle:
+                handle.write("\n".join(lines) + "\n")
+            os.replace(partial, final)
+        except OSError as exc:
+            logger.warning("Cannot write metrics to %s: %s", final, exc)
+            self._failed = True
+            return
+        if self._uploader is None:
+            return
+        try:
+            self._uploader(self.relative + "/" + name)
+        except Exception as exc:
+            if not self._upload_failed:
+                self._upload_failed = True
+                logger.warning(
+                    "Metrics are written locally but cannot be queued for the "
+                    "remote store: %s",
+                    exc,
+                )
+
+    def _run(self) -> None:
+        try:
+            os.makedirs(self.path, exist_ok=True)
         except OSError as exc:
             logger.warning("Cannot write metrics to %s: %s", self.path, exc)
             self._failed = True
+        if not self._failed:
+            self._write_chunk(HEADER_CHUNK, [json.dumps(self._header)])
 
+        pending: List[str] = []
+        opened = time.monotonic()
         done = False
         while not done:
+            wait = max(0.05, min(FLUSH_SECONDS, opened + self.chunk_every - time.monotonic()))
             batch: List[Optional[Tuple[int, float, Dict[str, Any]]]] = []
             try:
-                batch.append(self._queue.get(timeout=FLUSH_SECONDS))
+                batch.append(self._queue.get(timeout=wait))
                 while True:
                     batch.append(self._queue.get_nowait())
             except queue.Empty:
                 pass
-            lines = []
             for record in batch:
                 if record is None:
                     done = True
@@ -297,16 +358,14 @@ class MetricsWriter:
                 except Exception as exc:  # a device error, a freed tensor
                     logger.warning("Dropping metrics at step %d: %s", step, exc)
                     continue
-                lines.append(json.dumps({"step": step, "time": when, "values": resolved}))
-            if lines and handle is not None:
-                try:
-                    handle.write("\n".join(lines) + "\n")
-                    handle.flush()
-                except OSError as exc:
-                    logger.warning("Cannot write metrics to %s: %s", self.path, exc)
-                    self._failed = True
-        if handle is not None:
-            handle.close()
+                pending.append(json.dumps({"step": step, "time": when, "values": resolved}))
+            due = time.monotonic() - opened >= self.chunk_every
+            if pending and not self._failed and (done or due):
+                self._sequence += 1
+                self._write_chunk(chunk_name(self._sequence), pending)
+                pending = []
+            if due:
+                opened = time.monotonic()
 
 
 # ─── system metrics ──────────────────────────────────────────────────
@@ -454,9 +513,10 @@ class MetricsSession:
     logged before then waits here.
     """
 
-    def __init__(self, directory: str, system_every: float) -> None:
+    def __init__(self, directory: str, system_every: float, chunk_every: float = 15.0) -> None:
         self.directory = directory
         self.system_every = system_every
+        self.chunk_every = chunk_every
         self._pending: List[Tuple[int, float, Dict[str, Any]]] = []
         self._writer: Optional[MetricsWriter] = None
         self._sampler: Optional[SystemSampler] = None
@@ -468,7 +528,12 @@ class MetricsSession:
     def begun(self) -> bool:
         return self._begun
 
-    def begin(self, start_step: int, current_step: Callable[[], int]) -> None:
+    def begin(
+        self,
+        start_step: int,
+        current_step: Callable[[], int],
+        uploader: Optional[Callable[[str], None]] = None,
+    ) -> None:
         with self._lock:
             if self._begun:
                 return
@@ -482,7 +547,9 @@ class MetricsSession:
             if not (self._accepts_user or samples_machine):
                 self._pending.clear()
                 return
-            self._writer = MetricsWriter(self.directory, rank, start_step)
+            self._writer = MetricsWriter(
+                self.directory, rank, start_step, self.chunk_every, uploader
+            )
             if self._accepts_user:
                 for record in self._pending:
                     self._writer.put(*record)

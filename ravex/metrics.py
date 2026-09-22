@@ -11,13 +11,22 @@
 
 The path is the run's ``storage.path``, the same one its checkpoints are in.
 
+**Reading from somewhere that is not a directory.** :func:`read` does the I/O
+and :func:`resolve` does the rest. A reader that gets the files some other
+way - a Worker listing an R2 bucket, asynchronously - fetches every object
+under ``metrics/`` and hands ``resolve`` a mapping from each object's path
+below ``metrics/`` (``"<segment>/000003.jsonl"``) to its text. The timeline
+comes out the same either way, which is the point of keeping the rule here.
+This module and :mod:`ravex._metrics` import nothing compiled, so they load
+where Ravex's Rust core cannot.
+
 **The timeline rule.** A run is written in segments, one per execution, and
 each segment's header says the step it resumed from. When a run resumes at
 step 500 after reaching 700, the points its earlier execution logged after 500
 describe a history that was abandoned: the model that produced them no longer
-exists. :func:`read` keeps every segment only up to the step the next one
+exists. :func:`resolve` keeps every segment only up to the step the next one
 resumed from, so the series it returns is the history of the model the store
-holds — one value per step, as if the run had never been interrupted.
+holds - one value per step, as if the run had never been interrupted.
 
 System metrics are exempt. They describe machines, not the model: a GPU that
 was at 100% for the 200 steps that were thrown away really was at 100%, and
@@ -33,11 +42,11 @@ import json
 import logging
 import math
 import os
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple
 
-from ravex._metrics import FORMAT_VERSION, METRICS_DIR
+from ravex._metrics import FORMAT_VERSION, HEADER_CHUNK, METRICS_DIR
 
-__all__ = ["read", "segments"]
+__all__ = ["read", "resolve", "segments"]
 
 logger = logging.getLogger("ravex")
 
@@ -50,46 +59,87 @@ def _value(raw: Any) -> Any:
     return raw
 
 
-def _lines(path: str) -> Iterator[Dict[str, Any]]:
-    with open(path, "r", encoding="utf-8") as handle:
-        for number, line in enumerate(handle, 1):
-            line = line.strip()
-            if not line:
-                continue
+def _records(text: str, where: str) -> Iterator[Dict[str, Any]]:
+    for number, line in enumerate(text.splitlines(), 1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            # Chunks appear whole, by rename, so this is a file somebody
+            # edited, or one copied while it was being written.
+            logger.debug("Skipping unreadable line %d of %s", number, where)
+            continue
+        if isinstance(record, dict):
+            yield record
+
+
+def _local_chunks(path: str) -> Dict[str, str]:
+    """Every chunk under ``<path>/metrics``, keyed by its path below that."""
+    root = os.path.join(path, METRICS_DIR)
+    chunks: Dict[str, str] = {}
+    try:
+        segment_names = os.listdir(root)
+    except FileNotFoundError:
+        return chunks
+    for segment in segment_names:
+        directory = os.path.join(root, segment)
+        if not os.path.isdir(directory):
+            continue
+        for name in os.listdir(directory):
+            if not name.endswith(".jsonl"):
+                continue  # a chunk still being written ends in `.tmp`
             try:
-                yield json.loads(line)
-            except ValueError:
-                # The last line of a process killed mid-write. Anything else
-                # torn is worth a word, because it means the file was edited.
-                logger.debug("Skipping unreadable line %d of %s", number, path)
+                with open(os.path.join(directory, name), "r", encoding="utf-8") as handle:
+                    chunks[segment + "/" + name] = handle.read()
+            except OSError as exc:
+                logger.warning("Cannot read %s: %s", os.path.join(directory, name), exc)
+    return chunks
+
+
+def _grouped(chunks: Mapping[str, str]) -> Dict[str, List[Tuple[str, str]]]:
+    by_segment: Dict[str, List[Tuple[str, str]]] = {}
+    for key, text in chunks.items():
+        key = key.replace("\\", "/").strip("/")
+        if key.startswith(METRICS_DIR + "/"):
+            key = key[len(METRICS_DIR) + 1 :]
+        segment, _, name = key.rpartition("/")
+        if not segment or not name.endswith(".jsonl"):
+            continue
+        by_segment.setdefault(segment, []).append((name, text))
+    for entries in by_segment.values():
+        entries.sort()
+    return by_segment
+
+
+def _headers(by_segment: Mapping[str, List[Tuple[str, str]]]) -> List[Dict[str, Any]]:
+    headers = []
+    for segment, entries in by_segment.items():
+        first = entries[0]
+        if first[0] != HEADER_CHUNK:
+            # The header has not arrived, or was lost. Without it there is no
+            # resume step, and guessing one could cut another segment wrongly.
+            logger.debug("Segment %s has no header chunk; skipped", segment)
+            continue
+        header = next(_records(first[1], segment + "/" + first[0]), None)
+        if header is None or "segment" not in header:
+            continue
+        if header.get("format", 0) > FORMAT_VERSION:
+            logger.warning(
+                "Segment %s was written by a newer Ravex (format %s); reading "
+                "what this version understands",
+                segment,
+                header.get("format"),
+            )
+        headers.append(dict(header, chunks=len(entries) - 1))
+    headers.sort(key=lambda header: (header.get("time", 0.0), header["segment"]))
+    return headers
 
 
 def segments(path: str) -> List[Dict[str, Any]]:
-    """Every segment's header, oldest first, with the file it came from as ``file``."""
-    directory = os.path.join(path, METRICS_DIR)
-    try:
-        names = sorted(n for n in os.listdir(directory) if n.endswith(".jsonl"))
-    except FileNotFoundError:
-        return []
-    headers = []
-    for name in names:
-        file = os.path.join(directory, name)
-        try:
-            first = next(_lines(file), None)
-        except OSError:
-            continue
-        if not isinstance(first, dict) or "segment" not in first:
-            continue
-        if first.get("format", 0) > FORMAT_VERSION:
-            logger.warning(
-                "%s was written by a newer Ravex (format %s); reading what this "
-                "version understands",
-                file,
-                first.get("format"),
-            )
-        headers.append(dict(first, file=file))
-    headers.sort(key=lambda header: (header.get("time", 0.0), header["segment"]))
-    return headers
+    """Every segment's header in the store at ``path``, oldest first."""
+    return _headers(_grouped(_local_chunks(path)))
 
 
 def _series() -> Dict[str, List[Any]]:
@@ -98,6 +148,17 @@ def _series() -> Dict[str, List[Any]]:
 
 def read(path: str) -> Dict[str, Any]:
     """Everything logged into the store at ``path``, resolved into one timeline.
+
+    See :func:`resolve` for what comes back.
+    """
+    return resolve(_local_chunks(path))
+
+
+def resolve(chunks: Mapping[str, str]) -> Dict[str, Any]:
+    """Resolve metric chunks, however they were fetched, into one timeline.
+
+    ``chunks`` maps each chunk's path below ``metrics/`` - ``"<segment>/<n>.jsonl"``,
+    with or without the leading ``metrics/`` - to its text.
 
     Returns a dict with four keys:
 
@@ -116,7 +177,8 @@ def read(path: str) -> Dict[str, Any]:
         The headers, oldest first, each with ``cut_at``: the step past which
         its points were dropped, or ``None`` for the segment that is current.
     """
-    headers = segments(path)
+    by_segment = _grouped(chunks)
+    headers = _headers(by_segment)
     primary = [header for header in headers if header.get("rank", 0) == 0]
     cut_at: Dict[str, Optional[int]] = {}
     for index, header in enumerate(primary):
@@ -132,38 +194,35 @@ def read(path: str) -> Dict[str, Any]:
     histogram_points: Dict[str, List[Tuple[int, int, Dict[str, Any]]]] = {}
 
     for order, header in enumerate(headers):
-        limit = cut_at.get(header["segment"])
+        segment = header["segment"]
+        limit = cut_at.get(segment)
         is_primary = header.get("rank", 0) == 0
         host = str(header.get("host", "unknown"))
-        try:
-            records = list(_lines(header["file"]))
-        except OSError as exc:
-            logger.warning("Cannot read %s: %s", header["file"], exc)
-            continue
-        for record in records[1:]:
-            step = record.get("step")
-            when = record.get("time")
-            values = record.get("values")
-            if not isinstance(step, int) or not isinstance(values, dict):
-                continue
-            for name, raw in values.items():
-                if name.startswith("sys/"):
-                    series = system.setdefault(host, {}).setdefault(name, _series())
-                    series["step"].append(step)
-                    series["time"].append(when)
-                    series["value"].append(_value(raw))
+        for name, text in by_segment[segment][1:]:
+            for record in _records(text, segment + "/" + name):
+                step = record.get("step")
+                when = record.get("time")
+                values = record.get("values")
+                if not isinstance(step, int) or not isinstance(values, dict):
                     continue
-                if not is_primary or (limit is not None and step > limit):
-                    continue
-                if isinstance(raw, dict) and "histogram" in raw:
-                    entry = dict(raw["histogram"], step=step, time=when)
-                    histogram_points.setdefault(name, []).append((step, order, entry))
-                else:
-                    scalar_points.setdefault(name, []).append((step, order, when, _value(raw)))
+                for key, raw in values.items():
+                    if key.startswith("sys/"):
+                        series = system.setdefault(host, {}).setdefault(key, _series())
+                        series["step"].append(step)
+                        series["time"].append(when)
+                        series["value"].append(_value(raw))
+                        continue
+                    if not is_primary or (limit is not None and step > limit):
+                        continue
+                    if isinstance(raw, dict) and "histogram" in raw:
+                        entry = dict(raw["histogram"], step=step, time=when)
+                        histogram_points.setdefault(key, []).append((step, order, entry))
+                    else:
+                        scalar_points.setdefault(key, []).append((step, order, when, _value(raw)))
 
-    for name, points in scalar_points.items():
+    for key, points in scalar_points.items():
         points.sort(key=lambda point: (point[0], point[1]))
-        series = scalars[name] = _series()
+        series = scalars[key] = _series()
         for step, _order, when, value in points:
             if series["step"] and series["step"][-1] == step:
                 series["time"][-1] = when
@@ -173,7 +232,7 @@ def read(path: str) -> Dict[str, Any]:
             series["time"].append(when)
             series["value"].append(value)
 
-    for name, entries in histogram_points.items():
+    for key, entries in histogram_points.items():
         entries.sort(key=lambda point: (point[0], point[1]))
         resolved: List[Dict[str, Any]] = []
         for step, _order, entry in entries:
@@ -181,13 +240,13 @@ def read(path: str) -> Dict[str, Any]:
                 resolved[-1] = entry
             else:
                 resolved.append(entry)
-        histograms[name] = resolved
+        histograms[key] = resolved
 
     for per_host in system.values():
         for series in per_host.values():
             order = sorted(range(len(series["time"])), key=lambda i: series["time"][i])
-            for key in ("step", "time", "value"):
-                series[key] = [series[key][i] for i in order]
+            for field in ("step", "time", "value"):
+                series[field] = [series[field][i] for i in order]
 
     for header in headers:
         header["cut_at"] = cut_at.get(header["segment"])

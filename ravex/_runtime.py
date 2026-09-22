@@ -253,7 +253,9 @@ class RavexRuntime:
                 from ravex._metrics import MetricsSession
 
                 self._metrics = MetricsSession(
-                    self.config.storage.path, self.config.system_metrics_every
+                    self.config.storage.path,
+                    self.config.system_metrics_every,
+                    self.config.metrics_chunk_every,
                 )
 
             logger.info(
@@ -628,6 +630,45 @@ class RavexRuntime:
         if self._metrics is None or not self._enabled:
             return
         self._metrics.log(self.registry.step_count if step is None else int(step), values)
+
+    def _metrics_uploader(self) -> Any:
+        """What sends a finished metric chunk to the remote store, or None.
+
+        Moonclip's ``sync_prefix`` (GPU-152): the chunk goes up on Moonclip's
+        own sync thread, over the S3 client that already carries the
+        checkpoints, so there is one set of credentials and one code path
+        talking to the bucket. None when the store is local, or when the
+        backend cannot do it - and that second case says so, because the
+        metrics would then be on a machine a dashboard cannot see.
+        """
+        if not self.config.storage.is_remote:
+            return None
+        if not self._ensure_backend():
+            return None
+        backend = self._backend
+        manager = getattr(backend, "_manager", None)
+        sync_prefix = getattr(manager, "sync_prefix", None)
+        if sync_prefix is None:
+            logger.warning(
+                "Metrics stay in %s and do not reach the bucket: the %s cannot "
+                "upload them%s",
+                self.config.storage.path,
+                type(backend).__name__,
+                " (Moonclip older than sync_prefix)" if manager is not None else "",
+            )
+            return None
+        root = getattr(backend, "store_root", None)
+        if root is None or os.path.abspath(root) != os.path.abspath(self.config.storage.path):
+            # A per-rank store: the metrics directory is not inside the store
+            # Moonclip syncs, and a path relative to one is not to the other.
+            logger.warning(
+                "Metrics stay in %s and do not reach the bucket: the store "
+                "Moonclip syncs is %s",
+                self.config.storage.path,
+                root,
+            )
+            return None
+        return sync_prefix
 
     def _log_step_metrics(self, optimizer: Any) -> None:
         """The learning rates and the time per step, every `metrics_every` steps."""
@@ -1141,7 +1182,11 @@ class RavexRuntime:
             # one this execution's metrics continue from - see
             # `ravex.metrics.read` for why the header has to say so.
             if self._metrics is not None:
-                self._metrics.begin(self.registry.step_count, lambda: self.registry.step_count)
+                self._metrics.begin(
+                    self.registry.step_count,
+                    lambda: self.registry.step_count,
+                    self._metrics_uploader(),
+                )
 
     def _try_resume_body(self, defer_rng: bool) -> None:
         self._resume_attempted = True
@@ -2364,6 +2409,13 @@ class RavexRuntime:
                 else:
                     self.checkpoint(final=True)
             self.registry.release_pins()
+            if self._metrics is not None:
+                # After the final checkpoint, whose duration is a metric, and
+                # before the backend closes: closing is what writes the last
+                # chunk and queues it, and the backend's own close is the last
+                # sync that can carry it.
+                self._metrics.close(self.registry.step_count)
+                self._metrics = None
             if self._backend is not None:
                 self._backend.close()
             if self._audit is not None:
@@ -2371,10 +2423,6 @@ class RavexRuntime:
                 # disk now, so the last pending entries can be written.
                 self._audit.close()
                 self._audit = None
-            if self._metrics is not None:
-                # After the final checkpoint, whose duration is a metric.
-                self._metrics.close(self.registry.step_count)
-                self._metrics = None
             if self._ring_link:
                 self._ring_link.close()
                 self._ring_link = None

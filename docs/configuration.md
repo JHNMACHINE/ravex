@@ -52,6 +52,7 @@ ravex status
 | `metrics` | `RAVEX_METRICS` | `true` | Write what `ravex.log_metrics` is given, and the metrics Ravex takes on its own, to `metrics/` in the store. See [Metrics](#metrics). |
 | `metrics_every` | `RAVEX_METRICS_EVERY` | `10` | Steps between two records of the automatic step metrics: learning rate per param group, and time per step. |
 | `system_metrics_every` | `RAVEX_SYSTEM_METRICS_EVERY` | `30` | Seconds between two samples of the machine: GPU utilisation and memory, CPU, RAM. `0` turns them off. |
+| `metrics_chunk_every` | `RAVEX_METRICS_CHUNK_EVERY` | `15` | Seconds between two metric chunks: how late a reader of the bucket sees a value, and the most a crash loses. See [Metrics](#metrics). |
 | `frameworks.auto_detect` | — | `true` | Whether to identify the training framework in use. File only: there is no environment variable for it. |
 
 ### Sharded models
@@ -602,15 +603,29 @@ history["system"]["<host>"]["sys/gpu0/utilization"]
 ```
 
 **Across a resume there is one history, not two.** Every execution writes its
-own segment, `metrics/<segment>.jsonl`, headed by the step it resumed from. A
+own segment, `metrics/<segment>/`, headed by the step it resumed from. A
 run killed at step 700 with its last checkpoint at 500 comes back at 500, and
 what it logged between 501 and 700 describes a model that no longer exists:
 `read` keeps each segment only up to the step the next one resumed from. System
 metrics are kept whole, because they describe the machines, and the machines
 really did spend those 200 steps.
 
-**Not yet**: with `storage.type: s3` the metrics stay in the local staging
-directory and do not go up to the bucket.
+**In the bucket while the run goes on.** A segment is a directory of chunks,
+`000000.jsonl` for its header and then one file every `metrics_chunk_every`
+seconds, each written once and never touched again. With `storage.type: s3`
+each chunk is handed to Moonclip's `sync_prefix` as it lands and goes up on
+Moonclip's own sync thread, over the client that already carries the
+checkpoints. Files rather than one growing file because a bucket has no append,
+and Moonclip skips a file the bucket already holds by name. This needs Moonclip
+0.1.2; with an older one, or a `per_rank` store, the metrics stay local and
+Ravex says so.
+
+**Reading without a directory.** `read(path)` does the I/O and
+`ravex.metrics.resolve(chunks)` does the rest: give it each object's key below
+the store (`"metrics/<segment>/000003.jsonl"`) and its text, and the timeline
+comes out the same. That is what a dashboard reading the bucket calls.
+`ravex.metrics` imports nothing compiled, so it loads where Ravex's Rust core
+cannot, such as Cloudflare's Python Workers.
 
 ### More than one machine
 
