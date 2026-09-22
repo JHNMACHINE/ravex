@@ -469,6 +469,10 @@ class SystemSampler:
             self._thread.start()
 
     def _run(self) -> None:
+        # At once, then on the interval. A run shorter than `every` would
+        # otherwise record nothing about the machine it ran on, and a chart
+        # with no points reads as a broken sampler rather than a quick run.
+        self.sample_once()
         while not self._stop.wait(self._every):
             self.sample_once()
 

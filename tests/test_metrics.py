@@ -169,6 +169,19 @@ class TestAutomatic:
         seconds = ravex.metrics.read(str(storage))["scalars"]["ravex/checkpoint_seconds"]
         assert seconds["step"] == [2, 4]
 
+    def test_a_run_shorter_than_the_interval_still_samples_once(self, storage, monkeypatch):
+        """Otherwise a quick run has an empty system chart, which reads as a fault."""
+        monkeypatch.setattr(_metrics, "system_samplers", lambda: [lambda: {"sys/cpu_percent": 3.0}])
+
+        @ravex.train_loop(backend="torch_save", checkpoint_every=10_000, system_metrics_every=3600)
+        def train():
+            loop(1, lambda _s, _m: None)
+
+        train()
+        system = ravex.metrics.read(str(storage))["system"]
+        (host,) = system
+        assert system[host]["sys/cpu_percent"]["value"] == [3.0]
+
     def test_system_samples_go_to_the_machine_and_are_never_cut(self, storage, monkeypatch):
         monkeypatch.setattr(_metrics, "system_samplers", lambda: [lambda: {"sys/cpu_percent": 12.5}])
 
