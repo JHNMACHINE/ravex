@@ -15,6 +15,17 @@
   logged after the checkpoint the next one resumed from. New options:
   `metrics`, `metrics_every`, `system_metrics_every`.
 
+- **A run is a document in its own store (GPU-148).** `run.json` says what the
+  run is - its id, the name a person gave it, when it started, the
+  configuration it started with, credentials removed - and is written once,
+  when the store is born, so a resume cannot change the id everything else
+  quotes. `status.json` says where it got to - running, finished or failed,
+  and at which step - and is overwritten at every checkpoint and at exit.
+  `ravex.runs.describe(path)` reads both, `ravex.runs.discover(root)` lists the
+  runs under a directory, and `ravex.runs.looks_alive` answers the question a
+  dashboard actually asks, knowing that a killed process never gets to write
+  that it stopped. New option: `name`.
+
 - **Metrics reach the bucket while the run goes on (GPU-152).** A segment is
   written as chunks, one every `metrics_chunk_every` seconds (default 15), each
   a file written once; with `storage.type: s3` every chunk is queued on

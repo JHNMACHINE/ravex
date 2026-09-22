@@ -200,6 +200,10 @@ class RavexRuntime:
         self._audit: Any = None
         #: Where `ravex.log_metrics` goes (GPU-147). None with `metrics: false`.
         self._metrics: Any = None
+        #: This run's `run.json`, once the store has one (GPU-148). Only rank 0
+        #: writes it: one store, one document, and eight ranks racing to create
+        #: it would mean eight ids for one run.
+        self._run_record: Any = None
         #: For the automatic step metrics: the step and the clock at the last
         #: record, so the time per step is an average over the interval rather
         #: than the one step that happened to land on the cadence.
@@ -631,8 +635,69 @@ class RavexRuntime:
             return
         self._metrics.log(self.registry.step_count if step is None else int(step), values)
 
-    def _metrics_uploader(self) -> Any:
-        """What sends a finished metric chunk to the remote store, or None.
+    def _open_run_record(self, uploader: Any) -> None:
+        """Write `run.json` if this store is new, and say the run is running.
+
+        At the same moment the metrics segment opens, and for the same reason:
+        this is the first point where the resume has happened, so the step is
+        the real one, and where the process group is up, so rank 0 is known.
+        """
+        if not is_main_process():
+            return
+        try:
+            from ravex import __version__
+            from ravex._runs import RUN_FILE, STATUS_FILE, ensure_run, write_status
+
+            directory = self.config.storage.path
+            self._run_record = ensure_run(
+                directory,
+                run_id=self.config.run_id,
+                name=self.config.name,
+                config=self.config,
+                version=__version__,
+            )
+            self._run_uploader = uploader
+            self._upload_store_file(RUN_FILE)
+            write_status(
+                directory,
+                state="running",
+                step=self.registry.step_count,
+                run_id=self._run_record.get("run_id"),
+            )
+            self._upload_store_file(STATUS_FILE)
+        except Exception as exc:
+            # A run that cannot describe itself still trains. The dashboard is
+            # the thing that loses, and it says so by having nothing to show.
+            logger.warning("Cannot record this run: %s", exc)
+
+    def _record_status(self, state: str) -> None:
+        """Overwrite `status.json`. Cheap enough for every checkpoint."""
+        if self._run_record is None:
+            return
+        try:
+            from ravex._runs import STATUS_FILE, write_status
+
+            write_status(
+                self.config.storage.path,
+                state=state,
+                step=self.registry.step_count,
+                run_id=self._run_record.get("run_id"),
+            )
+            self._upload_store_file(STATUS_FILE)
+        except Exception as exc:
+            logger.debug("Cannot update the run's status: %s", exc)
+
+    def _upload_store_file(self, name: str) -> None:
+        uploader = getattr(self, "_run_uploader", None)
+        if uploader is None:
+            return
+        try:
+            uploader(name)
+        except Exception as exc:
+            logger.debug("Cannot queue %s for the remote store: %s", name, exc)
+
+    def _store_uploader(self) -> Any:
+        """What sends a file written beside the checkpoints to the remote store, or None.
 
         Moonclip's ``sync_prefix`` (GPU-152): the chunk goes up on Moonclip's
         own sync thread, over the S3 client that already carries the
@@ -1181,11 +1246,13 @@ class RavexRuntime:
             # Whatever the resume did or did not do, the step it left is the
             # one this execution's metrics continue from - see
             # `ravex.metrics.read` for why the header has to say so.
+            uploader = self._store_uploader()
+            self._open_run_record(uploader)
             if self._metrics is not None:
                 self._metrics.begin(
                     self.registry.step_count,
                     lambda: self.registry.step_count,
-                    self._metrics_uploader(),
+                    uploader,
                 )
 
     def _try_resume_body(self, defer_rng: bool) -> None:
@@ -1544,6 +1611,10 @@ class RavexRuntime:
             ", ".join("%s %.3fs" % item for item in phases.items()),
         )
         self._warn_if_cadence_is_expensive(step, started, finished, phases)
+        # Every checkpoint, not every step: it is a small file, and a reader
+        # judging whether a run is alive needs the timestamp refreshed on a
+        # cadence it can reason about.
+        self._record_status("running")
         if self._metrics is not None:
             from ravex._metrics import Scalar
 
@@ -2409,6 +2480,7 @@ class RavexRuntime:
                 else:
                     self.checkpoint(final=True)
             self.registry.release_pins()
+            self._record_status("finished")
             if self._metrics is not None:
                 # After the final checkpoint, whose duration is a metric, and
                 # before the backend closes: closing is what writes the last

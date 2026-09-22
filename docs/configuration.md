@@ -47,7 +47,8 @@ ravex status
 | `fallback_on_error` | `RAVEX_FALLBACK_ON_ERROR` | `true` | On an unexpected error, log it and let training continue; the checkpoint is retried at the next one. Set `false` to raise instead. |
 | `log_file` | `RAVEX_LOG_FILE` | `null` | Log destination. Unset means stderr, WARNING and above only. |
 | `log_level` | `RAVEX_LOG_LEVEL` | `INFO` | |
-| `run_id` | `RAVEX_RUN_ID` | `null` | Recorded in checkpoint metadata; also used as the storage prefix when none is set. |
+| `run_id` | `RAVEX_RUN_ID` | `null` | Recorded in checkpoint metadata, and the run's id in `run.json` when the store is new; also used as the storage prefix when none is set. See [The run as a document](#the-run-as-a-document). |
+| `name` | `RAVEX_NAME` | `null` | What a person calls this run, written into `run.json`. Unlike `run_id` it may repeat between experiments. Defaults to the store directory's name. |
 | `audit_log` | `RAVEX_AUDIT_LOG` | `false` | Append one hash-chained entry per durable checkpoint to `audit.jsonl` in the store: step, content fingerprint, config digest. See [Audit trail](#audit-trail). |
 | `metrics` | `RAVEX_METRICS` | `true` | Write what `ravex.log_metrics` is given, and the metrics Ravex takes on its own, to `metrics/` in the store. See [Metrics](#metrics). |
 | `metrics_every` | `RAVEX_METRICS_EVERY` | `10` | Steps between two records of the automatic step metrics: learning rate per param group, and time per step. |
@@ -556,6 +557,42 @@ What else to know:
 - **Not recorded: the loss or the data.** Ravex never sees the loss, and only
   the training script knows what its dataset is. Put a dataset hash in `run_id`
   if you have one — `run_id` is in every entry's metadata.
+
+### The run as a document
+
+Two files in the store, and the split is the point.
+
+`run.json` is **what this run is**: `run_id`, `name`, `created_at`, the
+configuration it started with (credentials removed), and `parent` for a run
+that was forked from another. Written once, when the store is born, and never
+rewritten — a resume is the same run coming back, and an id that changed under
+a resume would break every reference to it. A `run_id` in the configuration
+names a *new* store; an existing one keeps the id it was born with and says so
+in the log.
+
+`status.json` is **where it has got to**: `running`, `finished` or `failed`,
+the last step, and when that was written. Overwritten at every checkpoint and
+at exit.
+
+**A name is not an id.** The name is what somebody reads and may repeat between
+experiments — three runs called `baseline` is normal. The id is what gets
+quoted in a command or in a fork's lineage, and never repeats.
+
+```python
+import ravex.runs
+
+run = ravex.runs.describe("./checkpoints")
+run["run_id"], run["name"], run["parent"]
+run["status"]["state"], run["status"]["step"]
+
+ravex.runs.discover("./runs")          # every run in a directory of stores
+ravex.runs.looks_alive(run)            # still writing?
+```
+
+`looks_alive` is `running` **and** refreshed recently: a process that is killed
+outright never gets to write that it stopped, so a stale timestamp counts as
+stopped whatever the state says. Only rank 0 writes these files, and like
+`ravex.metrics` this module imports nothing compiled.
 
 ### Metrics
 

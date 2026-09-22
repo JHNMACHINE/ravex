@@ -585,8 +585,16 @@ class RavexConfig:
 
     framework_auto_detect: bool = True
 
-    # Purely informational, surfaced in checkpoint metadata.
+    # Purely informational, surfaced in checkpoint metadata. Also the run's
+    # identity in `run.json` when the store is new (GPU-148); an existing store
+    # keeps the id it was born with, and this is ignored with a log line.
     run_id: Optional[str] = None
+
+    #: What a person calls this run, written into ``run.json`` and shown by the
+    #: dashboard. Unlike ``run_id`` it may repeat between experiments - three
+    #: runs called `baseline` is normal - and it defaults to the store
+    #: directory's own name, which is what someone already typed.
+    name: Optional[str] = None
 
     #: Append one entry per durable checkpoint to ``audit.jsonl`` in the store:
     #: its step, a content fingerprint, the config digest, chained by SHA-256.
@@ -796,6 +804,8 @@ class RavexConfig:
             self.fallback_on_error = _as_bool(value, self.fallback_on_error)
         if (value := get("RUN_ID")) is not None:
             self.run_id = value
+        if (value := get("NAME")) is not None:
+            self.name = value or None
         if (value := get("AUDIT_LOG")) is not None:
             self.audit_log = _as_bool(value, self.audit_log)
         if (value := get("METRICS")) is not None:
