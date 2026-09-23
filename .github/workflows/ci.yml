@@ -16,6 +16,11 @@ on:
   # already happened: main was untested and there was no event left to replay.
   workflow_dispatch:
 
+# The job token only reads: nothing here pushes, tags or comments, and releases
+# go out with their own PyPI and crates.io tokens.
+permissions:
+  contents: read
+
 jobs:
   # The engine on every interpreter we claim to support. No Moonclip here:
   # `tests/test_backends.py` skips the Moonclip cases when it is absent, so
@@ -28,7 +33,7 @@ jobs:
   # times here, one interpreter each. That is the standing cost of the decision
   # taken in that issue, and it is paid on main rather than on a branch.
   unit:
-    runs-on: codeberg-medium
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
@@ -71,10 +76,9 @@ jobs:
       # swallowed it, and the job tested main instead. Every PR check was a
       # green tick for code nobody had built.
       - name: Checkout
-        run: |
-          set -eu
-          git clone ${{ forgejo.server_url }}/${{ forgejo.repository }}.git .
-          git checkout ${{ forgejo.sha }}
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       - name: Test on Python ${{ matrix.python }}
         run: |
@@ -102,7 +106,7 @@ jobs:
   # this job independent of whether a Moonclip release happens to be published,
   # and it tests the pairing at the commit both repositories are actually at.
   moonclip-backend:
-    runs-on: codeberg-medium
+    runs-on: ubuntu-latest
     container:
       image: python:3.12-bookworm
     steps:
@@ -122,10 +126,9 @@ jobs:
       # swallowed it, and the job tested main instead. Every PR check was a
       # green tick for code nobody had built.
       - name: Checkout
-        run: |
-          set -eu
-          git clone ${{ forgejo.server_url }}/${{ forgejo.repository }}.git .
-          git checkout ${{ forgejo.sha }}
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       - name: Build Moonclip and run the full suite
         run: |
@@ -133,7 +136,7 @@ jobs:
           pip install --quiet --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple torch
           pip install --quiet maturin pytest pytest-xdist
           git clone --depth 1 \
-            ${{ forgejo.server_url }}/${{ forgejo.repository_owner }}/moonclip.git /tmp/moonclip
+            ${{ github.server_url }}/${{ github.repository_owner }}/moonclip.git /tmp/moonclip
           pip install --quiet /tmp/moonclip
           pip install --quiet -e .
           python -c "import moonclip; print('moonclip', moonclip.__version__)"
@@ -166,8 +169,8 @@ jobs:
           # the file - a store, a port, a working directory belong to the file
           # that sets them up - so a file kept on one worker behaves as it
           # does serially. `-n 4` is spelled out rather than `auto` because
-          # the label says four cores while a count read from the host would
-          # be larger. `OMP_NUM_THREADS=1` because four workers each taking
+          # it is what `ubuntu-latest` gives a public repository, and the count
+          # should not move with whatever host the job lands on. `OMP_NUM_THREADS=1` because four workers each taking
           # four threads is how a parallel suite ends up slower than a serial
           # one.
           OMP_NUM_THREADS=1 pytest tests -v -n 4 --dist loadfile
@@ -178,7 +181,7 @@ jobs:
   # atexit hook runs, which is the one thing the decorator cannot promise.
   # Mirrors integration/Dockerfile — keep the two in step.
   integration:
-    runs-on: codeberg-medium
+    runs-on: ubuntu-latest
     container:
       image: python:3.12-bookworm
     steps:
@@ -198,10 +201,9 @@ jobs:
       # swallowed it, and the job tested main instead. Every PR check was a
       # green tick for code nobody had built.
       - name: Checkout
-        run: |
-          set -eu
-          git clone ${{ forgejo.server_url }}/${{ forgejo.repository }}.git .
-          git checkout ${{ forgejo.sha }}
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       - name: Install
         run: |
@@ -235,7 +237,7 @@ jobs:
   # `test_frameworks.py` is the only file in the suite that imports them. The
   # job above no longer pays for them at all, and this one runs a single file.
   integration-frameworks:
-    runs-on: codeberg-medium
+    runs-on: ubuntu-latest
     container:
       image: python:3.12-bookworm
     steps:
@@ -250,10 +252,9 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.97.1 --profile minimal
 
       - name: Checkout
-        run: |
-          set -eu
-          git clone ${{ forgejo.server_url }}/${{ forgejo.repository }}.git .
-          git checkout ${{ forgejo.sha }}
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       - name: Install
         run: |

@@ -23,9 +23,14 @@ on:
     branches-ignore: [main]
   workflow_dispatch:
 
+# The job token only reads: nothing here pushes, tags or comments, and releases
+# go out with their own PyPI and crates.io tokens.
+permissions:
+  contents: read
+
 jobs:
   unit:
-    runs-on: codeberg-small
+    runs-on: ubuntu-latest
     container:
       image: python:3.12-bookworm
     steps:
@@ -43,10 +48,9 @@ jobs:
       # pushed commit is missing from the clone and the job quietly tests main
       # instead. Same reasoning as ci.yml.
       - name: Checkout
-        run: |
-          set -eu
-          git clone ${{ forgejo.server_url }}/${{ forgejo.repository }}.git .
-          git checkout ${{ forgejo.sha }}
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       # The half of the engine that has no Python in it. Fast, and it fails with
       # a Rust error rather than with a Python traceback wrapped around one.
@@ -79,11 +83,12 @@ jobs:
           # Same index pair as ci.yml, for the same reason: `--index-url` alone
           # replaces PyPI and pip then cannot find torch's build dependencies.
           #
-          # `--no-cache-dir` because this runs on codeberg-small, whose 2 GB
-          # quota counts filesystem writes as well as memory: torch is 750 MB
-          # installed (876 MB of site-packages all told) and the cache would
-          # keep a second copy of the wheel on top. Nothing here is ever reused
-          # - the container is thrown away - so the cache buys nothing.
+          # `--no-cache-dir` dates from codeberg-small, whose 2 GB quota counted
+          # filesystem writes as well as memory: torch is 750 MB installed
+          # (876 MB of site-packages all told) and the cache would keep a second
+          # copy of the wheel on top. GitHub's runners have room to spare, but
+          # the flag still costs nothing: the container is thrown away, so the
+          # cache is never reused.
           pip install --quiet --no-cache-dir --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple torch
           # `-e .` is a maturin editable install since GPU-105: it compiles the
           # crate and puts `_core` in the source tree, so this is where the

@@ -9,6 +9,11 @@ on:
   # be tested by spending a version number. Publishing still requires a tag.
   workflow_dispatch:
 
+# The job token only reads: nothing here pushes, tags or comments, and releases
+# go out with their own PyPI and crates.io tokens.
+permissions:
+  contents: read
+
 # Two jobs and a matrix, since GPU-105. Until then this was one job on plain
 # `python:3.12-bookworm` producing a single `py3-none-any` wheel that served
 # every interpreter and platform, because Ravex was pure Python.
@@ -35,7 +40,7 @@ jobs:
   # First for the same reason Moonclip's crate job is first: if the release
   # stops here, nothing has been published and the version number is still free.
   sdist:
-    runs-on: codeberg-medium
+    runs-on: ubuntu-latest
     container:
       image: quay.io/pypa/manylinux_2_28_x86_64
     steps:
@@ -52,20 +57,20 @@ jobs:
       # By sha rather than by ref name, so a manual rehearsal — where the ref is
       # a branch and not a tag — checks out the same way a release does.
       - name: Checkout
-        run: |
-          git clone ${{ forgejo.server_url }}/${{ forgejo.repository }}.git .
-          git checkout ${{ forgejo.sha }}
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       # A tag can be pushed from any commit in the repository, including one on
       # a branch that was never reviewed or merged. Publishing is the one action
       # here that cannot be undone — PyPI refuses to reuse a version number — so
       # the tag has to name a commit that reached main.
       - name: Tag must be on main
-        if: ${{ forgejo.event_name == 'push' }}
+        if: ${{ github.event_name == 'push' }}
         run: |
           set -eu
           if ! git merge-base --is-ancestor HEAD origin/main; then
-            echo "Tag ${{ forgejo.ref_name }} points at $(git rev-parse --short HEAD)," >&2
+            echo "Tag ${{ github.ref_name }} points at $(git rev-parse --short HEAD)," >&2
             echo "which is not reachable from main. Merge the branch first, then" >&2
             echo "tag the merge commit. Nothing has been published." >&2
             exit 1
@@ -81,12 +86,12 @@ jobs:
       # Ahead of the build and of the token check, because both cost nothing and
       # the mistake they catch is permanent.
       - name: Tag must match the package version
-        if: ${{ forgejo.event_name == 'push' }}
+        if: ${{ github.event_name == 'push' }}
         run: |
           set -eu
           CARGO=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
           PACKAGE=$(/opt/python/cp312-cp312/bin/python -c "import ravex; print(ravex.__version__)")
-          TAG="${{ forgejo.ref_name }}"
+          TAG="${{ github.ref_name }}"
           echo "Cargo.toml $CARGO, ravex.__version__ $PACKAGE, tag $TAG"
           if [ "$CARGO" != "$PACKAGE" ]; then
             echo "Cargo.toml and ravex/__init__.py disagree: the wheel would be" >&2
@@ -130,7 +135,7 @@ jobs:
           ls "$tmp"/*/CHANGELOG.md
 
       - name: Upload to PyPI
-        if: ${{ forgejo.event_name == 'push' }}
+        if: ${{ github.event_name == 'push' }}
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.RAVEX_PYPI_TOKEN }}
@@ -156,7 +161,7 @@ jobs:
   # `--skip-existing` then makes unrepairable.
   wheels:
     needs: sdist
-    runs-on: codeberg-medium
+    runs-on: ubuntu-latest
     container:
       # The PyPA manylinux image ships every supported CPython under
       # /opt/python/cp3XX-cp3XX/bin/, each with pip — and, unlike plain
@@ -179,21 +184,20 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.97.1 --profile minimal
 
       - name: Checkout
-        run: |
-          set -eu
-          git clone ${{ forgejo.server_url }}/${{ forgejo.repository }}.git .
-          git checkout ${{ forgejo.sha }}
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       # Cheap, and repeated here on purpose: these jobs can be re-run
       # individually, and a wheel whose metadata disagrees with the tag is
       # exactly what the check in the sdist job exists to prevent.
       - name: Tag must match the package version
-        if: ${{ forgejo.event_name == 'push' }}
+        if: ${{ github.event_name == 'push' }}
         run: |
           set -eu
           VERSION=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
-          if [ "v$VERSION" != "${{ forgejo.ref_name }}" ]; then
-            echo "Tag ${{ forgejo.ref_name }} does not match version $VERSION" >&2
+          if [ "v$VERSION" != "${{ github.ref_name }}" ]; then
+            echo "Tag ${{ github.ref_name }} does not match version $VERSION" >&2
             exit 1
           fi
 
@@ -232,7 +236,7 @@ jobs:
           /opt/python/cp312-cp312/bin/python -c 'import sys, zipfile; names = zipfile.ZipFile(sys.argv[1]).namelist(); assert any(n.startswith("ravex/_core.") for n in names), "no compiled core"; print("wheel layout ok")' "$(ls dist/*.whl)"
 
       - name: Upload to PyPI
-        if: ${{ forgejo.event_name == 'push' }}
+        if: ${{ github.event_name == 'push' }}
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.RAVEX_PYPI_TOKEN }}
