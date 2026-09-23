@@ -43,7 +43,7 @@ def main() -> None:
     holdout, holdout_labels = spiral(512, args.seed + 1000)
 
     @ravex.train_loop(
-        backend="torch_save",
+        backend="moonclip",
         checkpoint_every=100,
         keep_last=10,
         metrics_chunk_every=2,

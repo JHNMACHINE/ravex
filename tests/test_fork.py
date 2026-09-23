@@ -228,3 +228,24 @@ class TestFork:
             pytest.skip("this Moonclip predates pin()")
         assert 4 in manager.pinned_steps()
         assert ravex.runs.describe(str(tmp_path / "child"))["parent"]["step"] == 4
+
+    def test_a_fork_into_another_model_stops_instead_of_starting_over(self, tmp_path, monkeypatch):
+        # A parameter that changes the model was changed: the parent's weights
+        # do not fit. Training from scratch under the fork's lineage would be a
+        # run whose history is a lie; it stops and says why.
+        parent = tmp_path / "base"
+        parent_run(parent, monkeypatch)
+        monkeypatch.setenv("RAVEX_STORAGE_PATH", str(tmp_path / "child"))
+
+        def wider():
+            model = torch.nn.Linear(4, 3)
+            optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+            ravex.track(model=model, optimizer=optimizer)
+            while ravex.step() < 6:
+                ravex.batch_boundary()
+                model(torch.randn(2, 4)).sum().backward()
+                optimizer.step()
+                optimizer.zero_grad()
+
+        with pytest.raises(RuntimeError, match="does not fit"):
+            ravex.train_loop(backend="torch_save", checkpoint_every=2, fork_from=str(parent), fork_step=4)(wider)()

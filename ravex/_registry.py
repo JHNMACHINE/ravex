@@ -738,6 +738,12 @@ class ObjectRegistry:
                     model, optimizers, saved["model"], saved["optimizer"]
                 )
 
+        # What the bridging below cannot place either: models of a shape the
+        # checkpoint has no state for. They keep their fresh initialisation
+        # while the step counter says otherwise - which a caller that asked for
+        # *this* checkpoint (a fork, a restart with new parameters) must hear.
+        leftover = len([key for key in saved_sharded if key not in claimed_sharded])
+        self.unrestored_models = [key for key, _model in unmatched_models[leftover:]]
         self._bridge_topologies(
             unmatched_models,
             unmatched_sharded,

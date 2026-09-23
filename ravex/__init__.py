@@ -287,6 +287,39 @@ def log_metrics(values: Any = None, *, step: Optional[int] = None) -> Any:
 _warned_outside = False
 
 
+#: Settings whoever launched this run chose for it, as JSON: the platform's
+#: run page, where somebody changed `checkpoint_every` and pressed save.
+OVERRIDE_ENV = "RAVEX_OVERRIDE"
+
+
+def _apply_platform_override(config: object) -> None:
+    """``RAVEX_OVERRIDE``, applied last - over the decorator's arguments too.
+
+    The one exception to "the decorator wins". A decorator argument is the
+    script's author choosing a setting for every run of that script; this is
+    somebody choosing one for *this* run, on purpose, after the fact - which is
+    why it cannot lose to the script, or a changed ``checkpoint_every`` would
+    be read and silently ignored. The same strictness as the decorator's: an
+    unknown name raises rather than being dropped.
+    """
+    import json
+    import os
+
+    raw = os.environ.get(OVERRIDE_ENV)
+    if not raw:
+        return
+    try:
+        chosen = json.loads(raw)
+    except ValueError as exc:
+        raise TypeError(f"{OVERRIDE_ENV} is not JSON: {exc}") from None
+    if not isinstance(chosen, dict):
+        raise TypeError(f"{OVERRIDE_ENV} must be a JSON object of settings")
+    for key, value in chosen.items():
+        if key == "storage" or not hasattr(config, key):
+            raise TypeError(f"{OVERRIDE_ENV}: unknown or unsettable configuration option {key!r}")
+        setattr(config, key, value)
+
+
 def _activate(**overrides: object) -> None:
     """Build the runtime and install the patches. The decorator's entry half.
 
@@ -324,6 +357,7 @@ def _activate(**overrides: object) -> None:
             config.apply_storage(value, strict=True)
             continue
         setattr(config, key, value)
+    _apply_platform_override(config)
     config._normalize()
 
     runtime = RavexRuntime(config)

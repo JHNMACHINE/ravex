@@ -29,6 +29,27 @@
   `torch_save` there is nothing to pin with and the log says so. Not yet with
   `sharded_checkpoints: per_rank`.
 
+- **`keep_hyperparameters` (`RAVEX_KEEP_HYPERPARAMETERS`).** A resume that
+  keeps the script's hyperparameters — learning rate, weight decay, the shape
+  of the schedule (a cosine's `T_max` included) — over the checkpoint's, while
+  the weights, the optimizer's state and how far along the schedule the run
+  is still come from the checkpoint. For a run restarted with parameters
+  somebody changed, which is what the platform's "save" does; without it the
+  new learning rate was read from the command line and then silently replaced
+  by the old one. Forks do the same, always.
+
+- **`RAVEX_OVERRIDE`**: settings chosen for one run, as JSON, applied last —
+  over the decorator's arguments too, which otherwise win over every
+  `RAVEX_*` variable. For whoever launches a run and changes, say,
+  `checkpoint_every` on purpose; an unknown name raises.
+
+- **A restore asked for by name fails loudly when the checkpoint does not
+  fit.** With `fork_from` or `keep_hyperparameters`, a model the checkpoint has
+  no state for — a different shape, usually because a parameter that changes
+  the model was changed — stops the run with an error instead of training
+  from scratch under the old run's history. An ordinary resume still falls
+  back with a warning, as before.
+
 - **`backend.known_steps()`**: every step a store holds, oldest first. It is
   what the error above lists, and what a dashboard draws as the points a run
   can be resumed or forked from.

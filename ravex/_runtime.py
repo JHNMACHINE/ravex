@@ -1344,15 +1344,34 @@ class RavexRuntime:
             # not a Ravex store is "nothing to resume" — the right answer.
             if self._convert_foreign(defer_rng):
                 return
-            resume_manager.try_resume(
+            # Taken before the restore overwrites it: what the script says now,
+            # for a restart whose parameters somebody changed.
+            chosen = self._hyperparameters() if self.config.keep_hyperparameters else None
+            resumed = resume_manager.try_resume(
                 defer_rng=defer_rng, per_rank=self._per_rank_active()
             )
+            if resumed and chosen is not None:
+                self._require_everything_restored()
+                self._keep_hyperparameters(chosen)
+                logger.info("Resumed with this script's hyperparameters, as keep_hyperparameters asks")
             self._restore_extra_state(resume_manager.restored_extra)
         except ResumeStepMissing:
             # Not caught here: `resume_step` is a number somebody typed, and
             # "starting from scratch" is the one outcome they did not ask for.
             raise
         except Exception as exc:
+            if self.config.fork_from or self.config.keep_hyperparameters:
+                # Asked for by name: carry on from *that* checkpoint, with
+                # these parameters. When it does not fit - a model of another
+                # shape, most often, because a parameter that changes the
+                # model was changed - starting from scratch would be a new
+                # model filed under the old run's history, which is a corrupt
+                # run and not a restart. Stop, and say why.
+                raise RuntimeError(
+                    "The checkpoint this run was asked to continue from does not fit it (%s). "
+                    "If a parameter that changes the model was changed, start a new run "
+                    "from scratch instead" % exc
+                ) from exc
             logger.warning("Resume failed (%s) - starting from scratch", exc)
         finally:
             self._restoring = False
@@ -1416,6 +1435,7 @@ class RavexRuntime:
         chosen = self._hyperparameters()
         applied = manager._apply(state, defer_rng)
         if applied:
+            self._require_everything_restored()
             self._keep_hyperparameters(chosen)
             self._fork_parent = {"run": parent_record.get("run_id"), "step": int(step)}
             logger.info(
@@ -1426,53 +1446,88 @@ class RavexRuntime:
             )
         return applied
 
+    #: A scheduler's state that is *progress* - how far along its schedule the
+    #: run is - rather than configuration. Everything else in its state dict is
+    #: the schedule itself, and that is the script's to choose.
+    _SCHEDULE_PROGRESS = frozenset(
+        {"last_epoch", "_step_count", "_last_lr", "_get_lr_called_within_step", "_is_initial"}
+    )
+
     def _hyperparameters(self) -> Dict[str, Any]:
         """What this script chose for its optimizers and schedulers, before a
-        fork's restore overwrites it with the parent's."""
+        restore overwrites it with what the checkpoint was written with."""
         groups = [
             [{k: v for k, v in group.items() if k != "params"} for group in optimizer.param_groups]
             for _key, optimizer in self.registry.keyed_optimizers()
         ]
-        base_lrs = [list(getattr(s, "base_lrs", []) or []) for s in self.registry.schedulers]
-        return {"groups": groups, "base_lrs": base_lrs}
+        schedules = []
+        for scheduler in self.registry.schedulers:
+            try:
+                state = dict(scheduler.state_dict())
+            except Exception:  # pragma: no cover - a scheduler without one
+                state = {}
+            schedules.append(
+                {k: v for k, v in state.items() if k not in self._SCHEDULE_PROGRESS}
+            )
+        return {"groups": groups, "schedules": schedules}
 
     def _keep_hyperparameters(self, chosen: Dict[str, Any]) -> None:
-        """Put this script's hyperparameters back after a fork's restore.
+        """Put this script's hyperparameters back after a restore.
 
-        A resume restores everything, the learning rate included: it is the
-        same run coming back. A fork is not - changing the learning rate, or
-        the schedule, from a point of another run is what a fork is usually
-        *for*, and the issue's own test is two forks with different ones. So
-        the parent gives the weights and the optimizer's state (the moments,
-        the step counts); the child's script gives the hyperparameters.
+        A plain resume restores everything, the learning rate included: it is
+        the same run coming back with the same configuration. Two cases are
+        not. A fork (GPU-149) - changing the learning rate or the schedule from
+        a point of another run is what a fork is usually *for*. And a run
+        restarted with parameters somebody changed (``keep_hyperparameters``,
+        the platform's "save"). In both, the checkpoint gives the weights, the
+        optimizer's state (the moments, the step counts) and how far along the
+        schedule the run is; the script gives the hyperparameters and the
+        shape of the schedule - a cosine's ``T_max`` included, which a longer
+        run changes.
 
-        With a scheduler, the learning rate at the fork step is the child's
-        schedule evaluated there, where the scheduler can say it in closed
-        form; otherwise it is the child's initial one, and the log says so.
+        The learning rate at the restart step is then the script's schedule
+        evaluated there, where the scheduler can say it in closed form;
+        otherwise it is the script's initial one, and the log says so.
         """
         for (_key, optimizer), groups in zip(self.registry.keyed_optimizers(), chosen["groups"]):
             for live, mine in zip(optimizer.param_groups, groups):
                 live.update(mine)
-        for scheduler, base_lrs in zip(self.registry.schedulers, chosen["base_lrs"]):
-            if not base_lrs or not hasattr(scheduler, "base_lrs"):
+        for scheduler, schedule in zip(self.registry.schedulers, chosen["schedules"]):
+            if not schedule:
                 continue
-            scheduler.base_lrs = list(base_lrs)
+            scheduler.__dict__.update(schedule)
             closed = getattr(scheduler, "_get_closed_form_lr", None)
             if closed is None:
                 logger.info(
-                    "%s has no closed form, so this fork's learning rate starts from the "
-                    "script's own rather than from its schedule at the fork step",
+                    "%s has no closed form, so the learning rate restarts from the "
+                    "script's own rather than from its schedule at this step",
                     type(scheduler).__name__,
                 )
                 continue
             try:
                 lrs = closed()
             except Exception as exc:  # pragma: no cover - a scheduler's own business
-                logger.info("Could not place %s at the fork step: %s", type(scheduler).__name__, exc)
+                logger.info("Could not place %s at this step: %s", type(scheduler).__name__, exc)
                 continue
             for group, lr in zip(scheduler.optimizer.param_groups, lrs):
                 group["lr"] = lr
             scheduler._last_lr = list(lrs)
+
+    def _require_everything_restored(self) -> None:
+        """For a restore somebody asked for by name: every model got its state.
+
+        A model of a shape the checkpoint does not have is skipped by the
+        restore and keeps its fresh weights, with the step counter restored
+        around it. For an ordinary resume that is one warning; for a fork or a
+        restart with changed parameters it is a new model filed under an old
+        history, and it stops the run.
+        """
+        missing = getattr(self.registry, "unrestored_models", None) or []
+        if missing:
+            raise RuntimeError(
+                "model(s) %s have no state in that checkpoint: their shape differs from "
+                "the one it was written with" % ", ".join(missing)
+            )
 
     def _open_parent_store(self, source: str, record: Dict[str, Any]) -> Any:
         """The parent's store, as the backend that wrote it would read it."""

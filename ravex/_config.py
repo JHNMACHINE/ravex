@@ -252,6 +252,15 @@ class RavexConfig:
     fork_from: Optional[str] = None
     fork_step: Optional[int] = None
 
+    #: On a resume, keep the hyperparameters this script sets - learning
+    #: rate, weight decay, the shape of the schedule - instead of the ones the
+    #: checkpoint was written with. Off by default, because a resume is the
+    #: same run coming back and the checkpoint is right. On for a restart with
+    #: changed parameters, which is what the platform's "save" does: without
+    #: it a new learning rate would be read from the command line and then
+    #: silently replaced by the old one. A fork always keeps them.
+    keep_hyperparameters: bool = False
+
     # Optional hard stop, in optimizer steps. Without it, a resumed script runs
     # its own loop bounds again from the top and overshoots the intended
     # budget; with it, Ravex ends the run at the right step no matter how many
@@ -841,6 +850,8 @@ class RavexConfig:
             self.fork_from = value or None
         if (value := get("FORK_STEP")) is not None:
             self.fork_step = _as_int(value, 0) if value else None
+        if (value := get("KEEP_HYPERPARAMETERS")) is not None:
+            self.keep_hyperparameters = _as_bool(value, self.keep_hyperparameters)
         if (value := get("AUDIT_LOG")) is not None:
             self.audit_log = _as_bool(value, self.audit_log)
         if (value := get("METRICS")) is not None:
