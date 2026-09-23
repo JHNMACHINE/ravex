@@ -146,12 +146,71 @@ def _series() -> Dict[str, List[Any]]:
     return {"step": [], "time": [], "value": []}
 
 
-def read(path: str) -> Dict[str, Any]:
+def read(path: str, inherited: bool = True) -> Dict[str, Any]:
     """Everything logged into the store at ``path``, resolved into one timeline.
 
     See :func:`resolve` for what comes back.
+
+    **A fork continues its parent's line** (GPU-149). When the store's
+    ``run.json`` names a parent - a run started with ``fork_from`` - each of
+    its series begins with the parent's points up to the fork step, read the
+    same way and so through the parent's own parents, and the answer has a
+    ``parent`` key, ``{"store": ..., "step": ...}``: where the line changes
+    hands, which is where a chart draws the branch. ``inherited=False`` is the
+    run's own points only.
+
+    System metrics are not inherited: they describe the parent's machines, not
+    this run's. A parent store that is not where the fork recorded it is
+    skipped with a warning rather than failing the read.
     """
-    return resolve(_local_chunks(path))
+    history = resolve(_local_chunks(path))
+    if inherited:
+        _inherit(path, history, {os.path.abspath(path)})
+    return history
+
+
+def _parent_of(path: str) -> Optional[Tuple[str, int]]:
+    """The store this run forked from, and the step, from its run.json."""
+    try:
+        with open(os.path.join(path, "run.json"), encoding="utf-8") as handle:
+            record = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    parent = record.get("parent") or {}
+    source = (record.get("config") or {}).get("fork_from")
+    if parent.get("step") is None or not source:
+        return None
+    return str(source), int(parent["step"])
+
+
+def _inherit(path: str, history: Dict[str, Any], seen: set) -> None:
+    found = _parent_of(path)
+    if found is None:
+        return
+    source, step = found
+    if os.path.abspath(source) in seen:
+        return
+    if not os.path.isdir(source):
+        logger.warning(
+            "%s forked from %s, which is not there; reading its own points only", path, source
+        )
+        return
+    seen.add(os.path.abspath(source))
+    before = resolve(_local_chunks(source))
+    _inherit(source, before, seen)
+    for key, series in before["scalars"].items():
+        keep = [i for i, at in enumerate(series["step"]) if at <= step]
+        own = history["scalars"].get(key, _series())
+        merged = _series()
+        for field in ("step", "time", "value"):
+            merged[field] = [series[field][i] for i in keep] + [
+                value for at, value in zip(own["step"], own[field]) if at > step
+            ]
+        history["scalars"][key] = merged
+    for key, entries in before["histograms"].items():
+        own_entries = [entry for entry in history["histograms"].get(key, []) if entry["step"] > step]
+        history["histograms"][key] = [entry for entry in entries if entry["step"] <= step] + own_entries
+    history["parent"] = {"store": source, "step": step}
 
 
 def resolve(chunks: Mapping[str, str]) -> Dict[str, Any]:

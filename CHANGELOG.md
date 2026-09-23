@@ -27,7 +27,15 @@
   changing them from a point of another run is what a fork is for. With
   Moonclip the parent's step is pinned so retention cannot take it; with
   `torch_save` there is nothing to pin with and the log says so. Not yet with
-  `sharded_checkpoints: per_rank`.
+  `sharded_checkpoints: per_rank`. The parent may keep training while a fork
+  starts from it; with Moonclip the pin survives the parent's own saves.
+
+- **`ravex.metrics.read` follows a fork back to its parent.** A fork's series
+  begin with the parent's points up to the fork step - through the parent's
+  own parents - and the answer says where the line changes hands
+  (`history["parent"]`), which is where a chart draws the branch.
+  `inherited=False` reads the run's own points only. A parent store that has
+  moved is skipped with a warning.
 
 - **`keep_hyperparameters` (`RAVEX_KEEP_HYPERPARAMETERS`).** A resume that
   keeps the script's hyperparameters — learning rate, weight decay, the shape

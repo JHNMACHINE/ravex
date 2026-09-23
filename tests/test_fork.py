@@ -249,3 +249,124 @@ class TestFork:
 
         with pytest.raises(RuntimeError, match="does not fit"):
             ravex.train_loop(backend="torch_save", checkpoint_every=2, fork_from=str(parent), fork_step=4)(wider)()
+
+
+def logged_to(total, lr=0.1):
+    """train_to, logging the loss at every step."""
+    torch.manual_seed(0)
+    model = torch.nn.Linear(4, 2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=lr)
+    ravex.track(model=model, optimizer=optimizer)
+    while ravex.step() < total:
+        ravex.batch_boundary()
+        loss = model(torch.randn(2, 4)).sum()
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+        ravex.log_metrics({"train/loss": loss})
+
+
+class TestReadingALineage:
+    """ravex.metrics.read follows a fork back to its parent, without the platform."""
+
+    def test_a_forks_series_begins_with_its_parents(self, tmp_path, monkeypatch):
+        import ravex.metrics
+
+        parent = tmp_path / "base"
+        monkeypatch.setenv("RAVEX_STORAGE_PATH", str(parent))
+        ravex.train_loop(backend="torch_save", checkpoint_every=2, metrics_chunk_every=0)(lambda: logged_to(6))()
+        child = tmp_path / "child"
+        monkeypatch.setenv("RAVEX_STORAGE_PATH", str(child))
+        ravex.train_loop(
+            backend="torch_save", checkpoint_every=2, metrics_chunk_every=0, fork_from=str(parent), fork_step=4
+        )(lambda: logged_to(8, lr=0.01))()
+
+        whole = ravex.metrics.read(str(child))
+        assert whole["scalars"]["train/loss"]["step"] == [1, 2, 3, 4, 5, 6, 7, 8]
+        # Where the line changes hands: the chart's branch point.
+        assert whole["parent"] == {"store": str(parent), "step": 4}
+        # The parent's first four are the parent's own values.
+        assert whole["scalars"]["train/loss"]["value"][:4] == ravex.metrics.read(str(parent))["scalars"]["train/loss"]["value"][:4]
+
+        own = ravex.metrics.read(str(child), inherited=False)
+        assert own["scalars"]["train/loss"]["step"] == [5, 6, 7, 8]
+        assert "parent" not in own
+
+    def test_a_parent_that_moved_leaves_the_forks_own_points(self, tmp_path, monkeypatch):
+        import shutil
+
+        import ravex.metrics
+
+        parent = tmp_path / "base"
+        monkeypatch.setenv("RAVEX_STORAGE_PATH", str(parent))
+        ravex.train_loop(backend="torch_save", checkpoint_every=2, metrics_chunk_every=0)(lambda: logged_to(4))()
+        child = tmp_path / "child"
+        monkeypatch.setenv("RAVEX_STORAGE_PATH", str(child))
+        ravex.train_loop(
+            backend="torch_save", checkpoint_every=2, metrics_chunk_every=0, fork_from=str(parent), fork_step=2
+        )(lambda: logged_to(4))()
+        shutil.rmtree(parent)
+        assert ravex.metrics.read(str(child))["scalars"]["train/loss"]["step"] == [3, 4]
+
+
+class TestAParentStillTraining:
+    """The issue's last condition: the parent carries on without noticing."""
+
+    def test_a_fork_starts_while_the_parent_keeps_training(self, tmp_path, monkeypatch):
+        # Two processes on one Moonclip store: the parent writing its manifest
+        # at every checkpoint, the child opening it to read step 4 and pin it.
+        # The pin must survive the parent's later writes.
+        import subprocess
+        import sys
+        import time
+
+        moonclip = pytest.importorskip("moonclip")
+        parent = tmp_path / "base"
+        code = f"""
+import os, time, torch, ravex
+os.environ["RAVEX_STORAGE_PATH"] = {str(parent)!r}
+
+@ravex.train_loop(backend="moonclip", checkpoint_every=2, async_save=False)
+def train():
+    torch.manual_seed(0)
+    model = torch.nn.Linear(4, 2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    ravex.track(model=model, optimizer=optimizer)
+    while ravex.step() < 40:
+        ravex.batch_boundary()
+        model(torch.randn(2, 4)).sum().backward()
+        optimizer.step()
+        optimizer.zero_grad()
+        time.sleep(0.1)
+
+train()
+"""
+        process = subprocess.Popen([sys.executable, "-c", code])
+        try:
+            deadline = time.monotonic() + 120
+            while time.monotonic() < deadline:
+                described = ravex.runs.describe(str(parent))
+                if described and (described["status"].get("step") or 0) >= 6:
+                    break
+                time.sleep(0.2)
+            else:
+                raise AssertionError("the parent never reached step 6")
+
+            monkeypatch.setenv("RAVEX_STORAGE_PATH", str(tmp_path / "child"))
+            seen = {}
+            ravex.train_loop(
+                backend="moonclip", checkpoint_every=2, async_save=False, fork_from=str(parent), fork_step=4
+            )(lambda: train_to(8, seen=seen))()
+            assert seen["start"] == 4
+            # Forked while the parent was still going.
+            assert process.poll() is None
+            assert process.wait(timeout=120) == 0
+        finally:
+            if process.poll() is None:
+                process.kill()
+
+        described = ravex.runs.describe(str(parent))
+        assert described["status"]["state"] == "finished" and described["status"]["step"] == 40
+        manager = moonclip.MoonclipManager(str(parent))
+        if hasattr(manager, "pinned_steps"):
+            assert 4 in manager.pinned_steps(), "the parent's own writes dropped the fork's pin"
