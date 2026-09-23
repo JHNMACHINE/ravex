@@ -27,6 +27,16 @@
   backlog when it answers, and chunks a dead process left unsent go first the
   next time a run opens the store. Without an endpoint nothing changes.
 
+- **`ravex ship --storage STORE --endpoint URL`**: sends a backend what a
+  store's runs never got to send, run document and final status included, and
+  exits non-zero if some of it still did not arrive. For the case the item
+  above leaves open: a run that *ends* while its backend is down keeps its
+  chunks for "the next execution on this store", and a finished run never gets
+  one — in the platform's first end-to-end test that left the backend with a
+  run stuck at `running` and four fifths of its points missing. Closing still
+  does not wait out a backend that is down; whoever outlives the run calls
+  this until it succeeds, and a repeat sends nothing twice.
+
 ### Fixed
 
 - **A run that raised is no longer recorded as `finished`.** `status.json`

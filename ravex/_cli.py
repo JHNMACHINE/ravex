@@ -26,11 +26,15 @@ frameworks read, where Ravex's own store is a format only Ravex reads.
 ``audit`` is the same kind: reading, listing and verifying the audit log a run
 with ``audit_log: true`` left in its store (GPU-93). The person who needs it is
 usually not the one who ran the training, and is asking months later.
+
+``ship`` too acts on a store whose run is gone: it sends a backend what that
+run could not (GPU-156), for a run that ended while its backend was down.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 
@@ -200,6 +204,74 @@ def _rendezvous(args) -> int:
         del server
 
 
+def _held_steps(storage):
+    """The steps a local store holds, read the way the run that wrote it would.
+
+    ``None`` when that cannot be said from here: a store in a bucket needs its
+    credentials, and a run.json without a config does not say which backend
+    wrote it. The metrics still go; only the checkpoint list is left alone.
+    """
+    from ravex._backends import get_backend
+    from ravex._config import RavexConfig
+
+    try:
+        with open(os.path.join(storage, "run.json"), encoding="utf-8") as handle:
+            written = json.load(handle).get("config") or {}
+    except (OSError, ValueError):
+        return None
+    if not written.get("backend") or (written.get("storage") or {}).get("type", "local") != "local":
+        return None
+    config = RavexConfig()
+    config.storage.path = storage
+    config.backend = written["backend"]
+    config._normalize()
+    try:
+        store = get_backend(config)
+        try:
+            return store.known_steps()
+        finally:
+            store.close()
+    except Exception as exc:
+        print(f"ravex ship: cannot list the checkpoints in {storage}: {exc}", file=sys.stderr)
+        return None
+
+
+def _ship(args) -> int:
+    """Send a backend what a store's executions never got to send (GPU-156).
+
+    A run posts itself while it trains, but closing does not wait out a backend
+    that is down: a run that has finished training should not sit there because
+    the dashboard is. What was left stays on disk for "the next execution on
+    this store" - which a finished run never gets. This is that execution
+    without the training: whoever outlives the run (the platform's agent, or a
+    person) calls it until it says everything arrived.
+    """
+    from ravex._ship import CLOSE_SECONDS, Shipper
+
+    if not os.path.isfile(os.path.join(args.storage, "run.json")):
+        print(f"ravex ship: {args.storage} holds no run.json, so it is not a run's store", file=sys.stderr)
+        return 2
+    token = args.token or os.environ.get("RAVEX_METRICS_TOKEN") or None
+    # recover=True is the whole command: it queues every chunk the ledgers do
+    # not list as confirmed, and marks the run document for sending, so the
+    # final status goes too.
+    shipper = Shipper(args.endpoint, args.storage, token=token, recover=True)
+    steps = _held_steps(args.storage)
+    if steps is not None:
+        # The list a resume is picked from. The backend's copy is whatever the
+        # run last managed to send, which after retention can name steps the
+        # store no longer holds - a resume the page offers and Ravex refuses.
+        shipper.checkpoints(steps)
+    shipper.close(timeout=args.wait if args.wait is not None else CLOSE_SECONDS)
+    left = shipper.pending
+    if left:
+        # Nothing is lost: the chunks stay, unconfirmed, for the next attempt.
+        print(f"ravex ship: {left} chunk(s) of {args.storage} did not reach {args.endpoint}", file=sys.stderr)
+        return 1
+    print(f"{args.storage}: everything it holds is at {args.endpoint}")
+    return 0
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="ravex",
@@ -255,6 +327,23 @@ def main(argv=None) -> int:
     )
     rendezvous.add_argument("--port", type=int, default=29400, help="default: 29400")
     rendezvous.set_defaults(handler=_rendezvous)
+
+    ship = subparsers.add_parser(
+        "ship",
+        help="send a backend what a store's runs never got to send (metrics_endpoint)",
+    )
+    ship.add_argument("--storage", required=True, help="the run's store")
+    ship.add_argument("--endpoint", required=True, help="the backend, as metrics_endpoint")
+    ship.add_argument(
+        "--token", default=None, help="default: RAVEX_METRICS_TOKEN, as metrics_token"
+    )
+    ship.add_argument(
+        "--wait",
+        type=float,
+        default=None,
+        help="seconds to spend on a backlog that is going out (default: as at the end of a run)",
+    )
+    ship.set_defaults(handler=_ship)
 
     args = parser.parse_args(argv)
     if not hasattr(args, "handler"):

@@ -235,6 +235,64 @@ class TestUnreachable:
         assert backend.points(run_id, "train/loss") == [1, 2, 3, 4, 5, 6, 7, 8]
         assert shipped(storage) == written(storage)
 
+    def test_a_run_that_ended_while_the_backend_was_down_is_sent_by_ravex_ship(self, storage, backend):
+        # What the platform's first end-to-end run hit: the backend went down
+        # mid-run and came back as the run finished. Closing makes one more
+        # attempt and leaves the rest on disk "for the next execution" - which a
+        # finished run never gets, so the backend kept a run stuck at `running`
+        # with four fifths of its points missing. `ravex ship` is that next
+        # execution without the training.
+        from ravex._cli import main
+
+        backend.down = True
+
+        @ravex.train_loop(
+            backend="torch_save",
+            checkpoint_every=10_000,
+            metrics_chunk_every=0,
+            system_metrics_every=0,
+            metrics_endpoint=backend.url,
+        )
+        def train():
+            tiny(6)
+
+        train()
+        run_id = ravex.runs.describe(str(storage))["run_id"]
+        assert backend.points(run_id, "train/loss") == []
+
+        backend.down = False
+        assert main(["ship", "--storage", str(storage), "--endpoint", backend.url, "--wait", "10"]) == 0
+        assert backend.points(run_id, "train/loss") == [1, 2, 3, 4, 5, 6]
+        assert backend.runs[run_id]["status"]["state"] == "finished"
+        # And what a resume can pick: the final checkpoint, read off the store.
+        assert backend.checkpoints[run_id] == [6]
+        assert shipped(storage) == written(storage)
+
+        # Again, with nothing left: nothing is sent twice.
+        assert main(["ship", "--storage", str(storage), "--endpoint", backend.url]) == 0
+        assert backend.points(run_id, "train/loss") == [1, 2, 3, 4, 5, 6]
+
+    def test_ravex_ship_says_so_when_the_backend_is_still_down(self, storage, backend, capsys):
+        from ravex._cli import main
+
+        backend.down = True
+
+        @ravex.train_loop(backend="torch_save", checkpoint_every=10_000, metrics_endpoint=backend.url)
+        def train():
+            tiny(2)
+
+        train()
+        assert main(["ship", "--storage", str(storage), "--endpoint", backend.url, "--wait", "2"]) == 1
+        assert "did not reach" in capsys.readouterr().err
+        # Nothing marked as sent, so the next attempt still has all of it.
+        assert not shipped(storage)
+
+    def test_ravex_ship_refuses_a_directory_that_is_not_a_store(self, tmp_path, backend):
+        from ravex._cli import main
+
+        assert main(["ship", "--storage", str(tmp_path), "--endpoint", backend.url]) == 2
+        assert backend.runs == {}
+
     def test_a_backend_that_comes_back_gets_the_backlog(self, tmp_path, backend):
         store = tmp_path / "store"
         segment = store / METRICS_DIR / "0000000000001-host-1-r0-abcdef12"
