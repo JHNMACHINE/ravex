@@ -42,7 +42,7 @@ jobs:
           # 1.98.1. Pinning the same version here matters: rustup honours the
           # toolchain file regardless, so a different `--default-toolchain`
           # means downloading two compilers to use one.
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.98.1 --profile minimal
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.98.1 --profile minimal --component clippy
 
       # Not shallow: `--depth 1` fetches only the default branch's tip, so the
       # pushed commit is missing from the clone and the job quietly tests main
