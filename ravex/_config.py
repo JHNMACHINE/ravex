@@ -241,6 +241,17 @@ class RavexConfig:
     #: asked to continue.
     resume_step: Optional[int] = None
 
+    #: Start this run as a fork of another (GPU-149): the store of the run it
+    #: branches from, and the step. The child has a store of its own - this
+    #: run's ``storage.path`` - and the first time it starts, with nothing in
+    #: it yet, it loads ``fork_step`` from the parent's store, read-only, and
+    #: continues from there. Its ``run.json`` records the parent, which is what
+    #: lets a dashboard draw the child's line out of the parent's. Without
+    #: ``fork_step`` it is the parent's newest checkpoint. Once the child has a
+    #: checkpoint of its own it resumes from that, like any run.
+    fork_from: Optional[str] = None
+    fork_step: Optional[int] = None
+
     # Optional hard stop, in optimizer steps. Without it, a resumed script runs
     # its own loop bounds again from the top and overshoots the intended
     # budget; with it, Ravex ends the run at the right step no matter how many
@@ -826,6 +837,10 @@ class RavexConfig:
             self.name = value or None
         if (value := get("RESUME_STEP")) is not None:
             self.resume_step = _as_int(value, 0) if value else None
+        if (value := get("FORK_FROM")) is not None:
+            self.fork_from = value or None
+        if (value := get("FORK_STEP")) is not None:
+            self.fork_step = _as_int(value, 0) if value else None
         if (value := get("AUDIT_LOG")) is not None:
             self.audit_log = _as_bool(value, self.audit_log)
         if (value := get("METRICS")) is not None:
@@ -933,6 +948,22 @@ class RavexConfig:
                 )
                 coerced = None
             self.resume_step = coerced
+        if self.fork_step is not None:
+            coerced = _as_int(self.fork_step, -1)
+            if coerced < 0:
+                self.problems.append(f"fork_step={self.fork_step!r} is not a step; ignoring it")
+                coerced = None
+            self.fork_step = coerced
+        if self.fork_from is not None:
+            self.fork_from = str(self.fork_from) or None
+        if self.fork_from and self.resume_step is not None:
+            # Two different answers to "where does this run start". A fork
+            # that has checkpoints of its own resumes from them anyway.
+            self.problems.append(
+                "fork_from and resume_step both given; resume_step is ignored, "
+                "use fork_step for the step of the parent"
+            )
+            self.resume_step = None
 
         for name in (
             "backend",

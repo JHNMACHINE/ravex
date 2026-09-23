@@ -204,6 +204,9 @@ class RavexRuntime:
         #: writes it: one store, one document, and eight ranks racing to create
         #: it would mean eight ids for one run.
         self._run_record: Any = None
+        #: ``{run, step}`` of the run this one forked from, once the fork has
+        #: happened; written into ``run.json`` (GPU-149).
+        self._fork_parent: Optional[Dict[str, Any]] = None
         #: Sends the run to the platform's backend (GPU-156). None without
         #: `metrics_endpoint`.
         self._shipper: Any = None
@@ -660,6 +663,7 @@ class RavexRuntime:
                 run_id=self.config.run_id,
                 name=self.config.name,
                 config=self.config,
+                parent=self._fork_parent,
                 version=__version__,
             )
             self._run_uploader = uploader
@@ -1328,6 +1332,11 @@ class RavexRuntime:
             # Anything the loading machinery does to the optimizer is not
             # training; see the guard in on_step.
             self._restoring = True
+            # A fork's first start: this store is empty, and the state comes
+            # from the parent's. Every later start finds the child's own
+            # checkpoints and takes the ordinary path below.
+            if self._fork(defer_rng):
+                return
             # Before the ordinary resume, not instead of it: a foreign
             # checkpoint is converted here and the normal path is skipped only
             # when that succeeded. If it did not, the run falls through and
@@ -1347,6 +1356,137 @@ class RavexRuntime:
             logger.warning("Resume failed (%s) - starting from scratch", exc)
         finally:
             self._restoring = False
+
+    def _fork(self, defer_rng: bool) -> bool:
+        """Start this run from another run's checkpoint (GPU-149).
+
+        Only while this run's own store is empty: from its first checkpoint on
+        a fork is a run like any other, and resumes from what it wrote. The
+        parent's store is opened read-only, with the backend the parent was
+        written with, and nothing is written into it except a pin.
+
+        A step the parent does not hold stops the run, for the reason
+        ``resume_step`` does: somebody chose that point, and training from
+        scratch or from another step is the one thing they did not ask for.
+        """
+        source = self.config.fork_from
+        if not source:
+            return False
+        backend = self._backend
+        if backend is not None and backend.has_checkpoint():
+            return False
+        if self._per_rank_active():
+            raise ValueError(
+                "fork_from with sharded_checkpoints: per_rank is not supported yet; "
+                "fork from a gathered checkpoint"
+            )
+
+        from ravex._resume import ResumeStepMissing
+        from ravex._runs import RUN_FILE, read_json
+
+        parent_record = read_json(os.path.join(source, RUN_FILE)) or {}
+        parent = self._open_parent_store(source, parent_record)
+        try:
+            step = self.config.fork_step
+            if step is None:
+                step = parent.latest_step()
+                if step is None:
+                    raise ResumeStepMissing(
+                        "fork_from=%s holds no checkpoint to fork from" % source, -1, []
+                    )
+            state = parent.load_step(step)
+            if not state:
+                raise ResumeStepMissing(
+                    "fork_step=%d is not in %s" % (step, source), step, parent.known_steps()
+                )
+            if not parent.pin(step):
+                logger.info(
+                    "Step %d of %s could not be pinned (%s backend); retention there may "
+                    "take it before this run writes a checkpoint of its own",
+                    step,
+                    source,
+                    parent_record.get("config", {}).get("backend") or "this",
+                )
+        finally:
+            parent.close()
+
+        manager = self._resume_manager
+        if manager is None:  # pragma: no cover - _ensure_backend sets it
+            return False
+        chosen = self._hyperparameters()
+        applied = manager._apply(state, defer_rng)
+        if applied:
+            self._keep_hyperparameters(chosen)
+            self._fork_parent = {"run": parent_record.get("run_id"), "step": int(step)}
+            logger.info(
+                "Forked from %s at step %d; this run writes to %s",
+                parent_record.get("run_id") or source,
+                step,
+                self.config.storage.path,
+            )
+        return applied
+
+    def _hyperparameters(self) -> Dict[str, Any]:
+        """What this script chose for its optimizers and schedulers, before a
+        fork's restore overwrites it with the parent's."""
+        groups = [
+            [{k: v for k, v in group.items() if k != "params"} for group in optimizer.param_groups]
+            for _key, optimizer in self.registry.keyed_optimizers()
+        ]
+        base_lrs = [list(getattr(s, "base_lrs", []) or []) for s in self.registry.schedulers]
+        return {"groups": groups, "base_lrs": base_lrs}
+
+    def _keep_hyperparameters(self, chosen: Dict[str, Any]) -> None:
+        """Put this script's hyperparameters back after a fork's restore.
+
+        A resume restores everything, the learning rate included: it is the
+        same run coming back. A fork is not - changing the learning rate, or
+        the schedule, from a point of another run is what a fork is usually
+        *for*, and the issue's own test is two forks with different ones. So
+        the parent gives the weights and the optimizer's state (the moments,
+        the step counts); the child's script gives the hyperparameters.
+
+        With a scheduler, the learning rate at the fork step is the child's
+        schedule evaluated there, where the scheduler can say it in closed
+        form; otherwise it is the child's initial one, and the log says so.
+        """
+        for (_key, optimizer), groups in zip(self.registry.keyed_optimizers(), chosen["groups"]):
+            for live, mine in zip(optimizer.param_groups, groups):
+                live.update(mine)
+        for scheduler, base_lrs in zip(self.registry.schedulers, chosen["base_lrs"]):
+            if not base_lrs or not hasattr(scheduler, "base_lrs"):
+                continue
+            scheduler.base_lrs = list(base_lrs)
+            closed = getattr(scheduler, "_get_closed_form_lr", None)
+            if closed is None:
+                logger.info(
+                    "%s has no closed form, so this fork's learning rate starts from the "
+                    "script's own rather than from its schedule at the fork step",
+                    type(scheduler).__name__,
+                )
+                continue
+            try:
+                lrs = closed()
+            except Exception as exc:  # pragma: no cover - a scheduler's own business
+                logger.info("Could not place %s at the fork step: %s", type(scheduler).__name__, exc)
+                continue
+            for group, lr in zip(scheduler.optimizer.param_groups, lrs):
+                group["lr"] = lr
+            scheduler._last_lr = list(lrs)
+
+    def _open_parent_store(self, source: str, record: Dict[str, Any]) -> Any:
+        """The parent's store, as the backend that wrote it would read it."""
+        import copy
+
+        from ravex._backends import get_backend
+
+        written = record.get("config") or {}
+        config = copy.deepcopy(self.config)
+        config.storage.type = "local"
+        config.storage.path = source
+        config.backend = written.get("backend") or self.config.backend
+        config.fork_from = None
+        return get_backend(config)
 
     def _convert_foreign(self, defer_rng: bool) -> bool:
         """Restore from a checkpoint another framework wrote, if there is one

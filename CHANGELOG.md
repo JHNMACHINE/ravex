@@ -13,6 +13,22 @@
   error lists the steps the store does hold, because after retention a number
   remembered from a log is often just past the edge of what survives.
 
+- **Forks: `fork_from` and `fork_step` (GPU-149).** A new run that starts
+  from step N of another, in a store of its own: the first start, with that
+  store empty, loads step N from the parent's store read-only and continues
+  from there; `run.json` records `parent: {run, step}`, which is what lets a
+  dashboard draw the child's line out of the parent's. From its first
+  checkpoint on the fork resumes from its own store like any run. Also as
+  `RAVEX_FORK_FROM` / `RAVEX_FORK_STEP`; without a step, the parent's newest.
+  A step the parent does not hold stops the run and lists the ones it has.
+  **The parent gives the weights and the optimizer's state, the child's
+  script gives the hyperparameters** — learning rate, weight decay, and with
+  a scheduler the child's own schedule evaluated at the fork step — because
+  changing them from a point of another run is what a fork is for. With
+  Moonclip the parent's step is pinned so retention cannot take it; with
+  `torch_save` there is nothing to pin with and the log says so. Not yet with
+  `sharded_checkpoints: per_rank`.
+
 - **`backend.known_steps()`**: every step a store holds, oldest first. It is
   what the error above lists, and what a dashboard draws as the points a run
   can be resumed or forked from.

@@ -94,6 +94,17 @@ class CheckpointBackend(ABC):
         """
         return []
 
+    def pin(self, step: int) -> bool:
+        """Keep ``step`` whatever retention decides. False when this cannot.
+
+        For the checkpoint a fork starts from (GPU-149): the child reads it
+        from this store once, and until the child has written a checkpoint of
+        its own, losing it to retention would lose the child's only way back.
+        ``torch_save`` has nothing to hold it with and answers False; the
+        caller says so rather than pretending.
+        """
+        return False
+
     def describe_step(self, step: int) -> Optional[Dict[str, Any]]:
         """The shape of the checkpoint at ``step``, with no tensors in it.
 
@@ -458,6 +469,13 @@ class MoonclipBackend(CheckpointBackend):
             return []
         steps = {int(s["step"]) for s in snapshots if s.get("step") is not None}
         return sorted(steps)
+
+    def pin(self, step: int) -> bool:
+        pin = getattr(self._manager, "pin", None)
+        if pin is None:
+            # A Moonclip from before pin() existed (GPU-154).
+            return False
+        return bool(pin(int(step)))
 
     def load_step(self, step: int) -> Optional[Dict[str, Any]]:
         try:
