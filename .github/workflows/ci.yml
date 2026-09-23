@@ -66,9 +66,9 @@ jobs:
           apt-get install -y -qq git build-essential
           # Since GPU-105 the engine has a Rust core, so `pip install -e .`
           # compiles one. Debian bookworm ships rustc 1.63 and
-          # `rust-toolchain.toml` asks for 1.97.1; pinning the same version
+          # `rust-toolchain.toml` asks for 1.98.1; pinning the same version
           # here means rustup installs one compiler instead of two.
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.97.1 --profile minimal
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.98.1 --profile minimal
 
       # Not shallow, and the checkout is allowed to fail the job. `--depth 1`
       # fetches only the default branch's tip, so a pull request's own commit is
@@ -115,10 +115,10 @@ jobs:
           apt-get update -qq
           apt-get install -y -qq git build-essential
           # Debian bookworm ships rustc 1.63. Both repositories now pin
-          # 1.97.1 in a `rust-toolchain.toml`, and rustup honours those
+          # 1.98.1 in a `rust-toolchain.toml`, and rustup honours those
           # over whatever is installed here — so naming the same version
           # is the difference between one compiler and three.
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.97.1 --profile minimal
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.98.1 --profile minimal
 
       # Not shallow, and the checkout is allowed to fail the job. `--depth 1`
       # fetches only the default branch's tip, so a pull request's own commit is
@@ -191,9 +191,9 @@ jobs:
           apt-get install -y -qq git build-essential
           # Since GPU-105 the engine has a Rust core, so `pip install -e .`
           # compiles one. Debian bookworm ships rustc 1.63 and
-          # `rust-toolchain.toml` asks for 1.97.1; pinning the same version
+          # `rust-toolchain.toml` asks for 1.98.1; pinning the same version
           # here means rustup installs one compiler instead of two.
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.97.1 --profile minimal
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.98.1 --profile minimal
 
       # Not shallow, and the checkout is allowed to fail the job. `--depth 1`
       # fetches only the default branch's tip, so a pull request's own commit is
@@ -247,9 +247,9 @@ jobs:
           apt-get install -y -qq git build-essential
           # Since GPU-105 the engine has a Rust core, so `pip install -e .`
           # compiles one. Debian bookworm ships rustc 1.63 and
-          # `rust-toolchain.toml` asks for 1.97.1; pinning the same version
+          # `rust-toolchain.toml` asks for 1.98.1; pinning the same version
           # here means rustup installs one compiler instead of two.
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.97.1 --profile minimal
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.98.1 --profile minimal
 
       - name: Checkout
         uses: actions/checkout@v5

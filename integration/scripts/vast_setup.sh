@@ -54,7 +54,7 @@ if [ "$WITH_MOONCLIP" = "1" ]; then
     echo "── moonclip (Rust build, a few minutes) ─────────────────"
     if ! command -v cargo >/dev/null; then
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --default-toolchain 1.90.0 --profile minimal
+            | sh -s -- -y --default-toolchain 1.98.1 --profile minimal
     fi
     . "$HOME/.cargo/env"
     pip install --quiet maturin

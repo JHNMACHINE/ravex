@@ -52,10 +52,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends g++ curl \
 
 # Rust, since GPU-105: the reshard planner is a compiled extension and
 # `pip install -e .` builds it. Debian's rustc is far too old and
-# `rust-toolchain.toml` pins 1.97.1, so that exact version is installed here —
+# `rust-toolchain.toml` pins 1.98.1, so that exact version is installed here —
 # naming a different one only makes rustup fetch a second compiler to satisfy
 # the toolchain file.
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.97.1 --profile minimal
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.98.1 --profile minimal
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 WORKDIR /app
