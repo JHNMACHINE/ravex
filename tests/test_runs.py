@@ -234,6 +234,27 @@ class TestComingBackAtAStep:
         again()
         assert seen["after"] == 3, "continued from step 2, not from 6"
 
+    def test_a_named_step_is_where_a_moonclip_run_comes_back(self, storage):
+        # The same with the default backend, whose steps are snapshots in a
+        # manifest rather than files - and whose retention is the one that
+        # would take the step first.
+        pytest.importorskip("moonclip")
+
+        @ravex.train_loop(backend="moonclip", checkpoint_every=2, async_save=False)
+        def first():
+            tiny(6)
+
+        first()
+        seen = {}
+
+        @ravex.train_loop(backend="moonclip", checkpoint_every=2, async_save=False, resume_step=2)
+        def again():
+            tiny(1)
+            seen["after"] = ravex.step()
+
+        again()
+        assert seen["after"] == 3, "continued from step 2, not from 6"
+
     def test_a_step_the_store_does_not_hold_stops_the_run(self, storage):
         """Falling back to the newest would resume the history being left behind."""
         self.run_to(storage, 6)
