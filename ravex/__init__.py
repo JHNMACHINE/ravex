@@ -43,7 +43,7 @@ from typing import Any, Callable, Optional, TypeVar
 #: the wheel from. Two places, because maturin has no equivalent of setuptools'
 #: ``dynamic = {attr = ...}``; ``tests/test_version_is_single.py`` fails if they
 #: ever disagree.
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "batch_boundary",

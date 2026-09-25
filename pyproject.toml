@@ -87,7 +87,12 @@ dependencies = ["PyYAML>=5.1"]
 #            run goes on. Without it the metrics stay local, which `_runtime`
 #            says, but `keep_last: 1` silently resuming from the first
 #            checkpoint is not something to leave reachable.
-moonclip = ["moonclip>=0.1.2"]
+#            0.1.3 since GPU-154 and GPU-149: a fork pins its parent's step,
+#            and the pin has to hold while the parent keeps training in
+#            another process. Older releases have no `pin()`, which
+#            `_backends` survives by answering False, but then retention can
+#            take the fork's only way back.
+moonclip = ["moonclip>=0.1.3"]
 dev = ["pytest>=7", "numpy"]
 
 [project.urls]
