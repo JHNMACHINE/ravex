@@ -5,7 +5,7 @@
 # Run it *on the box*:
 #
 #   curl -sSLo measure_handoff.sh \
-#     https://codeberg.org/JHNMACHINE/ravex/raw/branch/main/integration/scripts/measure_handoff.sh
+#     https://raw.githubusercontent.com/JHNMACHINE/ravex/main/integration/scripts/measure_handoff.sh
 #   bash measure_handoff.sh 2>&1 | tee /root/measure.log
 #
 # Nothing is copied from a laptop and nothing is compiled: both libraries come
@@ -44,7 +44,7 @@ print("ravex", ravex.__version__, "| moonclip", moonclip.__version__,
 EOF
 # Only the driving script comes from git: the packages are the published ones.
 [ -d /root/ravex-src ] || git clone --quiet --depth 1 \
-    https://codeberg.org/JHNMACHINE/ravex.git /root/ravex-src
+    https://github.com/JHNMACHINE/ravex.git /root/ravex-src
 SCRIPT=/root/ravex-src/integration/scripts/train_fsdp_cuda.py
 
 # One workspace per run: Ravex finds its config by walking up from the working

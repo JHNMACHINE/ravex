@@ -16,7 +16,7 @@ edition = "2021"
 rust-version = "1.83"
 description = "The arithmetic core of Ravex: reshard planning, checkpoint format readers"
 license = "Apache-2.0"
-repository = "https://codeberg.org/JHNMACHINE/ravex"
+repository = "https://github.com/JHNMACHINE/ravex"
 readme = "README.md"
 publish = false
 

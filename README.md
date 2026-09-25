@@ -14,10 +14,10 @@ transport — so wheels are built per
 interpreter for Linux x86_64. On any other platform pip falls back to the source
 distribution, which builds if you have a Rust toolchain. Through 0.0.5 Ravex was
 pure Python and installed anywhere; what that bought and what it cost is in the
-[CHANGELOG](https://codeberg.org/JHNMACHINE/ravex/src/branch/main/CHANGELOG.md),
+[CHANGELOG](https://github.com/JHNMACHINE/ravex/blob/main/CHANGELOG.md),
 along with everything else that changed between versions.
 
-Its default checkpoint engine, [Moonclip](https://codeberg.org/JHNMACHINE/moonclip),
+Its default checkpoint engine, [Moonclip](https://github.com/JHNMACHINE/moonclip),
 ships wheels for the same platform — so `pip install "ravex[moonclip]"` is a
 Linux thing, and where it is unavailable Ravex falls back to `torch_save` on its
 own.
@@ -135,7 +135,7 @@ Full reference: [docs/configuration.md](docs/configuration.md).
 
 ## Backends
 
-**`moonclip`** (default) — the [Moonclip](https://codeberg.org/JHNMACHINE/moonclip)
+**`moonclip`** (default) — the [Moonclip](https://github.com/JHNMACHINE/moonclip)
 engine: per-tensor delta tracking, so unchanged weights cost zero I/O; zstd
 compression; background writes; direct S3/R2 sync.
 

@@ -91,13 +91,13 @@ moonclip = ["moonclip>=0.1.2"]
 dev = ["pytest>=7", "numpy"]
 
 [project.urls]
-Homepage = "https://codeberg.org/JHNMACHINE/ravex"
-Source = "https://codeberg.org/JHNMACHINE/ravex"
-Issues = "https://codeberg.org/JHNMACHINE/ravex/issues"
+Homepage = "https://github.com/JHNMACHINE/ravex"
+Source = "https://github.com/JHNMACHINE/ravex"
+Issues = "https://github.com/JHNMACHINE/ravex/issues"
 # Shown by PyPI under "Project links", which is where someone deciding whether to
 # upgrade looks. A relative link in the README would not serve: PyPI renders
 # relative paths as-is instead of resolving them against the repository.
-Changelog = "https://codeberg.org/JHNMACHINE/ravex/src/branch/main/CHANGELOG.md"
+Changelog = "https://github.com/JHNMACHINE/ravex/blob/main/CHANGELOG.md"
 
 [project.scripts]
 ravex = "ravex._cli:main"
