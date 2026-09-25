@@ -1,4 +1,4 @@
-"""One run on this machine's CPU: a small MLP learning two interleaved spirals.
+"""One run on this machine's GPU, or its CPU without one: a small MLP learning two interleaved spirals.
 
     RAVEX_STORAGE_PATH=runs/mine python examples/spiral.py --lr 5e-3 --steps 3000
 
@@ -39,8 +39,11 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    points, labels = spiral(2048, args.seed)
-    holdout, holdout_labels = spiral(512, args.seed + 1000)
+    # The GPU when there is one: on a node rented for it, a run on the CPU
+    # would be paying for a card and leaving it idle.
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    points, labels = (tensor.to(device) for tensor in spiral(2048, args.seed))
+    holdout, holdout_labels = (tensor.to(device) for tensor in spiral(512, args.seed + 1000))
 
     @ravex.train_loop(
         backend="moonclip",
@@ -52,7 +55,7 @@ def main() -> None:
     )
     def run():
         torch.manual_seed(args.seed)
-        model = model_for(args.width)
+        model = model_for(args.width).to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
         schedule = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.steps)
         loss_fn = torch.nn.CrossEntropyLoss()
