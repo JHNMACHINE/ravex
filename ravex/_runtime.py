@@ -24,6 +24,8 @@ import logging
 import os
 import signal
 import sys
+import shutil
+import tempfile
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -51,6 +53,22 @@ _LOG_FORMAT = "%(asctime)s [ravex] %(levelname)s %(message)s"
 #: accumulation. The slack is for a loop that steps the same optimizer
 #: more than once per iteration, which is unusual but not wrong.
 _ROUND_BOUNDARY_GRACE_STEPS = 2
+
+
+def _bucket_uri(source: str) -> Optional[Tuple[str, str]]:
+    """``(bucket, prefix)`` when ``source`` names a store in a bucket.
+
+    The form is the one a run reports as its ``store_uri`` - ``s3://bucket``
+    or ``s3://bucket/prefix`` - so a platform can hand a fork the parent's
+    address exactly as the parent gave it. ``s3`` whatever the provider: R2
+    and the rest speak the same protocol, and the endpoint is a setting.
+    """
+    if not source.startswith("s3://"):
+        return None
+    bucket, _, prefix = source[len("s3://") :].partition("/")
+    if not bucket:
+        raise ValueError("fork_from=%r names no bucket" % source)
+    return bucket, prefix.strip("/")
 
 
 def _drain_accelerator() -> None:
@@ -1403,8 +1421,25 @@ class RavexRuntime:
         from ravex._resume import ResumeStepMissing
         from ravex._runs import RUN_FILE, read_json
 
-        parent_record = read_json(os.path.join(source, RUN_FILE)) or {}
-        parent = self._open_parent_store(source, parent_record)
+        bucket = _bucket_uri(source)
+        staging: Optional[str] = None
+        if bucket is not None:
+            # A parent in a bucket, written on another machine (GPU-159): a
+            # copy of its store comes down beside this run's, is read like a
+            # local one, and goes away once the step is in memory.
+            staging = tempfile.mkdtemp(
+                prefix=".fork-parent-",
+                dir=os.path.dirname(os.path.abspath(self.config.storage.path)) or None,
+            )
+            try:
+                parent = self._open_remote_parent(source, bucket, staging)
+            except BaseException:
+                shutil.rmtree(staging, ignore_errors=True)
+                raise
+            parent_record = read_json(os.path.join(staging, RUN_FILE)) or {}
+        else:
+            parent_record = read_json(os.path.join(source, RUN_FILE)) or {}
+            parent = self._open_parent_store(source, parent_record)
         try:
             step = self.config.fork_step
             if step is None:
@@ -1418,7 +1453,17 @@ class RavexRuntime:
                 raise ResumeStepMissing(
                     "fork_step=%d is not in %s" % (step, source), step, parent.known_steps()
                 )
-            if not parent.pin(step):
+            if staging is not None:
+                # A pin lives beside the manifest of the machine that trains
+                # the parent, and this copy is not that machine's.
+                logger.info(
+                    "Step %d of %s is not pinned: the parent is in a bucket, and a pin "
+                    "reaches only the machine it is made on. Retention there may take it "
+                    "before this run writes a checkpoint of its own",
+                    step,
+                    source,
+                )
+            elif not parent.pin(step):
                 logger.info(
                     "Step %d of %s could not be pinned (%s backend); retention there may "
                     "take it before this run writes a checkpoint of its own",
@@ -1427,7 +1472,13 @@ class RavexRuntime:
                     parent_record.get("config", {}).get("backend") or "this",
                 )
         finally:
-            parent.close()
+            if staging is not None:
+                # Discarded rather than closed: closing a store with a remote
+                # syncs it, and this copy has nothing to give back.
+                parent.discard()
+                shutil.rmtree(staging, ignore_errors=True)
+            else:
+                parent.close()
 
         manager = self._resume_manager
         if manager is None:  # pragma: no cover - _ensure_backend sets it
@@ -1542,6 +1593,40 @@ class RavexRuntime:
         config.backend = written.get("backend") or self.config.backend
         config.fork_from = None
         return get_backend(config)
+
+    def _open_remote_parent(self, source: str, bucket: Tuple[str, str], staging: str) -> Any:
+        """The parent's store from a bucket, copied into ``staging`` (GPU-159).
+
+        Reached with this run's own storage settings - endpoint, region,
+        credentials - because a platform keeps its runs in one bucket, and a
+        run that forks is one of them. Moonclip, and Moonclip only: it is what
+        writes to a bucket, and ``get_backend``'s fallback to ``torch_save``
+        would open an empty directory and report a parent with no checkpoints.
+        """
+        import copy
+
+        from ravex._backends import MoonclipBackend
+        from ravex._resume import ResumeStepMissing
+
+        config = copy.deepcopy(self.config)
+        storage = config.storage
+        if not storage.is_remote:
+            storage.type = "s3"
+        storage.bucket, storage.prefix = bucket
+        storage.path = staging
+        storage.resolve_credentials()
+        config.backend = "moonclip"
+        config.fork_from = None
+        parent = MoonclipBackend(config)
+        try:
+            if not parent.restore_from_remote():
+                raise ResumeStepMissing(
+                    "fork_from=%s holds no checkpoint to fork from" % source, -1, []
+                )
+        except BaseException:
+            parent.discard()
+            raise
+        return parent
 
     def _convert_foreign(self, defer_rng: bool) -> bool:
         """Restore from a checkpoint another framework wrote, if there is one

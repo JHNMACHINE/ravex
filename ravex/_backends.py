@@ -158,6 +158,16 @@ class CheckpointBackend(ABC):
     def close(self) -> None:
         self.flush()
 
+    def discard(self) -> None:
+        """Let go of the store without pushing anything anywhere.
+
+        For a copy that was only read - a fork's parent brought down from a
+        bucket (GPU-159). ``close`` would sync it back, which for a store this
+        process never wrote is traffic at best. Backends with no remote have
+        nothing to hold back, which is why this is not abstract.
+        """
+        self.flush()
+
     #: The directory this store lives in on local disk. With a remote store it
     #: is the staging directory the bucket is synced from. The audit trail is
     #: written here (GPU-93), inside the store it describes.
@@ -567,6 +577,12 @@ class MoonclipBackend(CheckpointBackend):
                 self._manager.sync_now()
             except Exception as exc:
                 logger.warning("Final remote sync failed: %s", exc)
+
+    def discard(self) -> None:
+        # Dropping the manager stops its sync thread without a last pass, and
+        # releases the files so the copy can be deleted - on Windows too.
+        self.flush()
+        del self._manager
 
     def fingerprint(self, step: int) -> Tuple[Optional[str], str]:
         """SHA-256 over the per-tensor xxHash3 values Moonclip reports for ``step``.

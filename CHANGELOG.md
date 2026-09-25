@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **A fork from a parent in a bucket (GPU-159).** `fork_from` also takes the
+  `store_uri` a run reports when its store is remote - `s3://bucket/prefix` -
+  so a fork can start on a machine that never held the parent: a rented node
+  is gone once it stops, and its store lives on only in the bucket. The
+  parent's store is reached with this run's own storage settings (endpoint,
+  region, credentials), copied into a directory beside this run's store,
+  read as a local parent is, and deleted once the step is in memory; nothing
+  is pushed back. Moonclip only, since it is what writes to a bucket. The
+  whole store comes down, not just the step - fine for the runs the platform
+  forks today, and the thing to change when a store is too large for it. **Not
+  pinned:** a pin lives beside the manifest of the machine that trains the
+  parent, and the copy is not that machine's, so the log says retention there
+  may take the step before this run writes a checkpoint of its own.
+
 ## 0.4.0 — 2026-09-25
 
 ### Added
