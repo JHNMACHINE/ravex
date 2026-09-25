@@ -312,3 +312,38 @@ class TestUnreachable:
         shipper.close(timeout=40)
         assert backend.points("r-1", "x") == [1, 2]
         assert shipper.pending == 0
+
+
+class TestTheStoresAddress:
+    """What `ravex ship` calls a store it did not open itself (GPU-159).
+
+    The agent ships a finished run from its local copy; for a run in a bucket,
+    the address the platform keeps has to stay the bucket's, or a resume on
+    another machine is sent to a path that went with the first one.
+    """
+
+    def write_run(self, store, storage):
+        os.makedirs(store, exist_ok=True)
+        with open(os.path.join(store, "run.json"), "w", encoding="utf-8") as handle:
+            json.dump({"run_id": "r-1", "config": {"storage": storage}}, handle)
+
+    def test_a_store_in_a_bucket_keeps_its_bucket_address(self, tmp_path):
+        from ravex._ship import recorded_store_uri
+
+        store = str(tmp_path / "harold-001")
+        self.write_run(store, {"type": "r2", "bucket": "gpuzero", "prefix": "runs/harold-001", "path": store})
+        assert recorded_store_uri(store) == "s3://gpuzero/runs/harold-001"
+        assert Shipper("http://127.0.0.1:9", store).store_uri == "s3://gpuzero/runs/harold-001"
+
+    def test_a_local_store_is_its_path(self, tmp_path):
+        from ravex._ship import recorded_store_uri
+
+        store = str(tmp_path / "local")
+        self.write_run(store, {"type": "local", "path": store})
+        assert recorded_store_uri(store) is None
+        assert Shipper("http://127.0.0.1:9", store).store_uri == os.path.abspath(store)
+
+    def test_an_address_given_wins(self, tmp_path):
+        store = str(tmp_path / "harold-001")
+        self.write_run(store, {"type": "r2", "bucket": "gpuzero", "prefix": "runs/harold-001"})
+        assert Shipper("http://127.0.0.1:9", store, store_uri="s3://other/x").store_uri == "s3://other/x"

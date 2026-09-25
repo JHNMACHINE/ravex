@@ -40,6 +40,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import deque
+from types import SimpleNamespace
 from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
 from ravex._metrics import HEADER_CHUNK, METRICS_DIR
@@ -120,7 +121,11 @@ class Shipper:
         self.endpoint = endpoint.rstrip("/")
         self.store = store
         self.token = token or None
-        self.store_uri = store_uri or os.path.abspath(store)
+        # Without one given, the address the run recorded at its birth: a
+        # store in a bucket is known to the platform by its bucket, and
+        # `ravex ship` on the local copy must not replace that with a path
+        # on a machine that is about to go away (GPU-159).
+        self.store_uri = store_uri or recorded_store_uri(store) or os.path.abspath(store)
         self._chunks: Deque[str] = deque()
         self._run_dirty = False
         self._checkpoints: Optional[List[int]] = None
@@ -413,6 +418,17 @@ def combine(*uploaders: Any) -> Any:
             raise failure
 
     return both
+
+
+def recorded_store_uri(store: str) -> Optional[str]:
+    """The bucket address in the store's ``run.json``, if it names one."""
+    record = _read_json(os.path.join(store, "run.json")) or {}
+    storage = (record.get("config") or {}).get("storage") or {}
+    if storage.get("type") in ("s3", "r2") and storage.get("bucket"):
+        return describe_store(SimpleNamespace(is_remote=True, path=store, **{
+            key: storage.get(key) for key in ("bucket", "prefix")
+        }))[1]
+    return None
 
 
 def describe_store(storage: Any) -> Tuple[str, str]:

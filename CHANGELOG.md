@@ -18,6 +18,16 @@
   parent, and the copy is not that machine's, so the log says retention there
   may take the step before this run writes a checkpoint of its own.
 
+### Fixed
+
+- **`ravex ship` no longer renames a store in a bucket after its local copy
+  (GPU-159).** The command sent the backend the store's local path as its
+  address, so shipping a finished run from the machine that trained it -
+  what the platform's agent does after every job - replaced the
+  `s3://bucket/prefix` the run had reported with a directory that goes away
+  with the machine, and a resume or a fork elsewhere was sent there. Without
+  an address given, the one in the store's `run.json` is used.
+
 ## 0.4.0 — 2026-09-25
 
 ### Added
