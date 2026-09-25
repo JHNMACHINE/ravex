@@ -130,7 +130,38 @@ jobs:
         with:
           fetch-depth: 0
 
+      # An S3 server, so the tests that need a bucket stop skipping: metrics
+      # reaching it while the run goes on (GPU-152), and a fork on one machine
+      # from a parent written on another (GPU-159). Without it they had never
+      # run in CI. The same pinned versitygw, started the same way, as
+      # Moonclip's CI - see the comments there for why not MinIO and not a
+      # `services:` block. The data directory is also what the metrics test
+      # reads objects back from.
+      - name: Start the S3 server
+        run: |
+          set -eu
+          VGW=1.8.0
+          curl -sSfL -o /tmp/vgw.tgz             "https://github.com/versity/versitygw/releases/download/v${VGW}/versitygw_v${VGW}_Linux_x86_64.tar.gz"
+          tar -xzf /tmp/vgw.tgz -C /tmp
+          install -m 0755 "/tmp/versitygw_v${VGW}_Linux_x86_64/versitygw" /usr/local/bin/versitygw
+          mkdir -p /tmp/s3-data/ravex-test
+          versitygw --access minioadmin --secret minioadmin --port :9000             posix /tmp/s3-data >/tmp/s3.log 2>&1 &
+          for _ in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9000/ || true)
+            if [ "$code" != "000" ]; then
+              echo "versitygw is up (HTTP $code)"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "versitygw did not come up:" >&2
+          cat /tmp/s3.log >&2
+          exit 1
+
       - name: Build Moonclip and run the full suite
+        env:
+          RAVEX_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+          RAVEX_TEST_S3_DATA_DIR: /tmp/s3-data
         run: |
           . "$HOME/.cargo/env"
           pip install --quiet --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple torch
