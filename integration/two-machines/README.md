@@ -212,8 +212,9 @@ of `100-outer.sh` kills node 1.
 downloads the outer parameters and the momentum — twice a delta — over the real
 link, inside the round it enters. On loopback that cost nothing.
 
-**The rendezvous has no authentication.** Whoever reaches its port can read the
-job token. A RunPod pod exposes only the ports it was created with, so 29400 is
+**The rendezvous has no authentication.** Whoever reaches its port can take a
+number and write any key; without `RAVEX_JOB_TOKEN` it can also read the job
+token. A RunPod pod exposes only the ports it was created with, so 29400 is
 reachable over `podnet1` and not from outside; keep it that way.
 
 ## Rules that cost money to relearn

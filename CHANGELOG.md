@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Security
+
+- **The job token no longer crosses the wire, and can stay off the store
+  (GPU-134).** The round exchange and the replication ring used to open every
+  connection by sending the token itself, to whatever address the dialled
+  rank had advertised on the rendezvous store. Anybody who could write that
+  store - which is anybody who reaches a `ravex rendezvous` port - could
+  advertise a listener, wait for a member to dial, and from then on answer as
+  a member: its delta went into the average. Both handshakes now send a nonce
+  and an HMAC of the token bound to both ranks (and, in the exchange, to the
+  round and the kind of request), and answer with a different HMAC over the
+  same. `RAVEX_JOB_TOKEN`, when set, is the token and is never written to the
+  store; without it rank 0 still makes one and leaves it there, which is only
+  right on a private network. The keys a job leaves on the store are scoped by
+  a separate incarnation rank 0 makes at every start, since a token handed in
+  is the same across restarts. **The wire format changed**: nodes on this
+  version and on an older one do not recognise each other.
+
 ### Added
 
 - **A fork from a parent in a bucket (GPU-159).** `fork_from` also takes the

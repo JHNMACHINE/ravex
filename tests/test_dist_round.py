@@ -366,7 +366,7 @@ def test_a_step_that_fails_after_the_decision_is_a_split_not_a_skip():
             raise RuntimeError("out of memory")
 
     exchange = SimpleNamespace(
-        rank=0, store=FakeStore(), secret=b"t", publish_wait=0.0, gather_wait=0.0,
+        rank=0, store=FakeStore(), secret=b"t", scope=b"t", publish_wait=0.0, gather_wait=0.0,
         publish=lambda *a: None, as_published=lambda delta, *a: delta,
         gather_by_rank=lambda *a: {}, decided=lambda *a: None, applied=lambda *a: None,
     )

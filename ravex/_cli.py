@@ -191,8 +191,10 @@ def _rendezvous(args) -> int:
         flush=True,
     )
     print(
-        "No authentication: whoever reaches this port can read every job's "
-        "token. Keep it on a private network.",
+        "No authentication: whoever reaches this port can take a number and "
+        "write any key. Set RAVEX_JOB_TOKEN on every node so a stranger cannot "
+        "put a delta into the average; without it, it can read the job token, "
+        "so keep this port on a private network.",
         flush=True,
     )
     try:

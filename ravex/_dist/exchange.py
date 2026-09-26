@@ -30,8 +30,9 @@ when the others will be ready, which is the thing there is no channel for.
 
 **Reused rather than rebuilt.** The listener address (``RingLink._advertise``,
 and the ten seconds a hostname cost on a box with a Hyper-V interface), the
-job token (``RingLink._shared_secret``, GPU-112) and its derived
-acknowledgement all come from the replication ring. Same question — "is this
+job token (``RingLink._shared_secret``, GPU-112) and the proofs of it that go
+on the wire instead of it (``RingLink._proof``, GPU-134) all come from the
+replication ring. Same question — "is this
 one of us" — and answering it twice is how two answers end up differing.
 
 **The bytes are moonclip's, and so is the format.** A report is written as a
@@ -58,6 +59,7 @@ from __future__ import annotations
 
 import logging
 import hashlib
+import hmac
 import json
 import os
 import socket as _socket
@@ -91,9 +93,19 @@ ADDRESS_ENV = "RAVEX_EXCHANGE_ADDRESS"
 #: a reserved bit inside an integer is a convention that has to be remembered
 #: at four call sites, and the day someone forgets it the request still parses
 #: and asks for the wrong tree.
-REQUEST = struct.Struct("<8s32sIII")
+#:
+#: Neither carries the token (GPU-134). The greeting carries a nonce and a
+#: proof of the token over the whole request, and the answer a proof over the
+#: same request and nonce - see ``RingLink._proof``. A greeting used to carry
+#: the token itself, to whatever address the asked-for rank had advertised on
+#: the store, which handed it to anybody who could write that store.
+REQUEST = struct.Struct("<8s16s64sIII")
 RESPONSE = struct.Struct("<64sBQ")
-REQUEST_MAGIC = b"RVXROUND"
+REQUEST_MAGIC = b"RVXRND02"
+
+#: What a proof of each half says it is, so one can never stand in for the other.
+ASKED = b"ravex-round-ask"
+ANSWERED = b"ravex-round-answer"
 
 #: What a greeting is asking for.
 KIND_ROUND = 0  #: a round's delta report, the ordinary case
@@ -105,10 +117,11 @@ KIND_RELAY = 2  #: another node's report for a round, held by this one (GPU-140)
 #: size and a request of either older kind reads exactly as it always did.
 OWNER = struct.Struct("<I")
 
-#: Where a round's contributors are decided (GPU-140): the job token's digest,
-#: then the round. The digest scopes the key to one incarnation of the job -
-#: rank 0 makes a new token every time it starts - so a job that restarts on a
-#: store that outlived it does not find the sets its previous life decided.
+#: Where a round's contributors are decided (GPU-140): the job incarnation's
+#: digest, then the round. The digest scopes the key to one life of the job -
+#: rank 0 makes a new incarnation every time it starts, see
+#: ``RingLink._incarnation`` - so a job that restarts on a store that outlived
+#: it does not find the sets its previous life decided.
 ROUND_SET_KEY = "ravex/gpu140/set/%s/%d"
 
 #: A node saying it has applied a round: job digest, round, rank. What
@@ -172,14 +185,14 @@ class RoundSplitError(MembershipError):
     """
 
 
-def _job_digest(secret: Optional[bytes]) -> str:
+def _job_digest(scope: Optional[bytes]) -> str:
     digest = hashlib.sha256()
-    digest.update(secret or b"")
+    digest.update(scope or b"")
     digest.update(b"ravex-round-set")
     return digest.hexdigest()[:16]
 
 
-def decide_round(store, secret, round_number: int, rank: int, collected,
+def decide_round(store, scope, round_number: int, rank: int, collected,
                  deadline: float) -> Tuple[List[int], int]:
     """The round's contributors, as the store decided them, and who proposed.
 
@@ -202,7 +215,7 @@ def decide_round(store, secret, round_number: int, rank: int, collected,
     a node that cannot learn the decision cannot know whether the others took
     the step, and guessing either way is the failure this closes.
     """
-    key = ROUND_SET_KEY % (_job_digest(secret), round_number)
+    key = ROUND_SET_KEY % (_job_digest(scope), round_number)
     proposal = json.dumps({"by": int(rank), "set": sorted(int(r) for r in collected)})
     while True:
         try:
@@ -341,7 +354,7 @@ def close_round(loop, exchange: "DeltaExchange", peers, deadline: float):
             )
     collected = set(received) | ({exchange.rank} if self_included else set())
     members, decided_by = decide_round(
-        exchange.store, exchange.secret, round_number, exchange.rank, collected,
+        exchange.store, exchange.scope, round_number, exchange.rank, collected,
         time.monotonic() + budget,
     )
     decided = time.monotonic()
@@ -591,6 +604,9 @@ class DeltaExchange:
         self.patience = float(patience)
         self.listener: Optional[Any] = None
         self.secret: Optional[bytes] = None
+        #: This life of the job, which scopes its keys on the store. Not the
+        #: token, which can be the same across restarts (GPU-134).
+        self.scope: Optional[bytes] = None
         self.address: Optional[str] = None
 
         #: This node's reports and the peers', **one directory per round on
@@ -702,6 +718,14 @@ class DeltaExchange:
                     self.patience,
                 )
                 return False
+            self.scope = RingLink._incarnation(self.store, self.rank, deadline)
+            if self.scope is None:
+                logger.warning(
+                    "Rank 0 did not say which life of the job this is within "
+                    "%.0fs; not serving.",
+                    self.patience,
+                )
+                return False
 
             listener = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
             listener.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
@@ -779,7 +803,7 @@ class DeltaExchange:
         to its full deadline while the others moved on without this node - which
         is how the relay test broke the first time this ran.
         """
-        key = ROUND_SET_KEY % (_job_digest(self.secret), round_number)
+        key = ROUND_SET_KEY % (_job_digest(self.scope), round_number)
         while True:
             with self._lock:
                 if all(self._served.get(p, -1) >= round_number for p in peers):
@@ -806,7 +830,7 @@ class DeltaExchange:
         node deletes the decision and its own mark from that far back, which
         is idempotent, so nobody has to be the one that does it.
         """
-        digest = _job_digest(self.secret)
+        digest = _job_digest(self.scope)
         try:
             self.store.set(APPLIED_KEY % (digest, int(round_number), self.rank), b"1")
         except Exception as exc:
@@ -831,7 +855,7 @@ class DeltaExchange:
         the relay did the first time it ran, on the run's last round.
         """
         round_number, members = self._last_decided
-        digest = _job_digest(self.secret)
+        digest = _job_digest(self.scope)
         waiting = [m for m in members if m != self.rank]
         while waiting and time.monotonic() < deadline:
             try:
@@ -1112,12 +1136,17 @@ class DeltaExchange:
             connection = _socket.create_connection(
                 (host, int(port)), timeout=min(remaining, 30.0)
             )
+            wanted = int(round_number) & 0xFFFFFFFF
+            nonce = RingLink._nonce()
             connection.sendall(
                 REQUEST.pack(
                     REQUEST_MAGIC,
-                    self.secret or b"",
+                    nonce,
+                    RingLink._proof(
+                        self.secret or b"", ASKED, nonce, self.rank, peer, wanted, kind
+                    ),
                     self.rank,
-                    int(round_number) & 0xFFFFFFFF,
+                    wanted,
                     int(kind),
                 )
             )
@@ -1136,8 +1165,10 @@ class DeltaExchange:
             self._waits[peer] = time.monotonic() - dialled
             acknowledgement, status, length = RESPONSE.unpack(head)
 
-            expect = RingLink._acknowledgement(self.secret, self.rank)
-            if acknowledgement != expect:
+            expect = RingLink._proof(
+                self.secret or b"", ANSWERED, nonce, self.rank, peer, wanted, kind
+            )
+            if not hmac.compare_digest(acknowledgement, expect):
                 logger.warning(
                     "Rank %s answered without the job token. Not reading a "
                     "delta from it.",
@@ -1301,28 +1332,34 @@ class DeltaExchange:
             greeting = _recv_exactly(
                 connection, REQUEST.size, time.monotonic() + SERVE_PATIENCE
             )
-            magic, token, peer, wanted, kind = REQUEST.unpack(greeting)
-            if magic != REQUEST_MAGIC or token != (self.secret or b""):
+            magic, nonce, proof, peer, wanted, kind = REQUEST.unpack(greeting)
+            if magic != REQUEST_MAGIC or not self.secret or not hmac.compare_digest(
+                proof,
+                RingLink._proof(self.secret, ASKED, nonce, peer, self.rank, wanted, kind),
+            ):
                 # Silence rather than a message. Something that reached the
                 # port without the token is not owed an explanation, and a
                 # refusal that says which half was wrong is a hint.
                 logger.warning("Refused a connection without the job token.")
                 return
 
+            acknowledgement = RingLink._proof(
+                self.secret, ANSWERED, nonce, peer, self.rank, wanted, kind
+            )
             if kind == KIND_STATE:
-                self._serve_state(connection, peer, wanted)
+                self._serve_state(connection, acknowledgement, wanted)
                 return
             if kind == KIND_RELAY:
                 owner = OWNER.unpack(
                     _recv_exactly(connection, OWNER.size,
                                   time.monotonic() + SERVE_PATIENCE)
                 )[0]
-                self._serve_relay(connection, peer, owner, wanted)
+                self._serve_relay(connection, acknowledgement, peer, owner, wanted)
                 return
 
             if not self._await_round(wanted):
                 connection.sendall(
-                    RESPONSE.pack(RingLink._acknowledgement(self.secret, peer), GONE, 0)
+                    RESPONSE.pack(acknowledgement, GONE, 0)
                 )
                 return
 
@@ -1333,7 +1370,7 @@ class DeltaExchange:
             self._hold(wanted)
             try:
                 connection.sendall(
-                    RESPONSE.pack(RingLink._acknowledgement(self.secret, peer), OK, 0)
+                    RESPONSE.pack(acknowledgement, OK, 0)
                 )
                 # The descriptor goes to Rust from here, so the bound has to be
                 # the kernel's - see `set_deadline`.
@@ -1364,7 +1401,8 @@ class DeltaExchange:
             except OSError:
                 pass
 
-    def _serve_relay(self, connection, peer: int, owner: int, wanted: int) -> None:
+    def _serve_relay(self, connection, acknowledgement: bytes, peer: int,
+                     owner: int, wanted: int) -> None:
         """Hand ``peer`` the report ``owner`` sent this node for round ``wanted``.
 
         GPU-140: the round was decided over a set that includes ``owner``, and
@@ -1373,9 +1411,6 @@ class DeltaExchange:
         report whole or it does not, and ``GONE`` lets the asker try the next
         holder instead of holding a handler on a report that is not coming.
         """
-        from ravex._dist.replication import RingLink
-
-        acknowledgement = RingLink._acknowledgement(self.secret, peer)
         root = self.mine_path if owner == self.rank else self._peer_path(owner)
         key = (owner, wanted)
         with self._lock:
@@ -1403,7 +1438,7 @@ class DeltaExchange:
         with self._lock:
             return tuple(r for (o, r) in self._relaying if o == owner)
 
-    def _serve_state(self, connection, peer: int, wanted: int) -> None:
+    def _serve_state(self, connection, acknowledgement: bytes, wanted: int) -> None:
         """Hand a joining node the outer parameters for round ``wanted``.
 
         Deliberately *not* a wait. A round fetch waits because the peer asking
@@ -1413,9 +1448,6 @@ class DeltaExchange:
         handler for ten minutes on behalf of a stranger. The joiner reads the
         round it should ask for off the store and comes back.
         """
-        from ravex._dist.replication import RingLink
-
-        acknowledgement = RingLink._acknowledgement(self.secret, peer)
         if not _report.round_is_complete(self.state_path, wanted):
             connection.sendall(RESPONSE.pack(acknowledgement, GONE, 0))
             return

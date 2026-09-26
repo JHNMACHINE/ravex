@@ -910,8 +910,14 @@ contributes from that round. A node that crashes and is started again is a new
 node, and joins the same way.
 
 Three limits, and the first is a warning. **The server has no
-authentication**: whoever reaches its port can read the job token that tells
-members from strangers, so keep it on a private network. It is a single point,
+authentication**: whoever reaches its port can take a number and write any key.
+**Set `RAVEX_JOB_TOKEN` on every node** (GPU-134) — a secret whoever launches
+the run makes and hands out with the address. It never goes on the store and
+never crosses the wire: nodes prove they hold it with an HMAC bound to a nonce
+and to both ends. A stranger on the server can then slow a round down, but it
+cannot put a delta into the average. Without it, rank 0 makes a token and leaves
+it on the store for anyone who reaches the port, so keep the port on a private
+network. The server is also a single point,
 and restarting it loses the job's state — though a small process is easier to
 keep alive than a spot GPU. And a run that has lost one of its starting nodes
 cannot take a new one yet: a joiner waits for every starting node to

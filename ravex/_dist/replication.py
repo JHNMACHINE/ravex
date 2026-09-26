@@ -427,19 +427,23 @@ class RingLink:
     connection that arrives and says nothing is enough to stop a *good* replica
     from being read as one.
 
-    So both ends prove they belong to this job, with a token rank 0 generates
-    and leaves on the rendezvous store. Not a new trust boundary: whoever can
-    read that store is already inside the job. What it buys is that a stranger
-    who merely reaches the port is refused before any writer exists, and that a
-    rank never pushes its store into a port that cannot answer for itself.
+    So both ends prove they belong to this job, with a token: the one handed
+    in as ``RAVEX_JOB_TOKEN``, or else one rank 0 generates and leaves on the
+    rendezvous store, where whoever can read that store is already inside the
+    job. What it buys is that a stranger who merely reaches the port is refused
+    before any writer exists, and that a rank never pushes its store into a
+    port that cannot answer for itself. Since GPU-134 the token itself never
+    crosses the wire, only a proof of it bound to a nonce and to both ranks
+    (`_proof`), so a stranger that got its own address advertised learns
+    nothing from being dialled.
     Rejections do not break the ring — the listener keeps waiting for the peer
     it is expecting, which is the point of doing this at the handshake rather
     than after.
 
-    **What it is not.** It is a shared secret in the clear on a connection
-    nobody has encrypted, so it identifies rather than protects: someone able
-    to read the traffic between two ranks, or to take over an established TCP
-    connection, is not stopped by it. On a network where that is the threat,
+    **What it is not.** It is a handshake on a connection nobody has
+    encrypted, so it identifies rather than protects: someone able to read the
+    traffic between two ranks, or to take over an established TCP connection,
+    is not stopped by it. On a network where that is the threat,
     `replication_transport: collectives` is the answer, and it stays supported
     for exactly this reason.
     """
@@ -453,9 +457,20 @@ class RingLink:
     #: membership does.
     SECRET_KEY = "ravex/gpu112/replica/secret"
 
-    #: Hex characters of the token on the wire, so the read is exact. 32 hex is
-    #: 16 bytes of `secrets.token_hex`, which is what is guessed against.
+    #: Hex characters of a token rank 0 makes. 32 hex is 16 bytes of
+    #: `secrets.token_hex`, which is what is guessed against.
     TOKEN_CHARS = 32
+
+    #: A token handed in by whoever launches the run (GPU-134). When set, it is
+    #: the token, and nothing puts it on the store.
+    TOKEN_ENV = "RAVEX_JOB_TOKEN"
+
+    #: Where rank 0 leaves this life of the job - see `_incarnation`.
+    INCARNATION_KEY = "ravex/gpu134/incarnation"
+
+    #: A greeting's nonce, and a proof's length on the wire (hex SHA-256).
+    NONCE_BYTES = 16
+    PROOF_CHARS = 64
 
     #: Seconds to spend on one dial. Short on purpose - see the comment where
     #: it is used.
@@ -524,14 +539,22 @@ class RingLink:
                         connection.settimeout(
                             max(1.0, deadline - time.monotonic())
                         )
-                        greeting = _recv_exactly(connection, 4 + cls.TOKEN_CHARS)
+                        greeting = _recv_exactly(
+                            connection, 4 + cls.NONCE_BYTES + cls.PROOF_CHARS
+                        )
                         peer = int.from_bytes(greeting[:4], "big")
-                        if not hmac.compare_digest(greeting[4:], secret):
+                        nonce = greeting[4:4 + cls.NONCE_BYTES]
+                        if not hmac.compare_digest(
+                            greeting[4 + cls.NONCE_BYTES:],
+                            cls._proof(secret, b"ravex-ring-hello", nonce, peer, rank),
+                        ):
                             raise OSError("the token did not match")
                         # The other half of the proof, so the peer knows it
                         # reached a rank of this job and not whatever else was
                         # holding that port.
-                        connection.sendall(cls._acknowledgement(secret, peer))
+                        connection.sendall(
+                            cls._proof(secret, b"ravex-ring-ack", nonce, peer, rank)
+                        )
                         # Blocking from here on: the descriptor goes to the
                         # core, and a socket with a timeout is non-blocking
                         # underneath, where every read would come back as
@@ -565,10 +588,15 @@ class RingLink:
                     cls.CONNECT_TIMEOUT, max(1.0, deadline - time.monotonic())
                 )
                 outgoing = _socket.create_connection((host, int(port_text)), timeout=left)
-                outgoing.sendall(rank.to_bytes(4, "big") + secret)
+                nonce = cls._nonce()
+                outgoing.sendall(
+                    rank.to_bytes(4, "big")
+                    + nonce
+                    + cls._proof(secret, b"ravex-ring-hello", nonce, rank, send_to)
+                )
                 if not hmac.compare_digest(
-                    _recv_exactly(outgoing, len(cls._acknowledgement(secret, rank))),
-                    cls._acknowledgement(secret, rank),
+                    _recv_exactly(outgoing, cls.PROOF_CHARS),
+                    cls._proof(secret, b"ravex-ring-ack", nonce, rank, send_to),
                 ):
                     raise OSError(
                         "the peer at %s did not answer with this job's token; "
@@ -643,11 +671,23 @@ class RingLink:
     def _shared_secret(cls, store, rank, deadline):
         """The token every rank of this job proves it knows.
 
-        Rank 0 makes it and the others read it. Not agreed by a collective for
-        the same reason none of this is: the store is reachable by a rank that
-        belongs to no group yet, which is the case a joiner is in and the case
-        this whole road is built for.
+        ``RAVEX_JOB_TOKEN`` when it is set (GPU-134), and then **never written
+        to the store**: on a rendezvous that strangers can reach, a token on
+        the store is a token anybody can read, and a proof of it proves
+        nothing. Whoever launches the run makes it and hands it to every node
+        together with the rendezvous address.
+
+        Without it, rank 0 makes one and leaves it on the store, and the others
+        read it there - which is right only on a network where reaching the
+        store already means being inside the job. Not agreed by a collective
+        for the same reason none of this is: the store is reachable by a rank
+        that belongs to no group yet, which is the case a joiner is in and the
+        case this whole road is built for.
         """
+        given = os.environ.get(cls.TOKEN_ENV, "")
+        if given:
+            return given.encode("utf-8")
+
         if rank == 0:
             token = secrets.token_hex(cls.TOKEN_CHARS // 2).encode("ascii")
             store.set(cls.SECRET_KEY, token)
@@ -659,18 +699,49 @@ class RingLink:
             time.sleep(0.05)
         return None
 
-    @staticmethod
-    def _acknowledgement(secret: bytes, peer: int) -> bytes:
-        """What a listener answers with, to prove it holds the token too.
+    @classmethod
+    def _incarnation(cls, store, rank, deadline):
+        """This life of the job: rank 0 makes it new every time it starts.
 
-        Derived rather than echoed, and bound to the peer that asked, so the
-        answer to one rank's greeting is not a reusable answer to another's.
+        What scopes the keys a job leaves on a store that can outlive it
+        (GPU-140). It used to be the token itself, which rank 0 also made new
+        each time; a token handed in from outside is the same across restarts,
+        so the two are separate now. Not a secret - it is on the store for
+        anyone to read, and it proves nothing.
         """
-        digest = hashlib.sha256()
-        digest.update(secret)
-        digest.update(b"ravex-ring-ack")
-        digest.update(peer.to_bytes(4, "big"))
-        return digest.hexdigest().encode("ascii")
+        if rank == 0:
+            value = secrets.token_hex(8).encode("ascii")
+            store.set(cls.INCARNATION_KEY, value)
+            return value
+
+        while time.monotonic() < deadline:
+            if store.check([cls.INCARNATION_KEY]):
+                return store.get(cls.INCARNATION_KEY)
+            time.sleep(0.05)
+        return None
+
+    @classmethod
+    def _nonce(cls) -> bytes:
+        return secrets.token_bytes(cls.NONCE_BYTES)
+
+    @staticmethod
+    def _proof(secret: bytes, label: bytes, nonce: bytes, *numbers: int) -> bytes:
+        """An HMAC of the token over what one message is about (GPU-134).
+
+        What goes on the wire in place of the token. The token used to travel
+        in the clear in the first message, sent to whatever address a peer had
+        advertised on the store - so a stranger that could write the store got
+        it by advertising a listener and waiting for a member to dial. A proof
+        is bound to a fresh nonce, to who is asking and who is asked, and to
+        the ``label`` saying which message it is: whoever receives one cannot
+        turn it into the token, into the answer, or into a greeting to anybody
+        else.
+        """
+        mac = hmac.new(secret, label, hashlib.sha256)
+        mac.update(nonce)
+        for number in numbers:
+            mac.update(int(number).to_bytes(8, "big", signed=True))
+        return mac.hexdigest().encode("ascii")
 
     @staticmethod
     def _address_of(store, peer, deadline):

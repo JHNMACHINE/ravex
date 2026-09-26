@@ -161,7 +161,7 @@ def test_a_stranger_is_refused_and_the_real_peer_still_gets_in(tmp_path, caplog)
 
     # In before rank 1, saying nothing it is entitled to say.
     intruder = socket.create_connection(address_of(store, 0), timeout=10)
-    intruder.sendall((0).to_bytes(4, "big") + b"z" * RingLink.TOKEN_CHARS)
+    intruder.sendall(b"z" * (4 + RingLink.NONCE_BYTES + RingLink.PROOF_CHARS))
     assert intruder.recv(16) == b"", "the port answered a connection with no token"
     intruder.close()
 
@@ -198,7 +198,7 @@ def test_a_port_that_cannot_answer_is_not_pushed_to(tmp_path):
     def answer_badly():
         try:
             connection, _ = impostor.accept()
-            _recv_exactly(connection, 4 + RingLink.TOKEN_CHARS)
+            _recv_exactly(connection, 4 + RingLink.NONCE_BYTES + RingLink.PROOF_CHARS)
             connection.sendall(b"n" * 64)
             connection.close()
         except OSError:
@@ -237,12 +237,77 @@ def test_a_rank_that_finds_no_token_does_not_open_a_port():
     assert RingLink.connect(1, 0, 0, empty, timeout_seconds=1) is None
 
 
-@pytest.mark.parametrize("peer", [0, 1, 7])
-def test_the_answer_is_bound_to_the_rank_that_asked(peer):
-    """So one rank's answer is not a reusable answer to another's greeting."""
-    secret = b"a" * RingLink.TOKEN_CHARS
-    answers = {RingLink._acknowledgement(secret, rank) for rank in (0, 1, 7)}
-    assert len(answers) == 3
-    assert RingLink._acknowledgement(secret, peer) != RingLink._acknowledgement(
-        b"b" * RingLink.TOKEN_CHARS, peer
+def test_a_proof_is_bound_to_everything_it_is_about():
+    """Change any one input and it is a different proof (GPU-134).
+
+    The label, so a greeting is never an answer; the nonce, so a proof seen
+    once is no use later; each number, so a greeting to one rank is not a
+    greeting to another; and the token, which is the point.
+    """
+    secret, nonce = b"a" * 32, b"n" * RingLink.NONCE_BYTES
+    base = RingLink._proof(secret, b"hello", nonce, 0, 1)
+    assert len(base) == RingLink.PROOF_CHARS
+    variants = {
+        RingLink._proof(secret, b"ack", nonce, 0, 1),
+        RingLink._proof(secret, b"hello", b"m" * RingLink.NONCE_BYTES, 0, 1),
+        RingLink._proof(secret, b"hello", nonce, 1, 0),
+        RingLink._proof(secret, b"hello", nonce, 0, 2),
+        RingLink._proof(b"b" * 32, b"hello", nonce, 0, 1),
+    }
+    assert base not in variants and len(variants) == 5
+
+
+def test_a_token_handed_in_never_reaches_the_store(monkeypatch):
+    """With RAVEX_JOB_TOKEN, the store holds nothing that proves membership.
+
+    On a rendezvous strangers can reach, a token on the store is a token
+    anybody has - GPU-134.
+    """
+    monkeypatch.setenv(RingLink.TOKEN_ENV, "handed-in")
+    store = FakeStore()
+    assert RingLink._shared_secret(store, 0, deadline=float("inf")) == b"handed-in"
+    assert RingLink._shared_secret(store, 3, deadline=0.0) == b"handed-in"
+    assert not store.check([RingLink.SECRET_KEY])
+
+
+def test_each_life_of_the_job_is_its_own(monkeypatch):
+    """The incarnation is rank 0's to make, new each time, and read by the rest."""
+    store = FakeStore()
+    first = RingLink._incarnation(store, 0, deadline=float("inf"))
+    assert RingLink._incarnation(store, 2, deadline=float("inf")) == first
+    assert RingLink._incarnation(store, 0, deadline=float("inf")) != first
+
+
+def test_dialling_an_impostor_does_not_hand_it_the_token(monkeypatch):
+    """The hole GPU-134 found: the greeting used to *be* the token.
+
+    A stranger that can write the store advertises a listener under a rank's
+    key and waits. Whatever the real rank sends it has to be useless to it.
+    """
+    monkeypatch.setenv(RingLink.TOKEN_ENV, "the-real-token")
+    store = FakeStore()
+    impostor = socket.socket()
+    impostor.bind(("127.0.0.1", 0))
+    impostor.listen(1)
+    impostor.settimeout(15)
+    store.set(
+        RingLink.ADDRESS_KEY % 1,
+        ("127.0.0.1:%d" % impostor.getsockname()[1]).encode("utf-8"),
     )
+    heard = {}
+
+    def listen():
+        try:
+            connection, _ = impostor.accept()
+            heard["greeting"] = _recv_exactly(connection, 4 + RingLink.NONCE_BYTES + RingLink.PROOF_CHARS)
+            connection.close()
+        except OSError:
+            pass
+
+    thread = threading.Thread(target=listen, daemon=True)
+    thread.start()
+    assert RingLink.connect(0, 1, 1, store, timeout_seconds=5) is None
+    thread.join(timeout=20)
+    impostor.close()
+
+    assert b"the-real-token" not in heard["greeting"]

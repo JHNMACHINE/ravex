@@ -32,9 +32,13 @@ is a new node with a new number, which is the only reading under which
 
 **What it does not do, said before anyone relies on it.**
 
-* ``TCPStore`` has **no authentication**. Whoever reaches the port can read the
-  job token the exchange uses to tell members from strangers, so the port
-  belongs on a private network.
+* ``TCPStore`` has **no authentication**. Whoever reaches the port can take a
+  number, and write any key. With ``RAVEX_JOB_TOKEN`` set on every node
+  (GPU-134) that stranger still cannot put a delta into the average: the token
+  is not on the store, and the exchange and the ring prove it without sending
+  it. It can still slow a round down, or muddle the membership. Without the
+  token, rank 0 leaves one on the store, and the port belongs on a private
+  network.
 * The server is **still a single point** — moved from a rented GPU to a process
   that is cheap to keep alive. If it restarts, the job's state on it is gone.
 * A base member that dies **before** the run starts cannot be replaced by

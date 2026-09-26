@@ -270,7 +270,7 @@ def test_a_connection_without_the_job_token_gets_nothing(nodes, caplog):
         connection = _socket.create_connection((host, int(port)), timeout=5)
         try:
             connection.sendall(
-                REQUEST.pack(REQUEST_MAGIC, b"0" * 32, 1, 0, KIND_ROUND)
+                REQUEST.pack(REQUEST_MAGIC, b"0" * 16, b"0" * 64, 1, 0, KIND_ROUND)
             )
             connection.settimeout(2)
             assert connection.recv(RESPONSE.size) == b"", "a stranger was answered"
@@ -278,6 +278,71 @@ def test_a_connection_without_the_job_token_gets_nothing(nodes, caplog):
             connection.close()
 
     assert "without the job token" in caplog.text
+
+
+def test_a_fetch_from_an_impostor_hands_it_nothing(store, nodes, monkeypatch):
+    """GPU-134: whoever can write the store can put its own address under a rank.
+
+    The greeting used to carry the token, so the first member to fetch from
+    that address gave it away - and with it the right to answer as a member.
+    Now it carries a proof bound to a nonce, and the impostor's answer, which
+    cannot be one, is not read.
+    """
+    import socket as _socket
+
+    from ravex._dist.exchange import REQUEST
+    from ravex._dist.replication import RingLink
+
+    monkeypatch.setenv(RingLink.TOKEN_ENV, "the-real-token")
+    zero = nodes(0)
+    impostor = _socket.socket()
+    impostor.bind(("127.0.0.1", 0))
+    impostor.listen(1)
+    impostor.settimeout(10)
+    store.set(ADDRESS_KEY % 1, ("127.0.0.1:%d" % impostor.getsockname()[1]).encode())
+    heard = {}
+
+    def answer():
+        try:
+            connection, _ = impostor.accept()
+            heard["greeting"] = connection.recv(REQUEST.size)
+            connection.sendall(b"x" * 64 + b"\x00" + b"\x00" * 8)
+            connection.close()
+        except OSError:
+            pass
+
+    thread = threading.Thread(target=answer, daemon=True)
+    thread.start()
+    got = zero.fetch(1, 0, _report.expectation(a_delta()), time.monotonic() + 5)
+    thread.join(timeout=10)
+    impostor.close()
+
+    assert got is None
+    assert b"the-real-token" not in heard["greeting"]
+
+
+def test_nodes_with_different_tokens_do_not_trade(store, tmp_path, monkeypatch):
+    """Two tokens handed in are two jobs, whatever store they share."""
+    from ravex._dist.replication import RingLink
+
+    made = []
+    try:
+        for rank, token in ((0, "one"), (1, "other")):
+            monkeypatch.setenv(RingLink.TOKEN_ENV, token)
+            exchange = DeltaExchange(
+                rank, store, root=os.path.join(str(tmp_path), "rank%d" % rank),
+                node="n%d" % rank, patience=5.0,
+            )
+            assert exchange.start()
+            made.append(exchange)
+        zero, one = made
+        delta = a_delta()
+        publish(one, delta, 0, 10)
+        got = zero.fetch(1, 0, _report.expectation(delta), time.monotonic() + 3)
+        assert got is None, "a delta was read from a node of another job"
+    finally:
+        for exchange in made:
+            exchange.close()
 
 
 def test_a_node_cannot_be_talked_into_answering_for_a_peer_it_did_not_reach(nodes):
@@ -614,7 +679,7 @@ def test_old_decisions_leave_the_store_and_recent_ones_stay():
 
     store = FakeStore()
     exchange = DeltaExchange(0, store, root=".", node="n0")
-    exchange.secret = b"t"
+    exchange.scope = b"t"
     digest = _job_digest(b"t")
     for round_number in range(1, KEEP_DECISIONS + 3):
         decide_round(store, b"t", round_number, 0, {0}, time.monotonic() + 1)
