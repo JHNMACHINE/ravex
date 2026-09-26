@@ -133,6 +133,16 @@ Credentials are never read from the config file. Set `RAVEX_S3_ACCESS_KEY` /
 
 Full reference: [docs/configuration.md](docs/configuration.md).
 
+**What `ravex.log_metrics` costs a step.** Measured with `bench/metrics_cost.py`
+on an RTX 3090: a 16.8M-parameter model at 4.68 ms a step. Logging the loss, the
+gradient norm and the learning rate every step, as device tensors, adds
+**0.5%**. It does not wait for the GPU: the reduction is queued on the device
+and a thread of its own reads it back. Sending the run to a backend as it
+trains (`metrics_endpoint`) adds nothing measurable on top. Histograms are
+the expensive part: a 64-bin histogram of each of the four weight matrices
+(4.2M values each) every ten steps adds **11%**, about 5 ms each time they are
+taken. Log them every hundred steps, not every ten.
+
 ## Backends
 
 **`moonclip`** (default) — the [Moonclip](https://github.com/JHNMACHINE/moonclip)

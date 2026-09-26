@@ -27,8 +27,23 @@ them.
     python bench/metrics_cost.py
     python bench/metrics_cost.py --width 4096 --steps 1000 --repeats 5
 
-**Measured**, 2026-09-26, on an NVIDIA L4 (RunPod, secure cloud) - see the
-table printed by the run and the numbers in the README.
+**Measured**, 2026-09-26, on an RTX 3090 (RunPod, secure cloud), run by an
+agent from the platform's Launch page: 16.8M parameters, batch 512, 600
+measured steps per arm, three repeats. Median ms per step:
+
+========  ========  ======  ========
+arm       ms/step   spread  vs off
+========  ========  ======  ========
+off       4.681     0.021   —
+scalars   4.702     0.022   +0.5%
++hist     5.205     0.036   +11.2%
++ship     5.203     0.020   +11.2%
+========  ========  ======  ========
+
+Scalars cost what queueing a copy costs. Histograms cost about 5 ms each time
+the four 2048x2048 matrices are reduced, so every ten steps is 11% and every
+hundred would be about 1%. Sending to the backend adds nothing on top of
+``+hist``: it happens on the writer's thread, not the training one.
 """
 
 from __future__ import annotations
