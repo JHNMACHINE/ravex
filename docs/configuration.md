@@ -909,15 +909,27 @@ parameters and momentum the members publish for a round they all agree on, and
 contributes from that round. A node that crashes and is started again is a new
 node, and joins the same way.
 
-Three limits, and the first is a warning. **The server has no
-authentication**: whoever reaches its port can take a number and write any key.
-**Set `RAVEX_JOB_TOKEN` on every node** (GPU-134) — a secret whoever launches
-the run makes and hands out with the address. It never goes on the store and
-never crosses the wire: nodes prove they hold it with an HMAC bound to a nonce
-and to both ends. A stranger on the server can then slow a round down, but it
-cannot put a delta into the average. Without it, rank 0 makes a token and leaves
-it on the store for anyone who reaches the port, so keep the port on a private
-network. The server is also a single point,
+**Set `RAVEX_JOB_TOKEN`, on the server and on every node** (GPU-134): a secret
+whoever launches the run makes and hands out with the address.
+
+```bash
+RAVEX_JOB_TOKEN=$(openssl rand -hex 32) ravex rendezvous --port 29400
+```
+
+With it the store listens on loopback only, and the port is a gate that lets a
+connection through only once it has proved the token; a node reaches it through
+a forwarder `connect` opens on its own loopback. A stranger at the port never
+touches the store: no number, no key read or written, no place in the run. On
+their own connections the round exchange and the replication ring prove the
+same token again, and it never crosses the wire in either place — only HMACs of
+it bound to a nonce and to both ends. One token per server, so jobs sharing a
+server have to trust each other; the simple rule is a server per run.
+
+**Without it the server has no authentication**: whoever reaches its port can
+take a number, write any key, and read the token rank 0 leaves on the store.
+Keep that port on a private network.
+
+Two more limits. The server is a single point,
 and restarting it loses the job's state — though a small process is easier to
 keep alive than a spot GPU. And a run that has lost one of its starting nodes
 cannot take a new one yet: a joiner waits for every starting node to

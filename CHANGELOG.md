@@ -19,6 +19,17 @@
   a separate incarnation rank 0 makes at every start, since a token handed in
   is the same across restarts. **The wire format changed**: nodes on this
   version and on an older one do not recognise each other.
+- **`ravex rendezvous` closes behind `RAVEX_JOB_TOKEN` (GPU-134).** With the
+  token in its environment the server keeps torch's `TCPStore` on loopback
+  and puts a gate on the public port: it speaks first with a nonce, lets a
+  connection through only when it answers with an HMAC of the token, and then
+  relays bytes to the store. A node holding the token reaches it through a
+  forwarder on its own loopback that does the handshake, so nothing above
+  `rendezvous.connect` changes. A stranger never reaches the store - no
+  number, no key read or written - where before it could take a place in the
+  membership and write the keys the rounds agree on. One token per server;
+  jobs sharing one share it. Without the token the server is open, as before,
+  and says so when it starts.
 
 ### Added
 

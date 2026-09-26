@@ -48,6 +48,55 @@ def server():
     del store
 
 
+@pytest.fixture
+def gated_server(monkeypatch):
+    """A server with a token, and this process's nodes holding the same one.
+
+    Set in the environment rather than passed, so processes spawned from here
+    inherit it the way a node started by the platform would.
+    """
+    monkeypatch.setenv(rendezvous.TOKEN_ENV, "the-job-token")
+    port = free_port()
+    gated = rendezvous.serve("127.0.0.1", port)
+    yield "127.0.0.1:%d" % port
+    gated.close()
+
+
+def test_a_gated_server_hands_numbers_only_to_the_token(gated_server):
+    """GPU-134: a stranger at the port never reaches the store.
+
+    Not the store refusing it - the store never sees it. So nothing it could
+    do there is possible: no number taken, no key read, no key written.
+    """
+    import socket as _socket
+
+    first = rendezvous.connect(gated_server, "job", timeout=10)
+    assert rendezvous.register(first) == 0
+
+    with pytest.raises(Exception):
+        rendezvous.connect(gated_server, "job", timeout=2, token="a guess")
+
+    # Straight at the port, the way a store client or a scanner would come.
+    host, port = rendezvous.parse_address(gated_server)
+    raw = _socket.create_connection((host, port), timeout=5)
+    try:
+        opening = raw.recv(64)
+        assert opening.startswith(rendezvous.GATE_MAGIC), opening
+        raw.sendall(b"\x00" * (rendezvous.NONCE_BYTES + rendezvous.PROOF_CHARS))
+        raw.settimeout(5)
+        assert raw.recv(64) == b"", "the gate answered a connection without the token"
+    finally:
+        raw.close()
+
+    assert rendezvous.register(rendezvous.connect(gated_server, "job", timeout=10)) == 1
+
+
+def test_a_node_without_the_token_does_not_get_in(gated_server):
+    with pytest.raises(Exception):
+        rendezvous.connect(gated_server, "job", timeout=2, token="")
+    assert rendezvous.registered(rendezvous.connect(gated_server, "job", timeout=10)) == 0
+
+
 # ─── the pieces ────────────────────────────────────────────────────────
 
 
@@ -401,6 +450,16 @@ def rounds_over(said, nodes):
 @pytest.mark.skipif(sys.platform == "darwin", reason="spawn is slow on macOS")
 def test_nodes_started_on_their_own_train_one_model_and_a_later_one_joins(server, tmp_path):
     """GPU-121's join, reached for the first time from a process a user launches."""
+    join_a_run(server, tmp_path)
+
+
+def test_the_same_run_through_a_gated_rendezvous(gated_server, tmp_path):
+    """GPU-134: with a token, the whole of it - numbers, rounds, the join -
+    goes through the gate and the proofs, and ends in one model."""
+    join_a_run(gated_server, tmp_path)
+
+
+def join_a_run(server, tmp_path):
     # Here and not at the top of the module: a round report is a Moonclip
     # snapshot, but the pieces above need no engine, and the CI job without
     # Moonclip should still run them.

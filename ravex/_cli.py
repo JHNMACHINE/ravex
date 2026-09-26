@@ -190,13 +190,21 @@ def _rendezvous(args) -> int:
         f"and port {args.port}.",
         flush=True,
     )
-    print(
-        "No authentication: whoever reaches this port can take a number and "
-        "write any key. Set RAVEX_JOB_TOKEN on every node so a stranger cannot "
-        "put a delta into the average; without it, it can read the job token, "
-        "so keep this port on a private network.",
-        flush=True,
-    )
+    if rendezvous.job_token() is not None:
+        print(
+            f"Gated by {rendezvous.TOKEN_ENV}: only nodes started with the same "
+            "one get in. Jobs on this server share it, so run one server per "
+            "run unless its jobs trust each other.",
+            flush=True,
+        )
+    else:
+        print(
+            f"No authentication: {rendezvous.TOKEN_ENV} is not set, so whoever "
+            "reaches this port can take a number, write any key and read the "
+            "job token. Keep it on a private network, or set the token here "
+            "and on every node.",
+            flush=True,
+        )
     try:
         while True:
             time.sleep(3600)
