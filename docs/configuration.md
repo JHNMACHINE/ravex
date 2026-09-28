@@ -629,6 +629,23 @@ process on each.
 `nvidia-ml-py`; without it only this process's GPU memory is reported. CPU and
 RAM need `psutil`.
 
+**In a multi-node run, the model's metrics** (`outer_loop: true`). Every node
+computes its own loss, on its own shard, at its own step count, and a run is
+one model. So nothing the script logs is written as it is logged: each node
+keeps the mean of every name over the round and sends it with its round report,
+and at the end of the round **one node** - the lowest-numbered member of the
+round, the same answer on every node - writes one point per name: the mean over
+the nodes, weighted by the steps behind each. The step of that point is the
+model's, every step taken by every node in every round applied, so a run on four
+nodes and one on a single node are on the same axis. With it come
+`outer/round`, `outer/nodes`, `outer/steps` (the round's total) and
+`outer/seconds`. The `step=` argument does not apply, histograms are not
+averaged and are dropped with a warning, and system metrics stay per machine.
+The model's series is its own segment, under rank `-1`, cut only by segments of
+its own kind. For the nodes to be **one run** on the platform they share a
+`run_id`, which the platform's agent sets; without one each node keeps its own
+record, and the model's series is in the store of the node that wrote it.
+
 **Reading them back.**
 
 ```python

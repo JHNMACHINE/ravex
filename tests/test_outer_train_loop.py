@@ -28,7 +28,7 @@ def free_port():
         return probe.getsockname()[1]
 
 
-def a_node(rank, world, port, root, rounds, inner, queue, boundary="public"):
+def a_node(rank, world, port, root, rounds, inner, queue, boundary="public", log=False):
     """One rank: init the group, then a training loop that knows nothing."""
     try:
         import torch.distributed as dist
@@ -86,6 +86,10 @@ def a_node(rank, world, port, root, rounds, inner, queue, boundary="public"):
                 optimizer.zero_grad()
                 loss_fn(model(x[begin : begin + 32]), y[begin : begin + 32]).backward()
                 optimizer.step()
+                if log:
+                    # A different constant per rank, so the model's value can
+                    # only be the mean over both (GPU-135).
+                    ravex.log_metrics({"train/loss": 1.0 + 2.0 * rank})
                 if boundary == "public":
                     # The batch boundary a dataloader would give for free.
                     # This loop has no dataloader, which is exactly the case
@@ -129,14 +133,14 @@ def rounds_of(said):
     return [line for line in said if "Outer round" in line and "took" in line]
 
 
-def run_two(tmp_path, rounds=3, inner=8, boundary="public"):
+def run_two(tmp_path, rounds=3, inner=8, boundary="public", log=False):
     context = mp.get_context("spawn")
     queue = context.Queue()
     port = free_port()
     workers = [
         context.Process(
             target=a_node,
-            args=(rank, 2, port, str(tmp_path), rounds, inner, queue, boundary),
+            args=(rank, 2, port, str(tmp_path), rounds, inner, queue, boundary, log),
         )
         for rank in range(2)
     ]
@@ -178,6 +182,29 @@ def test_a_training_loop_that_knows_nothing_trains_with_a_peer(tmp_path):
         "reach them: %s against %s\nrank0 rounds: %s\nrank1 rounds: %s"
         % (left, right, rounds_of(results[0][3]), rounds_of(results[1][3]))
     )
+
+
+@pytest.mark.skipif(sys.platform == "darwin", reason="spawn + gloo is slow on macOS")
+def test_a_multi_node_run_logs_one_series_for_the_model(tmp_path):
+    """GPU-135: one run, the model's metrics - not one series per node.
+
+    Each rank logs its own constant loss every step. What reaches the store is
+    one point per round, on the model's axis (every step of every node), at
+    the mean over both nodes, written by one node only.
+    """
+    import ravex.metrics
+
+    run_two(tmp_path, rounds=3, inner=8, log=True)
+
+    writer = ravex.metrics.read(str(tmp_path / "cwd0" / "checkpoints"))["scalars"]
+    loss = writer["train/loss"]
+    assert loss["step"] == [16, 32, 48]
+    assert loss["value"] == pytest.approx([2.0, 2.0, 2.0])
+    assert writer["outer/nodes"]["value"] == [2.0, 2.0, 2.0]
+    assert writer["outer/steps"]["value"] == [16.0, 16.0, 16.0]
+
+    other = ravex.metrics.read(str(tmp_path / "cwd1" / "checkpoints"))["scalars"]
+    assert "train/loss" not in other and "outer/round" not in other
 
 
 @pytest.mark.skipif(sys.platform == "darwin", reason="spawn + gloo is slow on macOS")

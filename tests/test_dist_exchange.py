@@ -704,3 +704,14 @@ def test_a_member_that_left_is_not_waited_for_and_not_asked():
 
     membership = Membership(store, 0, 3)
     assert membership.peers_at(8) == [1]
+
+
+def test_a_report_carries_what_its_node_logged(nodes):
+    """GPU-135: the round's means travel with the delta, and never refuse it."""
+    zero, one = nodes(0), nodes(1)
+    delta = a_delta()
+    zero.publish(delta, 0, 10)
+    one.publish(delta, 0, 25, {"train/loss": [2.5, 25]})
+
+    (got,) = zero.gather([1], 0, _report.expectation(delta), time.monotonic() + 10)
+    assert got.metrics == {"train/loss": [2.5, 25]}

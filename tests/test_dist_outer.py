@@ -563,3 +563,28 @@ def test_a_node_that_dies_mid_run_does_not_stop_the_round():
         assert report["nodes"] == (2 if round_number < 3 else 1)
 
     assert final_loss(survivor, x, y) < final_loss(tiny_model(seed=3), x, y) / 2
+
+
+def test_the_model_counts_every_node_s_steps_and_keeps_the_count():
+    """GPU-135: the axis a multi-node run's metrics are drawn on."""
+    model = tiny_model()
+    loop = OuterLoop(model, inner_steps=4)
+    zero = {name: torch.zeros_like(p) for name, p in loop.outer.items()}
+    report = loop.apply(
+        [Contribution(delta=zero, steps=4), Contribution(delta=zero, steps=1)]
+    )
+    assert report["model_steps"] == loop.model_steps == 5
+
+    again = OuterLoop(tiny_model(), inner_steps=4)
+    again.load_state_dict(loop.state_dict())
+    assert again.model_steps == 5
+
+
+def test_a_joiner_takes_the_model_s_step_count_with_its_parameters():
+    from ravex._dist.membership import apply_state, state_payload
+
+    member = OuterLoop(tiny_model(), inner_steps=4)
+    member.model_steps = 1234
+    joiner = OuterLoop(tiny_model(seed=1), inner_steps=4)
+    apply_state(joiner, state_payload(member))
+    assert joiner.model_steps == 1234

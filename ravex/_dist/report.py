@@ -69,6 +69,7 @@ else is refused having cost a manifest read rather than an allocation.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
@@ -89,6 +90,9 @@ ROUND_PREFIX = "round-"
 #: say about itself, so there is no second channel for it.
 STEPS = "ravex.steps"
 NODE = "ravex.node"
+#: What the node logged during the round, ``{name: [mean, count]}`` as JSON
+#: (GPU-135). The round's writer turns everybody's into one value per name.
+METRICS = "ravex.metrics"
 
 
 class ReportError(ValueError):
@@ -105,13 +109,14 @@ class ReportError(ValueError):
 class Report:
     """One node's round: what it did, and the delta it did it with."""
 
-    __slots__ = ("delta", "steps", "node", "round_number")
+    __slots__ = ("delta", "steps", "node", "round_number", "metrics")
 
-    def __init__(self, delta, steps, node, round_number):
+    def __init__(self, delta, steps, node, round_number, metrics=None):
         self.delta = delta
         self.steps = steps
         self.node = node
         self.round_number = round_number
+        self.metrics = metrics or {}
 
     def __repr__(self) -> str:
         return "Report(node=%r, round=%d, steps=%d, tensors=%d)" % (
@@ -219,6 +224,7 @@ def publish_round(
     *,
     compression_level: int = 3,
     save_dtype=None,
+    metrics=None,
 ) -> str:
     """Write one round into its own directory, and mark it servable last.
 
@@ -231,7 +237,7 @@ def publish_round(
     store = open_store(
         path, compression_level=compression_level, save_dtype=save_dtype
     )
-    write(store, delta, round_number, steps, node)
+    write(store, delta, round_number, steps, node, metrics)
     with open(os.path.join(path, ROUND_OK), "wb"):
         pass
     return path
@@ -290,7 +296,9 @@ def drop_rounds(root: str, keep: int, protect: Iterable[int] = ()) -> None:
             logger.debug("Could not drop round %d: %s", number, exc)
 
 
-def write(store, delta: Dict[str, Any], round_number: int, steps: int, node: str) -> str:
+def write(
+    store, delta: Dict[str, Any], round_number: int, steps: int, node: str, metrics=None
+) -> str:
     """Put this node's report in the store, under ``round_number`` as the step.
 
     The round number *is* the step, so a peer looks a report up by the round it
@@ -298,11 +306,10 @@ def write(store, delta: Dict[str, Any], round_number: int, steps: int, node: str
     which matters because a peer may well be a round ahead by the time it
     answers.
     """
-    return store.save_tensors(
-        int(round_number),
-        delta,
-        metadata={STEPS: str(int(steps)), NODE: str(node)},
-    )
+    metadata = {STEPS: str(int(steps)), NODE: str(node)}
+    if metrics:
+        metadata[METRICS] = json.dumps(metrics, allow_nan=True)
+    return store.save_tensors(int(round_number), delta, metadata=metadata)
 
 
 def snapshot_of_round(store, round_number: int) -> Optional[str]:
@@ -414,4 +421,19 @@ def read(store, round_number: int, expected) -> Report:
         steps=int(metadata.get(STEPS, 0) or 0),
         node=str(metadata.get(NODE, "")),
         round_number=int(described.get("step", round_number)),
+        metrics=_metrics_of(metadata),
     )
+
+
+def _metrics_of(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    """A peer's round means, or nothing. Never a reason to refuse its delta:
+    the average is what the round is for, and a chart is not."""
+    raw = metadata.get(METRICS)
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        logger.debug("A report's metrics could not be read: %s", exc)
+        return {}
+    return parsed if isinstance(parsed, dict) else {}

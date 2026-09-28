@@ -401,3 +401,44 @@ def test_the_reader_imports_without_the_rust_core():
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "{}"
+
+
+# ─── a multi-node run's model series, GPU-135 ─────────────────────────────
+
+
+def test_a_round_keeps_a_mean_per_name_and_starts_again():
+    means = _metrics.RoundMeans()
+    means.add(_metrics.prepare_all({"train/loss": torch.tensor(1.0)}))
+    means.add(_metrics.prepare_all({"train/loss": 3.0, "lr": 0.1}))
+    assert means.take() == {"train/loss": [2.0, 2], "lr": [0.1, 1]}
+    assert means.take() == {}
+
+
+def test_a_histogram_is_not_averaged_and_says_so(caplog):
+    means = _metrics.RoundMeans()
+    means.add(_metrics.prepare_all({"w": torch.arange(10.0)}))
+    assert means.take() == {}
+    assert "not averaged" in caplog.text
+
+
+def test_the_model_s_value_is_weighted_by_the_steps_behind_each_node():
+    # A node at a fifth of the speed moves the value by a fifth as much.
+    got = _metrics.model_means([(10, {"loss": [1.0, 10]}), (2, {"loss": [7.0, 2]})])
+    assert got["loss"] == pytest.approx((1.0 * 10 + 7.0 * 2) / 12)
+
+
+def test_a_name_one_node_never_logged_is_the_others_alone():
+    got = _metrics.model_means([(10, {"loss": [1.0, 10], "eval": [5.0, 1]}), (10, {"loss": [3.0, 10]})])
+    assert got == {"loss": 2.0, "eval": 5.0}
+
+
+def test_the_model_timeline_is_cut_by_its_own_segments_only(tmp_path):
+    """A node's segment starting at its own local step 0 must not cut the
+    model's series, which is on another axis."""
+    model = _metrics.MetricsWriter(str(tmp_path), _metrics.MODEL_RANK, 0, chunk_every=0)
+    model.put(100, 1.0, {"train/loss": _metrics.Scalar(2.0)})
+    model.close()
+    node = _metrics.MetricsWriter(str(tmp_path), 0, 0, chunk_every=0)
+    node.put(3, 2.0, {"sys/cpu": _metrics.Scalar(50.0)})
+    node.close()
+    assert ravex.metrics.read(str(tmp_path))["scalars"]["train/loss"]["step"] == [100]

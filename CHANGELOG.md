@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Added
+
+- **A multi-node run logs the model's metrics, not each node's (GPU-135).**
+  With `outer_loop: true`, what the script logs is averaged over the round:
+  each node sends the mean of every name with its round report, and the
+  lowest-numbered member of the round writes one point per name, weighted by
+  the steps behind each node, on the model's step axis (every step of every
+  node). With it, `outer/round`, `outer/nodes`, `outer/steps` and
+  `outer/seconds`, so a platform can say where a run is without reading the
+  rendezvous store. The model's series is a segment of its own under rank
+  `-1`, and the reader cuts it only by its own kind. `OuterLoop.model_steps`
+  is kept in the checkpoint and handed to a node that joins. Histograms are
+  not averaged and are dropped with a warning; system metrics stay per
+  machine. **The round report format gained a metadata key**: an older node
+  ignores it, and a newer one reads a report without it as a node that logged
+  nothing.
+  The state handed to a joining node carries the model's step count too, so
+  a joiner and the members it joins have to be on the same version.
+
 ### Security
 
 - **The job token no longer crosses the wire, and can stay off the store

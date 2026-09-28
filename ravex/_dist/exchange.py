@@ -239,7 +239,7 @@ def decide_round(store, scope, round_number: int, rank: int, collected,
         ) from exc
 
 
-def close_round(loop, exchange: "DeltaExchange", peers, deadline: float):
+def close_round(loop, exchange: "DeltaExchange", peers, deadline: float, metrics=None):
     """Publish this node's report, collect the peers', take the outer step.
 
     The one function a training loop calls, and the seam between the two halves
@@ -289,8 +289,15 @@ def close_round(loop, exchange: "DeltaExchange", peers, deadline: float):
     :class:`RoundSplitError` rather than apply a different average. Two more
     spans come with it: ``decide_seconds`` and ``recover_seconds``, the second
     zero unless this node's gather came up short of the decision.
+
+    **And the round's metrics (GPU-135).** ``metrics`` is what this node logged
+    during the round, ``{name: [mean, count]}``; it travels in the report's
+    metadata, and the result carries ``model_metrics`` - one value per name,
+    over the decided set, weighted by steps - and ``members``, so that the one
+    node that writes the model's series is the same answer everywhere.
     """
     from ravex._dist.outer import Contribution
+    from ravex._metrics import model_means
 
     round_number = loop.round_number
     started = time.monotonic()
@@ -305,6 +312,7 @@ def close_round(loop, exchange: "DeltaExchange", peers, deadline: float):
     mine = None
     try:
         mine = loop.contribution()
+        mine.metrics = dict(metrics or {})
         expected = _report.expectation(mine.delta)
     except Exception as exc:
         logger.warning("Could not compute this node's round %d delta: %s", round_number, exc)
@@ -315,7 +323,7 @@ def close_round(loop, exchange: "DeltaExchange", peers, deadline: float):
     offered = mine is not None
     if offered:
         try:
-            exchange.publish(mine.delta, round_number, mine.steps)
+            exchange.publish(mine.delta, round_number, mine.steps, mine.metrics)
             # What the peers will average, which under `save_dtype` is not
             # what was just handed over. See `DeltaExchange.as_published`.
             mine.delta = exchange.as_published(mine.delta, round_number, expected)
@@ -392,7 +400,12 @@ def close_round(loop, exchange: "DeltaExchange", peers, deadline: float):
         )
 
     contributions = ([mine] if exchange.rank in members else []) + [
-        Contribution(delta=received[r].delta, steps=received[r].steps, node=received[r].node)
+        Contribution(
+            delta=received[r].delta,
+            steps=received[r].steps,
+            node=received[r].node,
+            metrics=getattr(received[r], "metrics", None) or {},
+        )
         for r in members
         if r != exchange.rank
     ]
@@ -417,6 +430,8 @@ def close_round(loop, exchange: "DeltaExchange", peers, deadline: float):
         report = {"round": round_number, "nodes": 0, "steps": []}
     report.update(
         {
+            "members": sorted(int(r) for r in members),
+            "model_metrics": model_means([(c.steps, c.metrics) for c in contributions]),
             "decided_by": decided_by,
             "recovered": len(missing),
             "delta_seconds": subtracted - started,
@@ -464,7 +479,10 @@ def adopt_outer_state(loop, exchange: "DeltaExchange", source: int, rank: int,
     Returns whether this node ended up holding the shared state.
     """
     expected = _report.expectation(loop.outer)
-    exchange.publish(loop.outer, SEED_ROUND, 0)
+    # The seed report's step count is the source's model steps (GPU-135):
+    # nodes resumed from checkpoints of different ages take the source's
+    # parameters, and the axis the run's metrics are drawn on goes with them.
+    exchange.publish(loop.outer, SEED_ROUND, int(getattr(loop, "model_steps", 0)))
     if rank == source:
         # **The source has to adopt its own state too**, whenever a
         # ``save_dtype`` means the peers will read a cast of it. Otherwise the
@@ -483,6 +501,7 @@ def adopt_outer_state(loop, exchange: "DeltaExchange", source: int, rank: int,
         return False
 
     loop.outer = reports[0].delta
+    loop.model_steps = int(reports[0].steps)
     loop.write_back()
     return True
 
@@ -876,7 +895,7 @@ class DeltaExchange:
 
     # -- publishing -------------------------------------------------------
 
-    def publish(self, delta, round_number: int, steps: int) -> None:
+    def publish(self, delta, round_number: int, steps: int, metrics=None) -> None:
         """Write this node's report and offer it to whoever asks.
 
         The round number is the snapshot's step, so a peer asks for a round by
@@ -904,6 +923,7 @@ class DeltaExchange:
             self.node,
             compression_level=self.compression_level,
             save_dtype=self.save_dtype,
+            metrics=metrics,
         )
         wrote = time.monotonic() - began
 

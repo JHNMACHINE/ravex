@@ -235,6 +235,16 @@ class RavexRuntime:
         #: record, so the time per step is an average over the interval rather
         #: than the one step that happened to land on the cadence.
         self._metrics_mark: Optional[Tuple[int, float]] = None
+        #: In a multi-node run, where the script's metrics wait for the end of
+        #: the round (GPU-135): they are the model's, one value per name over
+        #: every node, and not this node's. None otherwise.
+        self._round_means: Any = None
+        #: The model's series, when this node is the one writing it. Opened at
+        #: the first round it writes; see `_write_model_series`.
+        self._model_writer: Any = None
+        #: What sends a file beside the checkpoints on - the bucket, the
+        #: backend - kept for the model writer, which opens later.
+        self._metrics_uploader: Any = None
 
         self._setup_logging()
 
@@ -288,6 +298,10 @@ class RavexRuntime:
                     self.config.system_metrics_every,
                     self.config.metrics_chunk_every,
                 )
+                if self.config.outer_loop:
+                    from ravex._metrics import RoundMeans
+
+                    self._round_means = RoundMeans()
 
             logger.info(
                 "Ravex active - %s framework=%s rank=%d/%d",
@@ -660,6 +674,12 @@ class RavexRuntime:
         """Queue already-prepared metrics. See `ravex.log_metrics`."""
         if self._metrics is None or not self._enabled:
             return
+        if self._round_means is not None:
+            # A multi-node run: the model's metrics, averaged over the nodes
+            # at the end of the round (GPU-135). `step` does not apply - the
+            # model's axis is its steps over every node, known only then.
+            self._round_means.add(values)
+            return
         self._metrics.log(self.registry.step_count if step is None else int(step), values)
 
     def _open_run_record(self, uploader: Any) -> None:
@@ -829,7 +849,7 @@ class RavexRuntime:
             except (TypeError, ValueError):
                 continue
         if values:
-            self._metrics.log(step, values)
+            self.log_metrics(values, step)
 
     # ─── the outer loop, GPU-113 ────────────────────────────────────────
 
@@ -903,6 +923,14 @@ class RavexRuntime:
             # assigned once, to everybody at the same moment, by torchrun.
             store, rank, world, joining = self._join_rendezvous(address)
             ceiling = partial(_rendezvous.registered, store)
+            if not self.config.run_id:
+                # GPU-135: nodes started on their own each describe a run of
+                # their own unless they are told which one they are.
+                logger.warning(
+                    "No run_id is set: this node records a run of its own, and "
+                    "the platform shows as many runs as there are nodes. Give "
+                    "every node the same run_id (RAVEX_RUN_ID) to make them one."
+                )
         else:
             store = rendezvous_store()
             rank, world = get_rank(), get_world_size()
@@ -1229,6 +1257,7 @@ class RavexRuntime:
                 self._exchange,
                 self._outer_peers,
                 time.monotonic() + self.config.outer_deadline,
+                metrics=self._round_means.take() if self._round_means is not None else None,
             )
         except MembershipError as exc:
             # `RoundSplitError` among them. Not swallowed and not abandoned:
@@ -1266,6 +1295,57 @@ class RavexRuntime:
             report.get("recover_seconds", 0.0),
             report.get("apply_seconds", 0.0),
         )
+        self._write_model_series(report, time.monotonic() - started)
+
+    def _write_model_series(self, report: Dict[str, Any], seconds: float) -> None:
+        """Log the round as a point on the model's series (GPU-135).
+
+        **One node writes it: the lowest-numbered member of the round.** Every
+        node holds the same report - the same decided set, the same reports
+        in it - so every node computes the same answer to "is it me", and
+        nobody has to be told. The lowest member rather than the node that
+        decided, because it stays the same from round to round: the series is
+        one segment for as long as that node is in the run, and when it
+        leaves, the next one opens a segment starting where the model is,
+        which is exactly where the previous one stopped.
+
+        The step is the model's (:attr:`OuterLoop.model_steps`), every step
+        taken by every node in every round applied, so the chart of a run on
+        four nodes and one on a single node are on the same axis.
+        """
+        if self._metrics is None or self._exchange is None or not report.get("nodes"):
+            return
+        members = report.get("members") or []
+        if not members or int(self._exchange.rank) != min(members):
+            return
+        try:
+            from ravex._metrics import MODEL_RANK, MetricsWriter, Scalar
+
+            round_steps = sum(max(int(s), 0) for s in report.get("steps") or [])
+            model_steps = int(report.get("model_steps", getattr(self._outer, "model_steps", 0)))
+            if self._model_writer is None:
+                self._model_writer = MetricsWriter(
+                    self.config.storage.path,
+                    MODEL_RANK,
+                    model_steps - round_steps,
+                    self._metrics.chunk_every,
+                    self._metrics_uploader,
+                )
+            values: Dict[str, Any] = {
+                "outer/round": report.get("round", 0),
+                "outer/nodes": report.get("nodes", 0),
+                "outer/steps": round_steps,
+                "outer/seconds": seconds,
+            }
+            values.update(report.get("model_metrics") or {})
+            self._model_writer.put(
+                model_steps,
+                time.time(),
+                {name: Scalar(float(value)) for name, value in values.items()},
+            )
+        except Exception as exc:
+            # The round is applied; a chart missing a point is the whole cost.
+            logger.warning("Could not log outer round %s: %s", report.get("round"), exc)
 
     def should_stop(self) -> bool:
         """Whether the configured step budget has been spent.
@@ -1314,6 +1394,7 @@ class RavexRuntime:
             from ravex._ship import combine
 
             uploader = combine(self._store_uploader(), self._open_shipper())
+            self._metrics_uploader = uploader
             self._open_run_record(uploader)
             if self._metrics is not None:
                 self._metrics.begin(
@@ -2815,6 +2896,9 @@ class RavexRuntime:
                 # before the backend closes: closing is what writes the last
                 # chunk and queues it, and the backend's own close is the last
                 # sync that can carry it.
+                if self._model_writer is not None:
+                    self._model_writer.close()
+                    self._model_writer = None
                 self._metrics.close(self.registry.step_count)
                 self._metrics = None
             if self._backend is not None:
@@ -2877,6 +2961,9 @@ def reset_runtime() -> None:
             except Exception:
                 pass
             try:
+                if _runtime._model_writer is not None:
+                    _runtime._model_writer.close()
+                    _runtime._model_writer = None
                 if _runtime._metrics is not None:
                     _runtime._metrics.close(_runtime.registry.step_count)
                     _runtime._metrics = None

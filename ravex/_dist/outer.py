@@ -175,6 +175,9 @@ class Contribution:
     steps: int
     node: str = ""
     metadata: Dict[str, Any] = field(default_factory=dict)
+    #: What the node logged during the round, ``{name: [mean, count]}``
+    #: (GPU-135). Carried beside the delta and never averaged into it.
+    metrics: Dict[str, Any] = field(default_factory=dict)
 
 
 def combine(contributions: List[Contribution], mode: str = "mean") -> ParamMap:
@@ -475,6 +478,12 @@ class OuterLoop:
         self.optimizer = OuterOptimizer(lr=lr, momentum=momentum, nesterov=nesterov)
         self.steps_this_round = 0
         self.round_number = 0
+        #: Every step the model has taken, over all the nodes and all the
+        #: rounds applied (GPU-135): the axis a multi-node run's metrics are
+        #: drawn on. The same number on every node, because every node applies
+        #: the same decided set - and it travels with the outer state to a
+        #: node that joins, and with the checkpoint to one that resumes.
+        self.model_steps = 0
         self._started_at = time.monotonic()
 
         adrift = float_buffers(model)
@@ -524,12 +533,14 @@ class OuterLoop:
         self.write_back()
 
         steps = [c.steps for c in contributions]
+        self.model_steps += sum(max(int(s), 0) for s in steps)
         report = {
             "round": self.round_number,
             "nodes": len(contributions),
             "steps": steps,
             "slowest": min(steps),
             "fastest": max(steps),
+            "model_steps": self.model_steps,
         }
         logger.info(
             "Outer round %d closed over %d node(s), %d-%d local steps each.",
@@ -592,6 +603,7 @@ class OuterLoop:
         return {
             "round": self.round_number,
             "steps_this_round": self.steps_this_round,
+            "model_steps": self.model_steps,
             "combine_mode": self.combine_mode,
             "outer": self.outer,
             "optimizer": self.optimizer.state_dict(),
@@ -600,6 +612,7 @@ class OuterLoop:
     def load_state_dict(self, state: Dict[str, Any]) -> None:
         self.round_number = int(state.get("round", 0))
         self.steps_this_round = int(state.get("steps_this_round", 0))
+        self.model_steps = int(state.get("model_steps", 0))
         self.combine_mode = state.get("combine_mode", self.combine_mode)
         if state.get("outer"):
             self.outer = dict(state["outer"])

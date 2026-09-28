@@ -499,6 +499,102 @@ class SystemSampler:
 # ─── the session a runtime holds ─────────────────────────────────────
 
 
+#: The rank a multi-node run's **model timeline** is written under (GPU-135).
+#: Not a process: the series of the one model every node is training, written
+#: by one node at a time. A rank of its own, because the resume cut chains
+#: segments of equal rank - and every node of a run joined through a
+#: rendezvous is rank 0 of its own world, so its segment starting at its own
+#: local step would otherwise cut the model's series at a number on a
+#: different axis.
+MODEL_RANK = -1
+
+
+class RoundMeans:
+    """What this node logged during an outer round, as a mean per name (GPU-135).
+
+    In a multi-node run the script's metrics are not sent as they are logged:
+    every node computes its own loss on its own shard, at its own step count,
+    and a run is one model. So each node keeps a running sum here, sends the
+    mean with its round report, and the round's writer logs the mean over the
+    nodes, weighted by the steps behind each.
+
+    Sums stay on the device until :meth:`take`: adding a queued value is as
+    asynchronous as queueing it, and the round boundary - which reads the
+    parameters back anyway - is where they come home.
+    """
+
+    def __init__(self) -> None:
+        self._sums: Dict[str, List[Any]] = {}
+        self._lock = threading.Lock()
+        self._warned_histogram = False
+
+    def add(self, values: Mapping[str, Any]) -> None:
+        """Take prepared values. Histograms are not averaged and are dropped."""
+        with self._lock:
+            for key, value in values.items():
+                if not isinstance(value, Scalar):
+                    if not self._warned_histogram:
+                        self._warned_histogram = True
+                        logger.warning(
+                            "Histogram %r is not logged: in a multi-node run a "
+                            "metric is the mean over the nodes of a round, and "
+                            "histograms are not averaged.",
+                            key,
+                        )
+                    continue
+                pending = value.pending
+                if hasattr(pending, "double"):
+                    pending = pending.double()
+                entry = self._sums.get(key)
+                if entry is None:
+                    self._sums[key] = [pending, 1]
+                else:
+                    entry[0] = entry[0] + pending
+                    entry[1] += 1
+
+    def take(self) -> Dict[str, List[float]]:
+        """``{name: [mean, count]}`` for the round just over, and start again."""
+        with self._lock:
+            sums, self._sums = self._sums, {}
+        out: Dict[str, List[float]] = {}
+        for key, (total, count) in sums.items():
+            try:
+                value = float(total.item() if hasattr(total, "item") else total)
+            except Exception as exc:
+                logger.debug("Could not read metric %r back: %s", key, exc)
+                continue
+            out[key] = [value / count, count]
+        return out
+
+
+def model_means(reports: List[Tuple[int, Mapping[str, Any]]]) -> Dict[str, float]:
+    """One value per name out of every node's round means (GPU-135).
+
+    ``reports`` is ``(steps, {name: [mean, count]})`` per node that was in the
+    round. Weighted by the steps behind each node, so the result is the mean
+    over the steps the model took this round, wherever they ran: a node at a
+    fifth of the others' speed moves the loss by a fifth as much. A node that
+    did not log a name is left out of that name only; a round where every
+    node took zero steps falls back to an equal weight.
+    """
+    sums: Dict[str, List[float]] = {}
+    for steps, means in reports:
+        for key, entry in (means or {}).items():
+            try:
+                mean = float(entry[0])
+            except (TypeError, ValueError, IndexError):
+                continue
+            slot = sums.setdefault(key, [0.0, 0.0, 0.0, 0.0])
+            slot[0] += mean * max(int(steps), 0)
+            slot[1] += max(int(steps), 0)
+            slot[2] += mean
+            slot[3] += 1
+    return {
+        key: (weighted / weight if weight > 0 else plain / count)
+        for key, (weighted, weight, plain, count) in sums.items()
+    }
+
+
 def _environment_rank(name: str) -> Optional[int]:
     raw = os.environ.get(name)
     try:

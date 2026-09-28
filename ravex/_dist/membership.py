@@ -569,6 +569,7 @@ def _expectation(outer):
 #: cannot: ``::``.
 OUTER_PREFIX = "outer::"
 MOMENTUM_PREFIX = "momentum::"
+MODEL_STEPS_KEY = "ravex::model_steps"
 
 
 def state_payload(loop) -> Dict[str, object]:
@@ -610,6 +611,10 @@ def state_payload(loop) -> Dict[str, object]:
         payload[MOMENTUM_PREFIX + name] = (
             buffer if buffer is not None else torch.zeros_like(value)
         )
+    # The model's step count (GPU-135), so the joiner's metrics continue the
+    # run's axis instead of starting one of their own at zero. An integer
+    # tensor, which no `save_dtype` cast touches.
+    payload[MODEL_STEPS_KEY] = torch.tensor(int(getattr(loop, "model_steps", 0)), dtype=torch.int64)
     return payload
 
 
@@ -622,6 +627,8 @@ def apply_state(loop, payload: Dict[str, object]) -> None:
             outer[key[len(OUTER_PREFIX):]] = value
         elif key.startswith(MOMENTUM_PREFIX):
             buffers[key[len(MOMENTUM_PREFIX):]] = value
+        elif key == MODEL_STEPS_KEY:
+            loop.model_steps = int(value.item() if hasattr(value, "item") else value)
 
     if not outer:
         raise MembershipError(

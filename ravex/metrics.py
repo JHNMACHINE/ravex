@@ -44,7 +44,7 @@ import math
 import os
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple
 
-from ravex._metrics import FORMAT_VERSION, HEADER_CHUNK, METRICS_DIR
+from ravex._metrics import FORMAT_VERSION, HEADER_CHUNK, METRICS_DIR, MODEL_RANK
 
 __all__ = ["read", "resolve", "segments"]
 
@@ -238,11 +238,16 @@ def resolve(chunks: Mapping[str, str]) -> Dict[str, Any]:
     """
     by_segment = _grouped(chunks)
     headers = _headers(by_segment)
-    primary = [header for header in headers if header.get("rank", 0) == 0]
+    # Two timelines can carry a run's metrics: rank 0's, and a multi-node
+    # run's model series (GPU-135), written under a rank of its own because
+    # its steps are the model's and not any process's. Each is cut by the
+    # segments of its own kind only.
     cut_at: Dict[str, Optional[int]] = {}
-    for index, header in enumerate(primary):
-        following = primary[index + 1] if index + 1 < len(primary) else None
-        cut_at[header["segment"]] = None if following is None else int(following["start_step"])
+    for timeline in (0, MODEL_RANK):
+        chain = [header for header in headers if header.get("rank", 0) == timeline]
+        for index, header in enumerate(chain):
+            following = chain[index + 1] if index + 1 < len(chain) else None
+            cut_at[header["segment"]] = None if following is None else int(following["start_step"])
 
     scalars: Dict[str, Dict[str, List[Any]]] = {}
     histograms: Dict[str, List[Dict[str, Any]]] = {}
@@ -255,7 +260,7 @@ def resolve(chunks: Mapping[str, str]) -> Dict[str, Any]:
     for order, header in enumerate(headers):
         segment = header["segment"]
         limit = cut_at.get(segment)
-        is_primary = header.get("rank", 0) == 0
+        is_primary = header.get("rank", 0) in (0, MODEL_RANK)
         host = str(header.get("host", "unknown"))
         for name, text in by_segment[segment][1:]:
             for record in _records(text, segment + "/" + name):
