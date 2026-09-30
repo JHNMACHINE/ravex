@@ -114,13 +114,21 @@ def _exponents(blocks: torch.Tensor, fmt: Format) -> torch.Tensor:
 
 
 def _fp4_codes(scaled: torch.Tensor) -> torch.Tensor:
-    """e2m1 codes, 0..15, sign in bit 3. Ties go to the even code."""
+    """e2m1 codes, 0..15, sign in bit 3. Ties go to the even code.
+
+    **A negative value that rounds to zero keeps its sign** - code 8, negative
+    zero - because that is what the hardware conversion does, and the kernels
+    are held to this function byte for byte. Normalising it to +0, as the
+    first version did, cost nothing a reader could see and failed that test
+    on every block with a small negative value in it (found on an RTX 4090,
+    2026-09-30).
+    """
     magnitude = scaled.abs().clamp(max=6.0)
     bounds = _FP4_BOUNDS.to(scaled.device)
     index = torch.bucketize(magnitude, bounds)  # a tie lands on the lower code
     at_tie = magnitude == bounds[index.clamp(max=bounds.numel() - 1)]
     index = torch.where(at_tie & (index % 2 == 1), index + 1, index)
-    sign = ((scaled < 0) & (index > 0)).to(torch.int64)
+    sign = torch.signbit(scaled).to(torch.int64)
     return (index | (sign << 3)).to(torch.uint8)
 
 
@@ -141,6 +149,29 @@ def encode(tensor: torch.Tensor, fmt: Format) -> Tuple[torch.Tensor, torch.Tenso
         if fast is not None:
             return fast
     return encode_torch(tensor, fmt)
+
+
+def encode_for_wire(tensor: torch.Tensor, fmt: Format) -> Tuple[torch.Tensor, torch.Tensor]:
+    """:func:`encode` where it is cheapest, with the result on the host.
+
+    **The outer delta lives on the host** (GPU-124: Moonclip reads host
+    memory), so left to itself it would be quantized on the CPU - measured
+    on 2026-09-30 at ~30 ns per element for fp4, some 30 s a round for 1B
+    parameters. The same torch code on an RTX 4090 took 17 ms for 64M
+    elements. So a tensor goes to the GPU when there is one, is quantized
+    there, and only its codes come back: an eighth of what went. One tensor
+    at a time, so what this adds to the GPU's memory is one parameter's
+    worth, and anything failing on the way - a GPU without room, say -
+    quantizes that tensor on the CPU instead.
+    """
+    if not tensor.is_cuda and torch.cuda.is_available():
+        try:
+            codes, exponents = encode(tensor.to("cuda", non_blocking=True), fmt)
+            return codes.cpu(), exponents.cpu()
+        except Exception:
+            pass
+    codes, exponents = encode(tensor, fmt)
+    return codes.cpu(), exponents.cpu()
 
 
 def encode_torch(tensor: torch.Tensor, fmt: Format) -> Tuple[torch.Tensor, torch.Tensor]:

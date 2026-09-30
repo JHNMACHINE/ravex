@@ -340,7 +340,7 @@ def write(
         fmt = _quant.FORMATS[quantize]
         encoded = {}
         for name, tensor in delta.items():
-            codes, exponents = _quant.encode(tensor, fmt)
+            codes, exponents = _quant.encode_for_wire(tensor, fmt)
             encoded[name] = codes
             encoded[name + EXPONENTS] = exponents
         delta = encoded

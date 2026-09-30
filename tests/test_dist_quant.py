@@ -29,6 +29,13 @@ class TestTheFormats:
         got = roundtrip(block, FP4)[: len(values)].tolist()
         assert got == [0.0, 1.0, 1.0, 2.0, 2.0, 4.0, 4.0, 0.0, -4.0, 6.0]
 
+    def test_a_small_negative_value_rounds_to_negative_zero(self):
+        """What the hardware cast writes, so what the kernels write too."""
+        block = torch.tensor([6.0, -0.1, 0.1, -0.0] + [0.0] * 28)
+        codes, _ = encode(block, FP4)
+        nibbles = [codes[0] & 0xF, codes[0] >> 4, codes[1] & 0xF, codes[1] >> 4]
+        assert [int(n) for n in nibbles] == [7, 8, 0, 8]
+
     def test_fp8_agrees_with_the_torch_cast_at_the_block_scale(self):
         torch.manual_seed(0)
         x = torch.randn(4, 128)

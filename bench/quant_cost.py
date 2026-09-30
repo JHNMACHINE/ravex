@@ -21,7 +21,7 @@ import time
 import torch
 
 from ravex._dist import quant_tilelang
-from ravex._dist.quant import FORMATS, encode_torch
+from ravex._dist.quant import FORMATS, decode, encode_torch
 
 
 def timed(fn, repeat):
@@ -34,6 +34,27 @@ def timed(fn, repeat):
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     return (time.perf_counter() - started) / repeat, out
+
+
+def diagnose(x, fmt, want, got):
+    """What differs, for the first failing case: scales, bytes, and whether the
+    kernel's codes still decode to the tensor (a layout problem) or not (a
+    rounding or scale problem)."""
+    codes, exponents = got
+    print("  first failure: %s %s %s" % (fmt.name, tuple(x.shape), x.dtype))
+    print("  exponents equal: %s (%d vs %d)" % (torch.equal(exponents, want[1]),
+                                                exponents.numel(), want[1].numel()))
+    print("  code bytes equal: %d of %d" % ((codes == want[0]).sum().item(), codes.numel()))
+    print("  first bytes torch : %s" % want[0][:12].tolist())
+    print("  first bytes kernel: %s" % codes[:12].tolist())
+    swapped = (codes >> 4) | ((codes & 0x0F) << 4)
+    print("  equal with nibbles swapped: %d of %d" % ((swapped == want[0]).sum().item(), codes.numel()))
+    mine = decode(want[0], want[1], fmt, x.shape, torch.float32)
+    theirs = decode(codes, exponents, fmt, x.shape, torch.float32)
+    scale = x.float().abs().max().item() or 1.0
+    print("  max |decoded - x| / max|x|: torch %.3g, kernel %.3g"
+          % ((mine - x.float()).abs().max().item() / scale,
+             (theirs - x.float()).abs().max().item() / scale), flush=True)
 
 
 def check():
@@ -49,6 +70,8 @@ def check():
                 ok = got is not None and all(torch.equal(a, b) for a, b in zip(got, want))
                 if not ok:
                     failures.append("%s %s %s" % (name, shape, dtype))
+                    if len(failures) == 1 and got is not None:
+                        diagnose(x, fmt, want, got)
     print("CHECK %s%s" % ("OK" if not failures else "FAILED: ",
                           "; ".join(failures)), flush=True)
     return not failures
@@ -78,10 +101,17 @@ def main():
             xc = x.cuda()
             cuda, _ = timed(lambda: encode_torch(xc, fmt), args.repeat)
             line += "  torch/cuda %7.4fs" % cuda
+            # What a round actually does: the delta is on the host, goes to the
+            # GPU, and only the codes come back. Both paths timed that way, so
+            # the kernel's host copy is not counted against it alone.
+            torch_trip, _ = timed(
+                lambda: [t.cpu() for t in encode_torch(x.to("cuda"), fmt)], args.repeat
+            )
+            line += "  torch host->gpu->host %7.4fs" % torch_trip
             if quant_tilelang.available():
-                kernel, got = timed(lambda: quant_tilelang.encode(xc, fmt), args.repeat)
+                kernel, got = timed(lambda: quant_tilelang.encode(x.to("cuda"), fmt), args.repeat)
                 same = got is not None and all(torch.equal(a, b) for a, b in zip(got, want))
-                line += "  tilelang %7.4fs  same bytes: %s" % (kernel, same)
+                line += "  tilelang host->gpu->host %7.4fs  same bytes: %s" % (kernel, same)
         wire = args.elements * 4 / 1e6 * (1 - (fmt.bits + 8 / fmt.group) / 32)
         line += "  saves %.0f MB = %.1fs at %g MB/s" % (wire, wire / args.link_mbps, args.link_mbps)
         print(line, flush=True)
