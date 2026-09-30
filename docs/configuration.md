@@ -927,7 +927,8 @@ outer_lr: 0.7
 outer_momentum: 0.9
 outer_combine: mean          # mean | normalized | step_weighted
 outer_deadline: 900
-outer_save_dtype: null       # bf16 takes a fifth off a round
+outer_save_dtype: null       # bf16 takes a fifth off a round; fp4_block 7.6x
+outer_error_feedback: false  # carry the quantization residual to the next round
 outer_root: null             # defaults to <storage.path>/rounds
 ```
 
@@ -1076,6 +1077,43 @@ on one box. Set `outer_save_dtype: bf16` and take the fifth — it is the smalle
 of the two bets that measured free, keeping fp32's exponent range and losing
 only mantissa (0.14% of relative error per element against fp8's 2.3%). `none`,
 `off` and an empty value all turn it off again.
+
+**Block formats: `fp8_block` and `fp4_block` (GPU-139).** One power-of-two
+scale per 128 elements (fp8) or 32 (fp4, the MXFP4 layout) instead of one per
+tensor, so a block of small values keeps a scale of its own. Ravex quantizes
+the delta and hands Moonclip bytes it does not cast again; the format travels
+in the report, so a reader needs no setting to match. Measured on the delta of
+a real H=8 round, after compression:
+
+| `outer_save_dtype` | on the wire | bits per element |
+| -- | -- | -- |
+| `none` | 1.00x | 27.5 |
+| `bf16` | 2.35x | 11.7 |
+| `fp8` | 4.90x | 5.6 |
+| `fp8_block` | 4.79x | 5.8 |
+| `fp4_block` | **7.58x** | **3.6** |
+
+And what it costs the loss, `bench/outer_convergence.py`, 2026-09-30: two nodes,
+contiguous shards, H=8 for 2048 local steps — 256 rounds for the error to
+accumulate over — three seeds:
+
+| seed | `none` | `fp4_block` | `fp4_block` + feedback |
+| -- | -- | -- | -- |
+| 0 | 1.5284 | +0.016 | +0.020 |
+| 1 | 1.5015 | −0.013 | +0.000 |
+| 2 | 1.4935 | +0.004 | +0.007 |
+
+**fp4 costs nothing this bench can see**, at 3.2x fewer bytes than bf16 — the
+difference between H of ~3200 and ~800 for a 1B model on 7 MB/s. Error feedback
+(`outer_error_feedback: true`) does not help at this size either, so it stays
+off; it keeps a copy of the trainable parameters per node, never exchanged and
+not passed to a node that joins.
+
+**Every node can produce either format**, on any device: the quantization is
+plain torch, so the format is one per job, not negotiated per node. It is
+also the part that is slow today: fp4 costs ~20 ns per element on a CPU, some
+20 s a round for 1B parameters. A TileLang kernel for the GPU is the next step,
+tested against this path byte for byte.
 
 **What is not handled.** Floating-point buffers — batch-norm running statistics
 — are not exchanged; each node keeps its own, and it says so once at startup.

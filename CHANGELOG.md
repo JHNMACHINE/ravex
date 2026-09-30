@@ -42,6 +42,17 @@
   took 95 s against ten of notice; that shape is documented as out of scope
   for the emergency path.
 
+- **`outer_save_dtype: fp4_block` and `fp8_block`: the outer delta quantized
+  with one scale per block (GPU-139).** A power-of-two scale per 32 elements
+  (fp4, MXFP4) or 128 (fp8) instead of one per tensor. Ravex quantizes, and
+  Moonclip stores the codes without casting them again. fp4 puts 3.6 bits per
+  element on the wire, 7.6x under uncast and 3.2x under bf16, and costs
+  nothing measurable in loss: three seeds of 256 rounds, within ±0.016 nat of
+  fp32. Plain torch, so every node can produce it. **A new report format**: a
+  node on an older version cannot read a block-quantized report, so every node
+  of a run needs this version before the run sets it. With it,
+  `outer_error_feedback`, off by default, which did not help at this size.
+
 ### Changed
 
 - **A `save_dtype` glob is no longer shadowed by a component written before
