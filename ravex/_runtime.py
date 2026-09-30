@@ -108,6 +108,11 @@ def _drain_accelerator() -> None:
         logger.debug("Could not drain the accelerator queue: %s", exc)
 
 
+def _seconds(value: float) -> str:
+    """A duration for a log line: 0.00687, 4.2, 130, 3600 — never 0.0 or 3.6e+03."""
+    return "%.3g" % value if value < 1000 else "%.0f" % value
+
+
 class RavexRuntime:
     """Singleton runtime. Build it through :func:`get_runtime`."""
 
@@ -2873,22 +2878,22 @@ class RavexRuntime:
             )
         elif declined:
             logger.warning(
-                "SIGTERM on this rank. The last checkpoint took %.3gs and "
-                "preemption_notice is %.3gs, so a coordinated save would be "
+                "SIGTERM on this rank. The last checkpoint took %ss and "
+                "preemption_notice is %ss, so a coordinated save would be "
                 "killed before it landed: not attempting it. Flushing the "
                 "checkpoint of step %s and exiting; the others time out of the "
                 "emergency round in emergency_timeout=%ds and keep that one.",
-                cost,
-                notice,
+                _seconds(cost),
+                _seconds(notice),
                 getattr(self, "_last_saved_step", None),
                 self.config.emergency_timeout,
             )
         else:
             logger.warning(
-                "SIGTERM on this rank. The last checkpoint took %.3gs%s; "
+                "SIGTERM on this rank. The last checkpoint took %ss%s; "
                 "attempting the coordinated save.",
-                cost,
-                " against a notice of %.3gs" % notice if notice is not None else
+                _seconds(cost),
+                " against a notice of %ss" % _seconds(notice) if notice is not None else
                 " (preemption_notice unset, so this is not checked)",
             )
 
