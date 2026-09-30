@@ -354,10 +354,65 @@ save_dtype:
 ```
 
 Written the other way round the catch-all comes first and the exception never
-applies.
+applies. One rule overrides the written order: a glob that names tensors —
+anything but a component or the bare `*` — goes ahead of every component and
+`*`, wherever it appears. `{model: bf16, "*expert*": fp8}` used to cast the
+experts to bf16, because `model` matched them first; it now casts them to fp8.
 
 From the environment, `RAVEX_SAVE_DTYPE=bf16` for the bare form and
 `RAVEX_SAVE_DTYPE=model:none,optimizer:bf16` for rules, ordered left to right.
+
+#### On the module: `@ravex.save_dtype`
+
+A glob is a string about an attribute name. Rename `experts` to `moe_experts`
+and `"*expert*": fp8` still matches — rename it to `ffn` and the experts go
+back to whatever the rest of the model is stored at, with nothing to say so.
+The precision can be declared on the module instead, where a rename cannot
+detach it:
+
+```python
+@ravex.save_dtype("fp8")
+class Expert(nn.Module):
+    ...
+
+# or on one instance, for a model that is not yours to edit
+ravex.save_dtype(model.experts, "fp8")
+ravex.save_dtype(model, "bf16")        # the rest
+```
+
+It covers the module's parameters and buffers — the weights, sharded or not —
+and not its optimizer state, which stays with the `optimizer` component. It
+needs no active `train_loop`: a decorator runs at import, and a bad dtype
+raises there. `none` is a valid value, and keeps a module inside an annotated
+one at the precision it arrives in.
+
+When more than one thing speaks for a tensor:
+
+| | wins over |
+| -- | -- |
+| a deeper annotation | the annotations around it |
+| an annotation on an instance | the one on its class |
+| a `save_dtype` glob that names tensors | any annotation |
+| any annotation | a component name, `*`, or a bare `save_dtype: bf16` |
+
+The last two lines are the reason for the split. The author of a model knows
+which pieces tolerate fp8; a component name or a bare value in the file is a
+default for the run, and should not undo that in silence. A glob that names
+tensors is someone being specific, and wins. So everything at full precision,
+annotations included, for a debug:
+
+```
+RAVEX_SAVE_DTYPE='ravex/*:fp32'
+```
+
+— not `'*:fp32'`: the bare `*` is the catch-all default, and has to stay one
+for `{model: none, "*": bf16}` to keep meaning "everything but the weights".
+
+Annotations are read when the checkpoint backend is built, on the first
+checkpoint or resume, from the models registered by then. **A declaration that
+has no effect is logged**, once: a class no checkpointed model contains, an
+instance that is not part of one, a module whose every tensor sits under a
+deeper annotation, and one a configured glob overrides entirely.
 
 #### Why it is worth setting
 
@@ -411,7 +466,8 @@ on a single GPU and silently casts **nothing** on the sharded run the setting
 was chosen for. Naming the component covers both.
 
 Raw patterns still work for anything the component names do not reach, and they
-are passed through untouched.
+are passed through untouched, ahead of the components. For the parts of a model,
+an annotation on the module is the sturdier way to say it — see above.
 
 #### Turning it on mid-run
 

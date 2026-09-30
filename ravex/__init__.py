@@ -52,6 +52,7 @@ __all__ = [
     "flush",
     "is_active",
     "log_metrics",
+    "save_dtype",
     "status",
     "step",
     "track",
@@ -211,6 +212,57 @@ def track(
         registry.register_scheduler(scheduler)
     if scaler is not None:
         registry.register_scaler(scaler)
+
+
+def save_dtype(target: Any, dtype: Optional[str] = None) -> Any:
+    """Declare the precision a module is checkpointed at, on the module.
+
+    On a class, as a decorator — every instance in a checkpointed model::
+
+        @ravex.save_dtype("fp8")
+        class Expert(nn.Module): ...
+
+    On an instance, for a model that is not yours to edit::
+
+        ravex.save_dtype(model.experts, "fp8")
+
+    The dtype is any ``save_dtype`` value, ``"none"`` included, which keeps a
+    module inside an annotated one at the precision it arrives in. It covers
+    the module's parameters and buffers, not its optimizer state.
+
+    Who wins, when more than one thing speaks for a tensor: the deepest
+    annotation over the ones around it; an instance over its class; a
+    ``save_dtype`` glob in the configuration that names tensors over any
+    annotation; and any annotation over a component name, ``*`` or a scalar
+    ``save_dtype``, which are defaults for the run. So an operator who needs
+    everything at full precision, annotations included, says
+    ``RAVEX_SAVE_DTYPE='ravex/*:fp32'``: a glob that names every tensor. The
+    bare ``*`` is the catch-all default, and stays one, because
+    ``{model: none, "*": bf16}`` has to keep meaning "everything but the
+    weights".
+
+    Needs no active ``train_loop``: it is a declaration, and a decorator runs
+    at import. A bad dtype or target raises there. An annotation that ends up
+    covering no tensor is logged when the first checkpoint is prepared.
+    """
+    from ravex._precision import declare, normalize_dtype
+
+    if isinstance(target, str) and dtype is None:
+        name = normalize_dtype(target)
+
+        def decorate(cls: Any) -> Any:
+            declare(cls, name)
+            return cls
+
+        return decorate
+
+    if dtype is None:
+        raise TypeError(
+            "ravex.save_dtype(module) needs a dtype: ravex.save_dtype(module, 'fp8'), "
+            "or @ravex.save_dtype('fp8') on a class"
+        )
+    declare(target, dtype)
+    return target
 
 
 def log_metrics(values: Any = None, *, step: Optional[int] = None) -> Any:

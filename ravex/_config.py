@@ -285,7 +285,16 @@ class RavexConfig:
     # ``scaler``, ``dataloader`` — or raw Moonclip globs over the tensor name
     # for anything they do not cover. **The first matching rule wins**, in the
     # order written, which is what makes the third line above express an
-    # exception rather than a contradiction.
+    # exception rather than a contradiction — with one exception of its own: a
+    # glob that names tensors (anything but a component or the bare ``*``) goes
+    # ahead of every component and ``*``, wherever it was written. Written
+    # after ``model`` it used to be shadowed by it and never fire.
+    #
+    # A module can also carry its precision itself, ``@ravex.save_dtype("fp8")``
+    # on the class or ``ravex.save_dtype(model.experts, "fp8")`` on an instance
+    # (GPU-137, ``ravex/_precision.py``). Those go between the two: a naming
+    # glob here beats an annotation, and an annotation beats a component name,
+    # ``*`` or the scalar form, which are defaults for the run.
     #
     # Why it is worth setting. Measured 2026-08-18 on 8× RTX 5060 Ti, a 1.5B
     # model under FSDP2, per rank: the weights are about a third of the bytes
@@ -312,6 +321,13 @@ class RavexConfig:
     # checkpoint entry has nowhere to keep, so the name is refused rather than
     # accepted into something that produces wrong numbers quietly.
     save_dtype: Optional[Union[str, Dict[str, str]]] = None
+
+    # The ``@ravex.save_dtype`` annotations on the registered models, already
+    # turned into ordered globs. Filled by the runtime when it builds the
+    # backend, never read from ``ravex.yaml``; a field rather than an attribute
+    # because a per-rank store gets its config through ``dataclasses.replace``,
+    # which would drop anything that is not one.
+    declared_save_dtype: Optional[Dict[str, str]] = None
 
     # How often each rank sends a copy of its store to a peer on another
     # machine, counted in checkpoints. Only ever used when the storage turns
@@ -749,7 +765,9 @@ class RavexConfig:
 
         known = {f.name for f in fields(self)}
         for key, value in data.items():
-            if key in known and key not in ("storage", "source", "problems"):
+            if key in known and key not in (
+                "storage", "source", "problems", "declared_save_dtype"
+            ):
                 setattr(self, key, value)
 
     def _apply_env(self) -> None:
@@ -1227,19 +1245,50 @@ class RavexConfig:
         three rules with the two model globs still ahead of the catch-all,
         which is what keeps it meaning "everything except the weights".
 
+        Three tiers, each in the order it was written (GPU-137):
+
+        1. **Globs that name tensors** — any raw pattern except the bare
+           ``*``. The operator being specific; they win over everything.
+        2. **Annotations** from ``@ravex.save_dtype``, already deepest first
+           (:attr:`declared_save_dtype`).
+        3. **Defaults** — component names, ``*``, and the scalar form, which
+           becomes a trailing ``*`` once there is anything ahead of it.
+
         Returns ``None`` when nothing is configured, so the caller can leave
         the argument out entirely rather than pass a value that means the
         same as not passing one.
         """
         value = self.save_dtype
-        if value is None or isinstance(value, str):
+        declared = self.declared_save_dtype or {}
+        if value is None and not declared:
+            return None
+        if isinstance(value, str) and not declared:
             return value
 
+        naming: List[Tuple[str, str]] = []
+        defaults: List[Tuple[str, str]] = []
+        if isinstance(value, str):
+            defaults.append(("*", value))
+        elif value:
+            for key, dtype in value.items():
+                if key in _SAVE_DTYPE_COMPONENTS:
+                    defaults.extend((p, dtype) for p in _SAVE_DTYPE_COMPONENTS[key])
+                elif key == "*":
+                    defaults.append((key, dtype))
+                else:
+                    naming.append((key, dtype))
+
         expanded: Dict[str, str] = {}
-        for key, dtype in value.items():
-            for pattern in _SAVE_DTYPE_COMPONENTS.get(key, (key,)):
-                expanded.setdefault(pattern, dtype)
+        for pattern, dtype in naming + list(declared.items()) + defaults:
+            expanded.setdefault(pattern, dtype)
         return expanded or None
+
+    def naming_save_dtype_globs(self) -> List[str]:
+        """The configured globs that beat an annotation: tier 1 above."""
+        value = self.save_dtype
+        if not isinstance(value, dict):
+            return []
+        return [k for k in value if k not in _SAVE_DTYPE_COMPONENTS and k != "*"]
 
     def describe(self) -> str:
         target = (

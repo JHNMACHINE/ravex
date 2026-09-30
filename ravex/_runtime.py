@@ -482,6 +482,7 @@ class RavexRuntime:
             return True
         if not self._enabled:
             return False
+        self._resolve_declared_save_dtype()
         try:
             self._backend = get_backend(self.config, per_rank=self._per_rank_active())
             self._resume_manager = ResumeManager(
@@ -495,6 +496,33 @@ class RavexRuntime:
             logger.error("Could not open the checkpoint backend: %s", exc)
             return False
         return True
+
+    def _resolve_declared_save_dtype(self) -> None:
+        """Turn the ``@ravex.save_dtype`` annotations into globs, for the backend.
+
+        Here because this is the first point where both halves are known: the
+        models are registered — the backend is built on first real use, which
+        comes after them — and Moonclip takes its rules once, when the manager
+        is constructed. A model registered after that point is checkpointed
+        without its annotations; see ``ravex/_precision.py``.
+
+        A failure costs the annotations and not the checkpoint.
+        """
+        from ravex._precision import declared_rules
+
+        try:
+            rules = declared_rules(
+                self.registry, self.config.naming_save_dtype_globs()
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not read the @ravex.save_dtype annotations (%s: %s); "
+                "checkpointing without them",
+                type(exc).__name__,
+                exc,
+            )
+            rules = {}
+        self.config.declared_save_dtype = rules or None
 
     def _per_rank_active(self) -> bool:
         """Whether this run really is checkpointing per rank.

@@ -4,6 +4,16 @@
 
 ### Added
 
+- **`@ravex.save_dtype`: precision declared on the module (GPU-137).** On a
+  class, `@ravex.save_dtype("fp8")`; on an instance,
+  `ravex.save_dtype(model.experts, "fp8")`. It covers the module's weights and
+  buffers, sharded or not, and renaming the attribute changes nothing. The
+  deepest annotation wins, and an instance beats its class. Against the
+  configuration: a `save_dtype` glob that names tensors beats an annotation,
+  and an annotation beats a component name, `*` or a bare value. An annotation
+  that ends up covering nothing is logged. See "On the module" in
+  `docs/configuration.md`.
+
 - **A multi-node run logs the model's metrics, not each node's (GPU-135).**
   With `outer_loop: true`, what the script logs is averaged over the round:
   each node sends the mean of every name with its round report, and the
@@ -20,6 +30,15 @@
   nothing.
   The state handed to a joining node carries the model's step count too, so
   a joiner and the members it joins have to be on the same version.
+
+### Changed
+
+- **A `save_dtype` glob is no longer shadowed by a component written before
+  it (GPU-137).** Rules that name tensors — any glob but the bare `*` — now go
+  ahead of `model`, `optimizer` and the rest. `{model: bf16, "*expert*": fp8}`
+  used to store the experts in bf16, because `model` matched them first and
+  the second rule never fired; it now stores them in fp8.
+  `{model: none, "*": bf16}` means what it meant.
 
 ### Security
 
