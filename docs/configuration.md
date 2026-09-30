@@ -1110,10 +1110,26 @@ off; it keeps a copy of the trainable parameters per node, never exchanged and
 not passed to a node that joins.
 
 **Every node can produce either format**, on any device: the quantization is
-plain torch, so the format is one per job, not negotiated per node. It is
-also the part that is slow today: fp4 costs ~20 ns per element on a CPU, some
-20 s a round for 1B parameters. A TileLang kernel for the GPU is the next step,
-tested against this path byte for byte.
+plain torch, so the format is one per job, not negotiated per node.
+
+**Quantized on the GPU when there is one.** The outer delta lives on the host,
+and quantized there fp4 costs ~30 ns per element — some 30 s a round for 1B
+parameters. So each tensor goes to the GPU, is quantized there, and only its
+codes come back. With TileLang installed, a kernel does the GPU part; without
+it, the same torch code does. Measured on an RTX 4090 through the platform,
+2026-09-30, 64M elements from host to host:
+
+| | torch on the CPU | torch on the GPU | TileLang kernel |
+| -- | -- | -- | -- |
+| `fp8_block` | 0.34 s | 0.073 s | 0.075 s |
+| `fp4_block` | 1.90 s | 0.062 s | 0.047 s |
+
+The kernels write the torch path's bytes exactly — `bench/quant_cost.py`
+checks it on every run and says `CHECK OK` — so a node with the kernel and one
+without send the same report. Most of the win is being on the GPU at all;
+the kernel adds a quarter of a second a round at 1B parameters.
+`bench/quant_compile.py` compiles the kernels for a list of GPUs on a machine
+without one.
 
 **What is not handled.** Floating-point buffers — batch-norm running statistics
 — are not exchanged; each node keeps its own, and it says so once at startup.

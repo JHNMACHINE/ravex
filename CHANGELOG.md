@@ -52,6 +52,9 @@
   node on an older version cannot read a block-quantized report, so every node
   of a run needs this version before the run sets it. With it,
   `outer_error_feedback`, off by default, which did not help at this size.
+  The quantization runs on the GPU when there is one (0.06 s for 64M
+  elements from host to host on an RTX 4090, against 1.9 s on the CPU), with
+  optional TileLang kernels that write the same bytes as the torch path.
 
 ### Changed
 
