@@ -129,7 +129,22 @@ def encode(tensor: torch.Tensor, fmt: Format) -> Tuple[torch.Tensor, torch.Tenso
 
     ``codes`` is one byte per element for fp8 and one per two for fp4, over
     the tensor padded to whole blocks; ``exponents`` is one byte per block.
+
+    On a CUDA tensor with TileLang installed the kernel does it, and returns
+    the same bytes (:mod:`ravex._dist.quant_tilelang`); otherwise, and after
+    any kernel failure, this function does.
     """
+    if tensor.is_cuda:
+        from ravex._dist import quant_tilelang
+
+        fast = quant_tilelang.encode(tensor, fmt)
+        if fast is not None:
+            return fast
+    return encode_torch(tensor, fmt)
+
+
+def encode_torch(tensor: torch.Tensor, fmt: Format) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The torch path of :func:`encode`: the floor, and the kernels' oracle."""
     blocks = _blocks(tensor, fmt)
     exponent = _exponents(blocks, fmt)
     scaled = blocks * torch.ldexp(torch.ones_like(exponent, dtype=torch.float32), -exponent)[:, None]
