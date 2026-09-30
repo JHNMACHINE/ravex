@@ -508,6 +508,28 @@ class RavexConfig:
     #: join. What the store removes is the per-step cost, not the agreement.
     emergency_transport: str = "auto"
 
+    #: Seconds between SIGTERM and SIGKILL on the machines this run is on, if
+    #: known. Unset by default, because it is a property of the provider and
+    #: not of the run: AWS gives two minutes, GCP and Azure thirty seconds,
+    #: and a spot market on a rented box may give ten or nothing at all.
+    #:
+    #: What it decides (GPU-132): before a preempted rank announces the
+    #: coordinated emergency save, it compares this with what the last
+    #: periodic checkpoint cost, skew included. A save that would take longer
+    #: than the notice is not attempted — it would be killed half-way, and the
+    #: time it spent would have been the time to flush the last periodic
+    #: checkpoint instead. The rank flushes that and exits, and says so.
+    #:
+    #: Measured on 2026-09-15 across two continents under synchronous FSDP:
+    #: 95 s from the announcement to the checkpoint on disk, against ten of
+    #: notice. That shape is out of scope for the emergency path — the outer
+    #: loop is how to train across continents (GPU-113) — and this is what
+    #: keeps it from pretending otherwise.
+    #:
+    #: Unset, the estimate is still logged with the announcement, and the save
+    #: is always attempted, as before.
+    preemption_notice: Optional[float] = None
+
     # ─── the outer loop, GPU-113 ────────────────────────────────────────
     #
     #: Train across nodes that communicate once every `outer_inner_steps`
@@ -834,6 +856,8 @@ class RavexConfig:
             self.emergency_check_every = _as_int(value, self.emergency_check_every)
         if (value := get("EMERGENCY_TIMEOUT")) is not None:
             self.emergency_timeout = _as_int(value, self.emergency_timeout)
+        if (value := get("PREEMPTION_NOTICE")) is not None:
+            self.preemption_notice = value or None
         if (value := get("OUTER_LOOP")) is not None:
             self.outer_loop = _as_bool(value, self.outer_loop)
         if (value := get("OUTER_INNER_STEPS")) is not None:
@@ -1078,6 +1102,17 @@ class RavexConfig:
             self.outer_deadline = 1
         if self.metrics_every < 1:
             self.metrics_every = 1
+        if self.preemption_notice is not None:
+            notice = _as_float(self.preemption_notice, -1.0)
+            if not notice > 0:  # NaN too
+                self.problems.append(
+                    f"preemption_notice={self.preemption_notice!r} is not a "
+                    "positive number of seconds; leaving it unset, so the "
+                    "emergency save is always attempted"
+                )
+                self.preemption_notice = None
+            else:
+                self.preemption_notice = notice
         system_every = _as_float(self.system_metrics_every, -1.0)
         if system_every < 0:
             self.problems.append(

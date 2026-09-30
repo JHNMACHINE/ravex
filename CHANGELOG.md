@@ -31,6 +31,17 @@
   The state handed to a joining node carries the model's step count too, so
   a joiner and the members it joins have to be on the same version.
 
+- **`preemption_notice`: the emergency save is not tried when it cannot land
+  (GPU-132).** On SIGTERM the preempted rank now logs what the last
+  checkpoint cost it, skew included. With `preemption_notice` set to the
+  provider's seconds from SIGTERM to SIGKILL, and that cost above it, the
+  coordinated save is not announced: the rank flushes the last periodic
+  checkpoint and exits without joining the round, and the others time out of
+  it on the short-timeout group. Unset by default, and then the save is
+  attempted as before. Across two continents under synchronous FSDP the save
+  took 95 s against ten of notice; that shape is documented as out of scope
+  for the emergency path.
+
 ### Changed
 
 - **A `save_dtype` glob is no longer shadowed by a component written before

@@ -222,6 +222,130 @@ class TestTheDetectionRoundDegradesCleanly:
         assert killed == []
 
 
+class TestTheSaveHasToFitTheNotice:
+    """GPU-132: a coordinated save that cannot land before SIGKILL is not tried.
+
+    Measured across two continents under synchronous FSDP: 95 s from the
+    announcement to the checkpoint on disk, against ten seconds of notice.
+    Attempting it spends the whole notice on a save that will be killed, when
+    the same seconds could have made the last periodic checkpoint durable.
+    """
+
+    def _preempted(self, monkeypatch, notice, cost):
+        runtime = TestTheDetectionRoundDegradesCleanly()._bare_runtime()
+        runtime.config.preemption_notice = notice
+        runtime._last_checkpoint_cost = cost
+        runtime._last_saved_step = 40
+        runtime._emergency_group = "already-built"
+        runtime._emergency_requested = True
+
+        events = []
+        runtime.checkpoint = lambda *a, **k: events.append("save") or True
+
+        class Backend:
+            def flush(self):
+                events.append("flush")
+
+        runtime._backend = Backend()
+        monkeypatch.setattr(
+            "ravex._dist.collectives.emergency_signalled",
+            lambda local, group: events.append("collective") or True,
+        )
+        monkeypatch.setattr(
+            "ravex._dist.agreement.announce_emergency",
+            lambda *a, **k: events.append("announce") or 0,
+        )
+        monkeypatch.setattr(os, "kill", lambda pid, sig: events.append("kill"))
+        monkeypatch.setattr(signal, "signal", lambda sig, handler: None)
+        return runtime, events
+
+    def test_too_slow_means_flush_and_go_joining_nothing(self, monkeypatch, caplog):
+        runtime, events = self._preempted(monkeypatch, notice=10.0, cost=130.0)
+
+        runtime._check_emergency_signal()
+
+        # Neither the announcement nor the collective: a "no" in the
+        # collective could be outvoted by another preempted rank's "yes" and
+        # leave the survivors in a sharded save without this one.
+        assert events == ["flush", "kill"]
+        assert any("not attempting it" in r.getMessage() for r in caplog.records)
+
+    def test_on_the_store_road_nothing_is_announced(self, monkeypatch):
+        runtime, events = self._preempted(monkeypatch, notice=10.0, cost=130.0)
+        runtime._emergency_store = object()  # a rendezvous store is there
+
+        runtime._check_emergency_signal()
+
+        assert "announce" not in events
+        assert events == ["flush", "kill"]
+
+    def test_fast_enough_is_attempted(self, monkeypatch):
+        runtime, events = self._preempted(monkeypatch, notice=30.0, cost=4.0)
+
+        runtime._check_emergency_signal()
+
+        assert events == ["collective", "save", "flush", "kill"]
+
+    def test_without_a_notice_it_is_always_attempted_and_the_estimate_said(
+        self, monkeypatch, caplog
+    ):
+        runtime, events = self._preempted(monkeypatch, notice=None, cost=130.0)
+
+        runtime._check_emergency_signal()
+
+        assert "save" in events
+        assert any(
+            "took 130.0s" in r.getMessage() and "unset" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_with_no_checkpoint_timed_yet_it_is_attempted(self, monkeypatch):
+        runtime, events = self._preempted(monkeypatch, notice=10.0, cost=None)
+
+        runtime._check_emergency_signal()
+
+        assert "save" in events
+
+    def test_decided_once(self, monkeypatch):
+        runtime, _ = self._preempted(monkeypatch, notice=10.0, cost=130.0)
+        assert runtime._emergency_is_declined() is True
+        runtime._last_checkpoint_cost = 1.0
+        assert runtime._emergency_is_declined() is True
+
+    def test_a_rank_that_was_not_preempted_never_asks(self, monkeypatch):
+        runtime, events = self._preempted(monkeypatch, notice=10.0, cost=130.0)
+        runtime._emergency_requested = False
+
+        runtime._check_emergency_signal()
+
+        assert runtime._emergency_declined is None
+        assert "kill" not in events
+
+
+def test_a_checkpoint_records_what_it_cost(storage):
+    """The estimate exists after an ordinary periodic checkpoint."""
+    import torch
+
+    import ravex
+    from ravex._runtime import get_runtime
+
+    seen = {}
+
+    @ravex.train_loop(backend="torch_save", checkpoint_every=2)
+    def train():
+        model = torch.nn.Linear(4, 2)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        for _ in range(2):
+            model(torch.randn(2, 4)).sum().backward()
+            optimizer.step()
+            optimizer.zero_grad()
+        ravex.batch_boundary()
+        seen["cost"] = get_runtime(create=False)._last_checkpoint_cost
+
+    train()
+    assert seen["cost"] is not None and seen["cost"] >= 0
+
+
 class TestEmergencyCoordinationIsDecidedOnce:
     def test_off_by_default_for_a_replicated_job(self, monkeypatch):
         """No sharded models: DDP already gets a reliable local emergency
@@ -364,6 +488,21 @@ def test_emergency_env_overrides(monkeypatch):
     assert config.emergency_coordination is False
     assert config.emergency_check_every == 5
     assert config.emergency_timeout == 45
+
+
+def test_preemption_notice(monkeypatch):
+    assert RavexConfig().preemption_notice is None
+
+    monkeypatch.setenv("RAVEX_PREEMPTION_NOTICE", "30")
+    config = RavexConfig.load()
+    assert config.preemption_notice == 30.0
+    assert not config.problems
+
+    for bad in ("0", "-2", "soon", "nan"):
+        monkeypatch.setenv("RAVEX_PREEMPTION_NOTICE", bad)
+        config = RavexConfig.load()
+        assert config.preemption_notice is None, bad
+        assert any("preemption_notice" in p for p in config.problems), bad
 
 
 def test_emergency_numeric_fields_are_clamped(monkeypatch):

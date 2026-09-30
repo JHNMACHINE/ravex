@@ -45,6 +45,7 @@ ravex status
 | `emergency_check_every` | `RAVEX_EMERGENCY_CHECK_EVERY` | `1` | Optimizer steps between checks for a SIGTERM on any rank. Only spent when `emergency_coordination` is active for this run (sharded, multi-machine). |
 | `emergency_timeout` | `RAVEX_EMERGENCY_TIMEOUT` | `20` | Seconds before the SIGTERM-detection channel gives up, if the rank that raised it disappears before the others get there. Isolated from the main process group's own timeout — see the section below. |
 | `emergency_transport` | `RAVEX_EMERGENCY_TRANSPORT` | `auto` | How the ranks learn one of them was preempted: `store` announces the step everybody saves at on the rendezvous store, `collectives` asks with an `all_reduce` every step, `auto` takes the store where there is one. See [What a step of a run nobody preempts pays for this](#what-a-step-of-a-run-nobody-preempts-pays-for-this). |
+| `preemption_notice` | `RAVEX_PREEMPTION_NOTICE` | unset | Seconds from SIGTERM to SIGKILL on the provider. When the last checkpoint cost more than this, a preempted rank does not attempt the coordinated save and flushes the last periodic one instead. See [When the save cannot fit the notice](#when-the-save-cannot-fit-the-notice). |
 | `fallback_on_error` | `RAVEX_FALLBACK_ON_ERROR` | `true` | On an unexpected error, log it and let training continue; the checkpoint is retried at the next one. Set `false` to raise instead. |
 | `log_file` | `RAVEX_LOG_FILE` | `null` | Log destination. Unset means stderr, WARNING and above only. |
 | `log_level` | `RAVEX_LOG_LEVEL` | `INFO` | |
@@ -795,6 +796,38 @@ same save together. If the flag never reaches every rank in time, or the
 detection channel itself fails, nothing happens beyond what already happens
 today — the last periodic checkpoint stands, same as if this were switched
 off.
+
+#### When the save cannot fit the notice
+
+```yaml
+preemption_notice: 30   # seconds from SIGTERM to SIGKILL on this provider
+```
+
+Before the preempted rank announces the save, it logs what the last periodic
+checkpoint cost it, skew included. With `preemption_notice` set and that cost
+above it, **the save is not attempted**: the rank flushes the last periodic
+checkpoint, which is what a save killed half-way would have cost it, and exits
+without joining the announcement or the detection collective. The other ranks
+time out of the emergency round in `emergency_timeout` seconds, on the
+short-timeout group, and keep the periodic checkpoint. Unset, the estimate is
+still logged and the save is always attempted.
+
+It is unset by default because it belongs to the provider, not the run: AWS
+gives two minutes, GCP and Azure thirty seconds, a rented spot box ten or none.
+From the environment, `RAVEX_PREEMPTION_NOTICE=30`.
+
+The estimate is a floor: on an async store the checkpoint is durable some time
+after the handoff that was timed. A rank that has not checkpointed yet has no
+estimate, and attempts.
+
+**Synchronous FSDP across continents is out of scope for this path.** Measured
+on 2026-09-15 between RunPod EU and US-NC (RTT 131 ms, ~10 MB/s): the protocol
+held — both ranks read the announcement and saved at the same step — and the
+save took 95 s against ten of notice, because a periodic checkpoint there
+already spent ~127 s of ~130 in skew. That is not a transport problem this
+section can fix. Training across continents goes through the outer loop
+([Training across the internet](#training-across-the-internet)), where the
+sharded save stays inside each machine.
 
 ### How wide the channel is
 

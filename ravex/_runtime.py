@@ -143,6 +143,13 @@ class RavexRuntime:
     #: `_emergency_round_has_come`: there is nothing further to do on this
     #: road, and a second attempt would be a rendezvous nobody announced.
     _emergency_settled = False
+    #: What the last checkpoint cost, in seconds, skew included: the estimate
+    #: a preempted rank weighs against `preemption_notice` (GPU-132).
+    _last_checkpoint_cost: Optional[float] = None
+    #: Whether this rank, preempted, decided the coordinated save would not
+    #: fit in the notice. Decided once, on the first cadence that sees the
+    #: flag.
+    _emergency_declined: Optional[bool] = None
 
     def __init__(self, config: Optional[RavexConfig] = None):
         self.config = config or RavexConfig.load()
@@ -180,6 +187,8 @@ class RavexRuntime:
         self._emergency_store: Any = None
         self._emergency_round: Optional[int] = None
         self._emergency_settled = False
+        self._last_checkpoint_cost: Optional[float] = None
+        self._emergency_declined: Optional[bool] = None
         #: The outer loop and its transport (GPU-113), built on the first step
         #: that wants them. `False` means it was tried and could not be had —
         #: not the same as "not tried yet", and not retried every step, the
@@ -2034,6 +2043,13 @@ class RavexRuntime:
         # Worth printing anyway: a phase that costs nothing is the fastest way
         # to rule it out.
         phases["replicate"] = time.perf_counter() - replicate_started
+        # On every rank, the ones that did not write included: past the
+        # verdict above they have all waited for the same handoff, so the
+        # number is theirs too — and the rank a SIGTERM lands on is anyone's
+        # guess. See `_emergency_is_declined`.
+        self._last_checkpoint_cost = phases.get("skew", 0.0) + (
+            time.perf_counter() - started
+        )
         if not wrote:
             return False
 
@@ -2760,6 +2776,17 @@ class RavexRuntime:
                 self._emergency_active = False
                 return
 
+        if self._emergency_requested and self._emergency_is_declined():
+            # Out without joining anything: not the announcement, not the
+            # detection collective. A "no" posted to the collective would be
+            # outvoted by any other preempted rank's "yes", and the survivors
+            # would enter a sharded save this rank never joins — a hang on the
+            # default group's timeout. Absent, it is a missing participant in
+            # a round on the short-timeout group, which fails in seconds and
+            # is read as "no emergency" by everyone.
+            self._exit_preempted()
+            return
+
         if self._emergency_store_road() is not None:
             # The cheap half. On every step of every run that is not being
             # preempted this is one `check` on a key that is not there, and
@@ -2810,28 +2837,83 @@ class RavexRuntime:
         # ends at getting the state safely onto disk; who can carry on
         # afterwards is that mechanism's question, not this one's.
         if self._emergency_requested:
-            # Durability before death, and this is the whole point of the
-            # emergency path rather than a tidy-up.
-            #
-            # `checkpoint()` only *hands off* to the background writer. Killing
-            # the process here without waiting kills the writer mid-flight, and
-            # on 2026-08-31 that is exactly what two real machines showed: the
-            # preempted rank logged "Emergency checkpoint written at step 9"
-            # and its store held steps 4 and 8 and nothing else. With
-            # `per_rank` every rank's shard is needed, so the survivor's step 9
-            # was unusable on its own and the resume fell back to step 8 - the
-            # coordinated save bought nothing, silently, on the one rank the
-            # feature exists for. See GPU-100.
-            #
-            # Bounded, because the budget is not ours: SIGTERM gives ~10s
-            # before SIGKILL, which no handler can catch or delay, and the
-            # local handoff alone has been measured close to that. A flush that
-            # does not finish in time is reported and then abandoned - dying
-            # with a partial write announced beats dying with it hidden, and
-            # beats not dying at all while the cloud's own timer runs out.
-            self._flush_before_dying()
-            signal.signal(signal.SIGTERM, signal.SIG_DFL)
-            os.kill(os.getpid(), signal.SIGTERM)
+            self._exit_preempted()
+
+    def _emergency_is_declined(self) -> bool:
+        """Whether the coordinated save would not fit in the notice (GPU-132).
+
+        Asked by the preempted rank, once, before it announces anything. The
+        estimate is what the last checkpoint cost this rank, skew included —
+        the part that dominated across continents, ~127 s of ~130 — and it is
+        a floor rather than a forecast: an async store is durable some time
+        after the handoff that was timed.
+
+        Always logged, because it is the number that says whether what comes
+        next can work. It decides only when `preemption_notice` is set; unset,
+        the save is attempted as it always was. A rank that has not
+        checkpointed yet has no estimate and attempts: guessing "too slow"
+        would drop the one save the run may ever get.
+        """
+        if self._emergency_declined is not None:
+            return self._emergency_declined
+
+        cost = self._last_checkpoint_cost
+        notice = self.config.preemption_notice
+        declined = notice is not None and cost is not None and cost > notice
+
+        if cost is None:
+            logger.warning(
+                "SIGTERM on this rank before any checkpoint was timed: no "
+                "estimate of what the coordinated save costs, attempting it."
+            )
+        elif declined:
+            logger.warning(
+                "SIGTERM on this rank. The last checkpoint took %.1fs and "
+                "preemption_notice is %.1fs, so a coordinated save would be "
+                "killed before it landed: not attempting it. Flushing the "
+                "checkpoint of step %s and exiting; the others time out of the "
+                "emergency round in emergency_timeout=%ds and keep that one.",
+                cost,
+                notice,
+                getattr(self, "_last_saved_step", None),
+                self.config.emergency_timeout,
+            )
+        else:
+            logger.warning(
+                "SIGTERM on this rank. The last checkpoint took %.1fs%s; "
+                "attempting the coordinated save.",
+                cost,
+                " against a notice of %.1fs" % notice if notice is not None else
+                " (preemption_notice unset, so this is not checked)",
+            )
+
+        self._emergency_declined = declined
+        return declined
+
+    def _exit_preempted(self) -> None:
+        """Flush what is pending, then let SIGTERM do what it came to do."""
+        # Durability before death, and this is the whole point of the
+        # emergency path rather than a tidy-up.
+        #
+        # `checkpoint()` only *hands off* to the background writer. Killing
+        # the process here without waiting kills the writer mid-flight, and
+        # on 2026-08-31 that is exactly what two real machines showed: the
+        # preempted rank logged "Emergency checkpoint written at step 9"
+        # and its store held steps 4 and 8 and nothing else. With
+        # `per_rank` every rank's shard is needed, so the survivor's step 9
+        # was unusable on its own and the resume fell back to step 8 - the
+        # coordinated save bought nothing, silently, on the one rank the
+        # feature exists for. See GPU-100.
+        #
+        # Bounded, because the budget is not ours: SIGTERM gives ~10s
+        # before SIGKILL, which no handler can catch or delay, and the
+        # local handoff alone has been measured close to that. A flush that
+        # does not finish in time is reported and then abandoned - dying
+        # with a partial write announced beats dying with it hidden, and
+        # beats not dying at all while the cloud's own timer runs out.
+        self._flush_before_dying()
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGTERM)
 
     def _flush_before_dying(self) -> None:
         """Wait for the emergency checkpoint to reach the disk. **Bounded.**
@@ -2865,7 +2947,7 @@ class RavexRuntime:
             return
 
         logger.warning(
-            "Emergency checkpoint flushed to disk in %.2fs before exiting.",
+            "Pending checkpoint writes flushed to disk in %.2fs before exiting.",
             time.time() - started,
         )
 
