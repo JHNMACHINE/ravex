@@ -92,7 +92,12 @@ dependencies = ["PyYAML>=5.1"]
 #            another process. Older releases have no `pin()`, which
 #            `_backends` survives by answering False, but then retention can
 #            take the fork's only way back.
-moonclip = ["moonclip>=0.1.3"]
+#            0.1.4 since GPU-159: `restore_from_remote` padded the files it
+#            brought down to a 4 KiB page with zeros, so `run.json`,
+#            `status.json` and the metrics a fork or a resume reads from a
+#            bucket stopped parsing. A fork on a machine that never held its
+#            parent lost the parent's id.
+moonclip = ["moonclip>=0.1.4"]
 dev = ["pytest>=7", "numpy"]
 
 [project.urls]
