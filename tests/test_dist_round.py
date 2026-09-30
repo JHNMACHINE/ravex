@@ -60,7 +60,7 @@ class Node(threading.Thread):
     """One participant: a model, a shard, a listener, and its own clock."""
 
     def __init__(self, rank, store, shard, rounds, inner, world, root,
-                 dies_after=None, save_dtype=None, deadline=30):
+                 dies_after=None, save_dtype=None, deadline=30, error_feedback=False):
         super().__init__(daemon=True)
         self.rank = rank
         self.store = store
@@ -75,6 +75,7 @@ class Node(threading.Thread):
         self.vanished = False
         self.model_at_vanish = None
         self.deadline = deadline
+        self.error_feedback = error_feedback
         self.model = a_model()
         self.exchange = DeltaExchange(
             rank, store, root=os.path.join(root, "rank%d" % rank),
@@ -105,6 +106,7 @@ class Node(threading.Thread):
                     close_round(
                         self.loop, self.exchange, self.peers,
                         time.monotonic() + self.deadline,
+                        error_feedback=self.error_feedback,
                     )
                 )
                 if self.vanish_after is not None and round_number >= self.vanish_after:
@@ -520,6 +522,38 @@ def test_nodes_that_start_from_different_weights_end_up_on_one_model(tmp_path):
     finally:
         for exchange in exchanges:
             exchange.close()
+
+
+@pytest.mark.parametrize("feedback", [False, True], ids=["plain", "error-feedback"])
+def test_a_block_quantized_round_leaves_every_node_on_one_model(tmp_path, feedback):
+    """GPU-139: fp4 with a scale per block, with and without error feedback.
+
+    Error feedback changes what each node *sends* - its delta plus last
+    round's residual - but never what each node averages, which is still the
+    published report of everyone, itself included. So the invariant is the
+    same as for a cast, and just as exact.
+    """
+    store = FakeStore()
+    x, y = a_problem()
+    half = len(x) // 2
+    nodes = [
+        Node(rank, store,
+             (x[rank * half : (rank + 1) * half], y[rank * half : (rank + 1) * half]),
+             4, 15, 2, str(tmp_path), save_dtype="fp4_block", error_feedback=feedback)
+        for rank in range(2)
+    ]
+    for node in nodes:
+        node.start()
+    for node in nodes:
+        node.join(180)
+        if node.error is not None:
+            raise node.error
+
+    assert loss_of(nodes[0].model, x, y) < loss_of(a_model(), x, y) / 2
+    left = dict(nodes[0].model.named_parameters())
+    for name, right in nodes[1].model.named_parameters():
+        assert torch.equal(left[name], right), name
+    assert bool(nodes[0].loop.residual) is feedback
 
 
 def test_a_cast_round_still_leaves_every_node_on_one_model(tmp_path):

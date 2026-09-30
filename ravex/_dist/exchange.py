@@ -239,7 +239,8 @@ def decide_round(store, scope, round_number: int, rank: int, collected,
         ) from exc
 
 
-def close_round(loop, exchange: "DeltaExchange", peers, deadline: float, metrics=None):
+def close_round(loop, exchange: "DeltaExchange", peers, deadline: float, metrics=None,
+                error_feedback: bool = False):
     """Publish this node's report, collect the peers', take the outer step.
 
     The one function a training loop calls, and the seam between the two halves
@@ -290,6 +291,12 @@ def close_round(loop, exchange: "DeltaExchange", peers, deadline: float, metrics
     spans come with it: ``decide_seconds`` and ``recover_seconds``, the second
     zero unless this node's gather came up short of the decision.
 
+    **Error feedback (GPU-139).** With ``error_feedback`` and a quantized
+    wire, what the quantization of this node's delta dropped is added to the
+    next round's delta before it is quantized in turn, so a rounding error is
+    delayed instead of lost. Only ever this node's own: what it sends and what
+    it averages are both the published version, as without it.
+
     **And the round's metrics (GPU-135).** ``metrics`` is what this node logged
     during the round, ``{name: [mean, count]}``; it travels in the report's
     metadata, and the result carries ``model_metrics`` - one value per name,
@@ -323,10 +330,14 @@ def close_round(loop, exchange: "DeltaExchange", peers, deadline: float, metrics
     offered = mine is not None
     if offered:
         try:
-            exchange.publish(mine.delta, round_number, mine.steps, mine.metrics)
+            feedback = bool(error_feedback and exchange.save_dtype)
+            sent = loop.with_residual(mine.delta) if feedback else mine.delta
+            exchange.publish(sent, round_number, mine.steps, mine.metrics)
             # What the peers will average, which under `save_dtype` is not
             # what was just handed over. See `DeltaExchange.as_published`.
-            mine.delta = exchange.as_published(mine.delta, round_number, expected)
+            mine.delta = exchange.as_published(sent, round_number, expected)
+            if feedback:
+                loop.keep_residual(sent, mine.delta)
         except Exception as exc:
             logger.warning("Could not publish round %d: %s", round_number, exc)
             offered = False

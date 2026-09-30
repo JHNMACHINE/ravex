@@ -93,6 +93,12 @@ NODE = "ravex.node"
 #: What the node logged during the round, ``{name: [mean, count]}`` as JSON
 #: (GPU-135). The round's writer turns everybody's into one value per name.
 METRICS = "ravex.metrics"
+#: The block format the delta was quantized to by Ravex before Moonclip saw it
+#: (GPU-139), when it was. Its absence means the tensors are the delta itself.
+QUANT = "ravex.quant"
+#: Suffix of the tensor that carries a quantized tensor's per-block exponents.
+#: Not a character a parameter name can contain, so it cannot collide with one.
+EXPONENTS = "::exponents"
 
 
 class ReportError(ValueError):
@@ -156,6 +162,13 @@ def open_store(
     between a model fitting and not.
     """
     import moonclip
+
+    from ravex._dist import quant as _quant
+
+    # A block format is Ravex's to apply, and Moonclip then gets bytes it must
+    # not cast again: one quantization per tensor (GPU-139).
+    if _quant.is_block(save_dtype):
+        save_dtype = None
 
     return moonclip.MoonclipManager(
         storage_root=root,
@@ -234,10 +247,13 @@ def publish_round(
     """
     path = round_path(root, round_number)
     os.makedirs(path, exist_ok=True)
+    from ravex._dist import quant as _quant
+
     store = open_store(
         path, compression_level=compression_level, save_dtype=save_dtype
     )
-    write(store, delta, round_number, steps, node, metrics)
+    quantize = save_dtype if _quant.is_block(save_dtype) else None
+    write(store, delta, round_number, steps, node, metrics, quantize=quantize)
     with open(os.path.join(path, ROUND_OK), "wb"):
         pass
     return path
@@ -297,7 +313,13 @@ def drop_rounds(root: str, keep: int, protect: Iterable[int] = ()) -> None:
 
 
 def write(
-    store, delta: Dict[str, Any], round_number: int, steps: int, node: str, metrics=None
+    store,
+    delta: Dict[str, Any],
+    round_number: int,
+    steps: int,
+    node: str,
+    metrics=None,
+    quantize: Optional[str] = None,
 ) -> str:
     """Put this node's report in the store, under ``round_number`` as the step.
 
@@ -309,6 +331,20 @@ def write(
     metadata = {STEPS: str(int(steps)), NODE: str(node)}
     if metrics:
         metadata[METRICS] = json.dumps(metrics, allow_nan=True)
+    if quantize:
+        # Each tensor becomes its codes under its own name and its exponents
+        # beside it. The format rides in the metadata, so a reader never has
+        # to be configured to match the writer: it reads what it was sent.
+        from ravex._dist import quant as _quant
+
+        fmt = _quant.FORMATS[quantize]
+        encoded = {}
+        for name, tensor in delta.items():
+            codes, exponents = _quant.encode(tensor, fmt)
+            encoded[name] = codes
+            encoded[name + EXPONENTS] = exponents
+        delta = encoded
+        metadata[QUANT] = fmt.name
     return store.save_tensors(int(round_number), delta, metadata=metadata)
 
 
@@ -357,6 +393,10 @@ def read(store, round_number: int, expected) -> Report:
 
     described = store.describe(snapshot_id)
     tensors = {entry["name"]: entry for entry in described.get("tensors", [])}
+    metadata = described.get("metadata") or {}
+    if metadata.get(QUANT):
+        return _read_block(store, snapshot_id, described, tensors, metadata,
+                           round_number, expected)
 
     if len(tensors) != len(expected):
         raise ReportError(
@@ -415,7 +455,87 @@ def read(store, round_number: int, expected) -> Report:
         except (RuntimeError, ValueError) as exc:
             raise ReportError("%s could not be read: %s" % (name, exc)) from exc
 
-    metadata = described.get("metadata") or {}
+    return Report(
+        delta=delta,
+        steps=int(metadata.get(STEPS, 0) or 0),
+        node=str(metadata.get(NODE, "")),
+        round_number=int(described.get("step", round_number)),
+        metrics=_metrics_of(metadata),
+    )
+
+
+def _read_block(store, snapshot_id, described, tensors, metadata, round_number,
+                expected) -> Report:
+    """A report whose tensors are block-quantized codes (GPU-139).
+
+    The same checks as the plain path, in the same order - every name, then
+    every size, all from the manifest before a byte is loaded - against what
+    the codes of a tensor this node holds *must* measure, which is fixed by
+    its element count and the format.
+    """
+    import torch
+
+    from ravex._dist import quant as _quant
+
+    name = metadata.get(QUANT)
+    fmt = _quant.FORMATS.get(str(name))
+    if fmt is None:
+        raise ReportError(
+            "report is quantized as %r, which this version of Ravex does not "
+            "read. Every node of a run has to be on a version that knows the "
+            "run's outer_save_dtype" % name
+        )
+
+    wanted = set(expected) | {n + EXPONENTS for n in expected}
+    if set(tensors) != wanted:
+        stray = sorted(set(tensors) ^ wanted)[:1]
+        raise ReportError(
+            "report carries %d tensor(s) where a %s delta of this model has "
+            "%d; first mismatch %r"
+            % (len(tensors), fmt.name, len(wanted), (stray[0] if stray else "")[:64])
+        )
+
+    lengths = {}
+    for tensor_name, (_dtype, shape) in expected.items():
+        numel = 1
+        for dimension in shape:
+            numel *= int(dimension)
+        lengths[tensor_name] = _quant.encoded_lengths(numel, fmt)
+        for key, length in zip(
+            (tensor_name, tensor_name + EXPONENTS), lengths[tensor_name]
+        ):
+            entry = tensors[key]
+            if str(entry.get("dtype")) != "uint8":
+                raise ReportError(
+                    "%s arrived as %s, not uint8 codes" % (key[:64], entry.get("dtype"))
+                )
+            got = 1
+            for dimension in entry.get("shape", ()):
+                got *= int(dimension)
+            if got != length:
+                raise ReportError(
+                    "%s holds %d byte(s) and a %s encoding of this tensor needs %d"
+                    % (key[:64], got, fmt.name, length)
+                )
+
+    raw = store.load(snapshot_id)
+    delta = {}
+    for tensor_name, (want_dtype, want_shape) in expected.items():
+        buffers = [raw.get(tensor_name), raw.get(tensor_name + EXPONENTS)]
+        if any(buffer is None for buffer in buffers):
+            raise ReportError("%s was described but not in the snapshot" % tensor_name)
+        codes, exponents = (
+            torch.frombuffer(bytearray(buffer), dtype=torch.uint8)
+            if len(buffer)
+            else torch.empty(0, dtype=torch.uint8)
+            for buffer in buffers
+        )
+        if (codes.numel(), exponents.numel()) != lengths[tensor_name]:
+            raise ReportError("%s is not the size its manifest said" % tensor_name)
+        delta[tensor_name] = _quant.decode(
+            codes, exponents, fmt, want_shape, getattr(torch, want_dtype)
+        )
+
     return Report(
         delta=delta,
         steps=int(metadata.get(STEPS, 0) or 0),

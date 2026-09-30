@@ -183,6 +183,7 @@ import time
 
 import torch
 
+from ravex._dist import quant as _quant
 from ravex._dist import report as _report
 from ravex._dist.outer import Contribution, OuterLoop
 
@@ -372,7 +373,10 @@ class Wire:
             }
 
         store = self.stores[node]
-        _report.write(store, outgoing, round_number, 0, str(node))
+        # A block format is quantized by Ravex before the store sees it, the
+        # way `publish_round` does it in the product (GPU-139).
+        block = self.dtype if self.dtype in _quant.FORMATS else None
+        _report.write(store, outgoing, round_number, 0, str(node), quantize=block)
         received = _report.read(
             store, round_number, _report.expectation(outgoing)
         ).delta

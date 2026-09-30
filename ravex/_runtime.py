@@ -1300,6 +1300,7 @@ class RavexRuntime:
                 self._outer_peers,
                 time.monotonic() + self.config.outer_deadline,
                 metrics=self._round_means.take() if self._round_means is not None else None,
+                error_feedback=self.config.outer_error_feedback,
             )
         except MembershipError as exc:
             # `RoundSplitError` among them. Not swallowed and not abandoned:

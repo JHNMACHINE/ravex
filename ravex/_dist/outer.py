@@ -485,6 +485,13 @@ class OuterLoop:
         #: node that joins, and with the checkpoint to one that resumes.
         self.model_steps = 0
         self._started_at = time.monotonic()
+        #: What quantizing this node's delta threw away last round, carried
+        #: into the next one (GPU-139). Its own, never exchanged, and not in
+        #: `state_dict`, which also travels to a node that joins: a joiner
+        #: adopting another node's residual would send that node's rounding
+        #: error a second time. Lost on a resume, which costs one round's
+        #: quantization error and nothing else.
+        self.residual: Dict[str, Any] = {}
 
         adrift = float_buffers(model)
         if adrift:
@@ -519,6 +526,23 @@ class OuterLoop:
             node=self.node,
             metadata={"round": self.round_number},
         )
+
+    def with_residual(self, delta: Dict[str, Any]) -> Dict[str, Any]:
+        """``delta`` plus what the last round's quantization dropped."""
+        if not self.residual:
+            return delta
+        return {
+            name: value + self.residual[name] if name in self.residual else value
+            for name, value in delta.items()
+        }
+
+    def keep_residual(self, sent: Dict[str, Any], published: Dict[str, Any]) -> None:
+        """Remember what the wire did not carry of ``sent``, for next round."""
+        self.residual = {
+            name: sent[name] - published[name].to(sent[name].dtype)
+            for name in sent
+            if name in published
+        }
 
     def apply(self, contributions: List[Contribution]) -> Dict[str, Any]:
         """Take the outer step and start the next round.

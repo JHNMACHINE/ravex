@@ -59,6 +59,10 @@ def _as_float(value: Any, default: float) -> float:
 #: before anything under ``_dist`` is imported and long before a round.
 _OUTER_COMBINE_MODES = ("mean", "normalized", "step_weighted")
 
+#: Block formats the outer delta can travel in, besides Moonclip's casts.
+#: Mirrors ``ravex._dist.quant.FORMATS``, duplicated for the reason above.
+_OUTER_BLOCK_FORMATS = frozenset({"fp8_block", "fp4_block"})
+
 
 #: Every ``save_dtype`` target Moonclip accepts, in every spelling it accepts
 #: it. Duplicated here on purpose: Moonclip reports a bad target when the
@@ -617,7 +621,20 @@ class RavexConfig:
     #: wire wants a two-machine run behind it. Set it, and take the fifth: the
     #: measurement says it is there. It defaults off because the default is a
     #: promise made to people who did not read this comment.
+    #:
+    #: **Two block formats besides the casts (GPU-139)**: `fp8_block` and
+    #: `fp4_block`, one power-of-two scale per 128 or 32 elements instead of
+    #: one per tensor, quantized by Ravex (`ravex/_dist/quant.py`) and handed
+    #: to Moonclip as bytes it does not cast again. 8.06 and 4.25 bits per
+    #: element. Every node can produce them on any device, so the format is
+    #: one per job and nobody negotiates it.
     outer_save_dtype: Optional[str] = None
+
+    #: Carry what quantizing this node's delta dropped into its next round's
+    #: delta (GPU-139). Only does anything with `outer_save_dtype` set. Costs
+    #: one copy of the trainable parameters per node, in the dtype the delta
+    #: is computed in.
+    outer_error_feedback: bool = False
 
     #: Where round reports are staged. Defaults to `rounds/` beside the
     #: checkpoint store. Kept apart from the checkpoints deliberately: these
@@ -874,6 +891,8 @@ class RavexConfig:
             self.outer_deadline = _as_int(value, self.outer_deadline)
         if (value := get("OUTER_SAVE_DTYPE")) is not None:
             self.outer_save_dtype = value or None
+        if (value := get("OUTER_ERROR_FEEDBACK")) is not None:
+            self.outer_error_feedback = _as_bool(value, self.outer_error_feedback)
         if (value := get("OUTER_ROOT")) is not None:
             self.outer_root = value or None
         if (value := get("LOG_FILE")) is not None:
@@ -967,6 +986,7 @@ class RavexConfig:
             "handle_sigterm",
             "emergency_coordination",
             "outer_loop",
+            "outer_error_feedback",
             "fallback_on_error",
             "framework_auto_detect",
             "audit_log",
@@ -1151,11 +1171,12 @@ class RavexConfig:
                 # user turning it back off must not have to guess which word
                 # this option takes. `compression` accepts the same three.
                 self.outer_save_dtype = None
-            elif name not in _SAVE_DTYPES:
+            elif name not in _SAVE_DTYPES and name not in _OUTER_BLOCK_FORMATS:
                 self.problems.append(
                     f"outer_save_dtype={self.outer_save_dtype!r} is not a dtype "
-                    f"Moonclip can store; sending the delta uncast. Use one of: "
-                    f"{', '.join(sorted(_SAVE_DTYPES))}"
+                    f"Moonclip can store nor a block format; sending the delta "
+                    f"uncast. Use one of: "
+                    f"{', '.join(sorted(_SAVE_DTYPES | _OUTER_BLOCK_FORMATS))}"
                 )
                 self.outer_save_dtype = None
             else:
