@@ -295,7 +295,7 @@ class TestTheSaveHasToFitTheNotice:
 
         assert "save" in events
         assert any(
-            "took 130.0s" in r.getMessage() and "unset" in r.getMessage()
+            "took 130s" in r.getMessage() and "unset" in r.getMessage()
             for r in caplog.records
         )
 

@@ -51,6 +51,13 @@
   the second rule never fired; it now stores them in fp8.
   `{model: none, "*": bf16}` means what it meant.
 
+### Fixed
+
+- **"Emergency checkpoint did not complete" on ranks that were not supposed
+  to write.** Under `sharded_checkpoints: gather` only rank 0 writes, and the
+  others reported a successful coordinated save as a failed one. They now say
+  "written by another rank". Seen in a two-process SIGTERM test in Docker.
+
 ### Security
 
 - **The job token no longer crosses the wire, and can stay off the store

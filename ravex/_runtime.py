@@ -2819,9 +2819,14 @@ class RavexRuntime:
             get_world_size(),
         )
         wrote = self.checkpoint(final=True, emergency=True)
+        # `checkpoint()` answers "did *this* rank write", which under `gather`
+        # is False on every rank but 0 even when the save worked. The step
+        # recorded after the verdict every rank shares is the answer to "did
+        # the save happen", which is the question this line is asked.
+        saved = getattr(self, "_last_saved_step", None) == self.registry.step_count
         logger.warning(
             "Emergency checkpoint %s at step %d.",
-            "written" if wrote else "did not complete",
+            "written" if wrote else ("written by another rank" if saved else "did not complete"),
             self.registry.step_count,
         )
 
@@ -2868,8 +2873,8 @@ class RavexRuntime:
             )
         elif declined:
             logger.warning(
-                "SIGTERM on this rank. The last checkpoint took %.1fs and "
-                "preemption_notice is %.1fs, so a coordinated save would be "
+                "SIGTERM on this rank. The last checkpoint took %.3gs and "
+                "preemption_notice is %.3gs, so a coordinated save would be "
                 "killed before it landed: not attempting it. Flushing the "
                 "checkpoint of step %s and exiting; the others time out of the "
                 "emergency round in emergency_timeout=%ds and keep that one.",
@@ -2880,10 +2885,10 @@ class RavexRuntime:
             )
         else:
             logger.warning(
-                "SIGTERM on this rank. The last checkpoint took %.1fs%s; "
+                "SIGTERM on this rank. The last checkpoint took %.3gs%s; "
                 "attempting the coordinated save.",
                 cost,
-                " against a notice of %.1fs" % notice if notice is not None else
+                " against a notice of %.3gs" % notice if notice is not None else
                 " (preemption_notice unset, so this is not checked)",
             )
 
