@@ -192,6 +192,9 @@ from ravex._dist.outer import Contribution, OuterLoop
 CORPUS = ("ravex/**/*.py", "docs/*.md", "README.md", "CHANGELOG.md")
 
 VOCAB = 256  # bytes, so there is no tokenizer to agree about
+#: Bytes per unit shuffled by --iid: longer than a sample's context (128), so
+#: a shuffled shard is still text.
+IID_WINDOW = 1024
 
 
 def corpus_bytes(paths=None):
@@ -220,8 +223,18 @@ def shards_for(data, nodes, iid, holdout=0.1):
     distribution rather than over the luckiest node's.
     """
     if iid:
-        order = torch.randperm(len(data), generator=torch.Generator().manual_seed(11))
-        data = data[order]
+        # Windows, not bytes. This permuted single bytes until 2026-09-28,
+        # which leaves nothing to learn but how often each byte occurs: every
+        # arm, one node included, ended at 3.15 nat/byte against 1.6-1.8 on
+        # contiguous shards, and the control could not tell any two averages
+        # apart because there was nothing for them to differ on (GPU-138).
+        # A window longer than the context keeps text as text, and shuffling
+        # windows still gives every node a sample of the whole corpus.
+        window = IID_WINDOW
+        whole = len(data) // window * window
+        windows = data[:whole].view(-1, window)
+        order = torch.randperm(len(windows), generator=torch.Generator().manual_seed(11))
+        data = windows[order].reshape(-1)
 
     size = len(data) // nodes
     train, held = [], []
