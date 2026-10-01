@@ -20,7 +20,10 @@ there. The trade is deliberate and it is not permanent: a ring is bandwidth
 optimal *and* is exactly the shape that has to be rebuilt when a link in it
 goes away. Fault tolerance first on a link where a node vanishing is the normal
 case, then the hierarchical topology of GPU-113's point 6, which cuts the
-traffic by region rather than by rewriting this.
+traffic by region rather than by rewriting this - and which is
+:func:`close_round_regions` now (GPU-143): the same round, run within each
+region and then among one delegate per region, so the slow link carries
+``(R-1) x S`` per region.
 
 **Rounds rendezvous here, and that is on purpose.** A node asking for round 5
 from a peer still finishing round 4 does not get a refusal, it waits — up to
@@ -76,6 +79,11 @@ logger = logging.getLogger("ravex")
 
 #: Where a node advertises the port it serves its reports on.
 ADDRESS_KEY = "ravex/gpu115/exchange/addr/%d"
+
+#: Where a node advertises an exchange of a namespace (GPU-143): the
+#: namespace, then the rank. The round exchange of a flat run has none and
+#: keeps :data:`ADDRESS_KEY`.
+NAMESPACE_ADDRESS_KEY = "ravex/gpu143/exchange/%s/addr/%d"
 
 #: How an operator says what address peers should dial. **Required whenever the
 #: nodes are not on one network** — which is the case this whole subsystem
@@ -303,41 +311,112 @@ def close_round(loop, exchange: "DeltaExchange", peers, deadline: float, metrics
     over the decided set, weighted by steps - and ``members``, so that the one
     node that writes the model's series is the same answer everywhere.
     """
-    from ravex._dist.outer import Contribution
     from ravex._metrics import model_means
 
     round_number = loop.round_number
     started = time.monotonic()
-    # A round's whole budget, reused for the steps after the gather: the
-    # decision and a recovery are each allowed as long as the gather was.
-    budget = max(deadline - started, 1.0)
-    # Nothing before the decision may end this round early (GPU-142). A node
-    # that stops here skips the outer step its peers are about to take, and
-    # that is two models. So a failure only means this node offers nothing:
-    # nobody can have fetched a report that was never offered, the decided
-    # set will not name it, and it still applies the others'.
-    mine = None
+    mine, expected = _own_contribution(loop, round_number, metrics)
+    subtracted = time.monotonic()
+    collected = _collect_round(
+        exchange, round_number, mine, expected, peers, deadline,
+        residual=loop if error_feedback else None,
+    )
+    members, contributions = collected["members"], collected["contributions"]
+    exchange.decided(round_number, members)
+    applying = time.monotonic()
+    if contributions:
+        try:
+            report = loop.apply(contributions)
+        except Exception as exc:
+            # After the decision there is no way back: the others are taking
+            # this step, and a node that cannot is no longer holding their
+            # model. Out, and - with a rendezvous - back in (GPU-142).
+            raise RoundSplitError(
+                "could not apply round %d, which the others are applying: %s"
+                % (round_number, exc)
+            ) from exc
+        exchange.applied(round_number)
+    else:
+        # Decided empty: the proposer held nothing it could vouch for. Every
+        # node reads the same empty set, so every node skips the same step,
+        # which is the one case where not applying keeps them together.
+        loop.abandon_round()
+        report = {"round": round_number, "nodes": 0, "steps": []}
+    report.update(
+        {
+            "members": sorted(int(r) for r in members),
+            "model_metrics": model_means([(c.steps, c.metrics) for c in contributions]),
+            "decided_by": collected["decided_by"],
+            "recovered": collected["recovered"],
+            "delta_seconds": subtracted - started,
+            "publish_seconds": collected["publish_seconds"],
+            "publish_wait_seconds": exchange.publish_wait,
+            "gather_seconds": collected["gather_seconds"],
+            "gather_wait_seconds": exchange.gather_wait,
+            "decide_seconds": collected["decide_seconds"],
+            "recover_seconds": collected["recover_seconds"],
+            "apply_seconds": time.monotonic() - applying,
+        }
+    )
+    return report
+
+
+def _own_contribution(loop, round_number: int, metrics):
+    """This node's contribution and what its peers' must look like.
+
+    Nothing before the decision may end a round early (GPU-142). A node that
+    stops here skips the outer step its peers are about to take, and that is
+    two models. So a failure only means this node offers nothing: nobody can
+    have fetched a report that was never offered, the decided set will not
+    name it, and it still applies the others'.
+    """
     try:
         mine = loop.contribution()
         mine.metrics = dict(metrics or {})
-        expected = _report.expectation(mine.delta)
+        return mine, _report.expectation(mine.delta)
     except Exception as exc:
         logger.warning("Could not compute this node's round %d delta: %s", round_number, exc)
         # The delta has the outer parameters' names and shapes by
         # construction, so that is what the peers' reports are checked against.
-        expected = _report.expectation(loop.outer)
-    subtracted = time.monotonic()
+        return None, _report.expectation(loop.outer)
+
+
+def _collect_round(exchange: "DeltaExchange", round_number: int, mine, expected,
+                   peers, deadline: float, residual=None) -> Dict[str, Any]:
+    """Offer ``mine``, gather the peers', decide the set, recover what is missing.
+
+    Everything :func:`close_round` does before the outer step, taken out so
+    that a round over regions (GPU-143) runs it twice - once among a region's
+    nodes with their deltas, once among the regions' delegates with their
+    aggregates - with the same rules both times rather than a second copy of
+    them.
+
+    Returns the decided ``members``, their ``contributions`` (this node's
+    first when it is one of them), who ``decided_by``, how many reports were
+    ``recovered``, and the seconds spent.
+    """
+    from ravex._dist.outer import Contribution
+
+    started = time.monotonic()
+    # A round's whole budget, reused for the steps after the gather: the
+    # decision and a recovery are each allowed as long as the gather was.
+    budget = max(deadline - started, 1.0)
     offered = mine is not None
     if offered:
         try:
-            feedback = bool(error_feedback and exchange.save_dtype)
-            sent = loop.with_residual(mine.delta) if feedback else mine.delta
-            exchange.publish(sent, round_number, mine.steps, mine.metrics)
+            feedback = residual is not None and bool(exchange.save_dtype)
+            sent = residual.with_residual(mine.delta) if feedback and residual is not None else mine.delta
+            # ``extra`` only when there is one: a flat round publishes exactly
+            # as it did before rounds over regions existed.
+            metadata = getattr(mine, "metadata", None)
+            extra = metadata.get("extra") if isinstance(metadata, dict) else None
+            more = {"extra": extra} if extra else {}
+            exchange.publish(sent, round_number, mine.steps, mine.metrics, **more)
             # What the peers will average, which under `save_dtype` is not
             # what was just handed over. See `DeltaExchange.as_published`.
             mine.delta = exchange.as_published(sent, round_number, expected)
-            if feedback:
-                loop.keep_residual(sent, mine.delta)
+            if feedback and residual is not None:
+                residual.keep_residual(sent, mine.delta)
         except Exception as exc:
             logger.warning("Could not publish round %d: %s", round_number, exc)
             offered = False
@@ -416,43 +495,286 @@ def close_round(loop, exchange: "DeltaExchange", peers, deadline: float, metrics
             steps=received[r].steps,
             node=received[r].node,
             metrics=getattr(received[r], "metrics", None) or {},
+            metadata={"extra": getattr(received[r], "extra", None) or {}, "rank": r},
         )
         for r in members
         if r != exchange.rank
     ]
-    exchange.decided(round_number, members)
-    if contributions:
+    return {
+        "members": members,
+        "contributions": contributions,
+        "decided_by": decided_by,
+        "recovered": len(missing),
+        "publish_seconds": published - started,
+        "gather_seconds": gathered - published,
+        "decide_seconds": decided - gathered,
+        "recover_seconds": recovered_at - decided,
+    }
+
+
+# ─── rounds over regions (GPU-143) ──────────────────────────────────
+
+#: Where a node says which region it is in: the job's digest, then its rank.
+REGION_KEY = "ravex/gpu143/region/%s/%d"
+
+#: Which rank delegates a region in a round: job digest, round, region.
+DELEGATE_KEY = "ravex/gpu143/delegate/%s/%d/%s"
+
+#: The namespaces of the three exchanges a node opens for rounds over regions.
+#: A region's own, so its round decision is that region's alone; the
+#: delegates', where regions meet; and the results, which every delegate
+#: serves and every node reads.
+REGION_NAMESPACE = "region/%s"
+DELEGATES_NAMESPACE = "delegates"
+RESULTS_NAMESPACE = "results"
+
+
+def announce_region(store, scope, rank: int, region: str) -> None:
+    """Say on the store which region this node is in, for the life of the job."""
+    store.set(REGION_KEY % (_job_digest(scope), int(rank)), region.encode("utf-8"))
+
+
+def regions_of(store, scope, ranks, deadline: float) -> Dict[int, str]:
+    """Each rank's region, waiting up to ``deadline`` for one not said yet.
+
+    A rank whose region never appears is left out of the answer, and of the
+    round: the caller treats it as absent, which a node that has not said
+    where it is effectively is.
+    """
+    digest = _job_digest(scope)
+    found: Dict[int, str] = {}
+    waiting = sorted(set(int(r) for r in ranks))
+    while waiting:
+        still = []
+        for rank in waiting:
+            key = REGION_KEY % (digest, rank)
+            try:
+                if store.check([key]):
+                    found[rank] = store.get(key).decode("utf-8")
+                    continue
+            except Exception:
+                pass
+            still.append(rank)
+        waiting = still
+        if not waiting or time.monotonic() >= deadline:
+            break
+        time.sleep(0.05)
+    return found
+
+
+def _delegate_of(store, scope, round_number: int, region: str, proposal: Optional[int],
+                 deadline: float) -> Optional[int]:
+    """The region's delegate for a round, as the store keeps it.
+
+    Every member of a region proposes the same rank - the lowest of the
+    region's decided set - so the ``compare_set`` only makes the answer
+    readable by the other regions; it never has two candidates to choose
+    between. A region that decided an empty set proposes nothing, and a
+    caller that only reads (``proposal`` None) waits until ``deadline``.
+    """
+    key = DELEGATE_KEY % (_job_digest(scope), int(round_number), region)
+    while True:
         try:
-            report = loop.apply(contributions)
+            if proposal is not None:
+                raw = store.compare_set(key, "", str(int(proposal)))
+            elif store.check([key]):
+                raw = store.get(key)
+            else:
+                raw = None
+            if raw:
+                text = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
+                return int(text)
+        except Exception:
+            pass
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.05)
+
+
+def close_round_regions(loop, region: str, exchanges: Dict[str, "DeltaExchange"], peers,
+                        deadline: float, metrics=None, error_feedback: bool = False):
+    """:func:`close_round`, with the slow links carrying one aggregate per region.
+
+    GPU-143. Flat, every node downloads every other node's report: ``(N-1) x
+    S`` bytes per node per round, on whatever link joins them - and between
+    regions that link is 5-12 MB/s (GPU-120). Here the round is closed in three
+    steps, and only the second crosses regions:
+
+    1. **Within the region**, the round of :func:`close_round` over the
+       region's nodes: publish, gather, decide the region's set, recover. Every
+       node of the region then holds the same reports, and each computes the
+       region's :func:`ravex._dist.outer.partial` - the same bits, since the
+       set and the order are the same.
+    2. **Between regions**, the same round again among one delegate per region
+       - the lowest rank of its region's decided set - with the partials as
+       the reports. The slow link carries ``(R-1) x S`` per region instead of
+       ``(N-1) x S`` per node. Each delegate combines the decided partials in
+       region order (:func:`ravex._dist.outer.combine_partials`), so every
+       delegate holds the same pseudo-gradient, bit for bit.
+    3. **Back to every node**: each delegate serves that pseudo-gradient, and
+       every node takes the outer step with it. Any delegate's will do, being
+       the same tensor, so a node whose delegate died takes it from another
+       region's - slowly, for one round - and only if no delegate answers does
+       it stop (:class:`RoundSplitError`) and come back as a joiner.
+
+    **A region is in or out whole.** Its partial is one report on the
+    delegates' exchange, decided and recovered like any other: either every
+    node applies it or none does. A node whose own delta missed its region's
+    set still applies the round, as a node missing the flat set does.
+
+    ``exchanges`` holds the three: ``"region"``, ``"delegates"`` and
+    ``"results"`` (see the ``*_NAMESPACE`` constants), each a
+    :class:`DeltaExchange` this node opened.
+    """
+    from ravex._dist.outer import Contribution, combine_partials, partial
+    from ravex._metrics import model_means
+
+    local, upper, results = exchanges["region"], exchanges["delegates"], exchanges["results"]
+    round_number = loop.round_number
+    started = time.monotonic()
+    budget = max(deadline - started, 1.0)
+    rank = local.rank
+
+    mine, expected = _own_contribution(loop, round_number, metrics)
+    # The partials and the result are fp32 whatever the model trains in: they
+    # are sums and averages, and their names and shapes are the delta's.
+    wide = {name: ("float32", shape) for name, (_, shape) in expected.items()}
+
+    where = regions_of(local.store, local.scope_base, list(peers) + [rank], started + min(budget, 30.0))
+    region_peers = sorted(p for p in peers if where.get(p) == region and p != rank)
+    other_regions = sorted({where[p] for p in peers if p in where and where[p] != region})
+
+    # 1. Within the region.
+    inner = _collect_round(
+        local, round_number, mine, expected, region_peers, deadline,
+        residual=loop if error_feedback else None,
+    )
+    local.decided(round_number, inner["members"])
+    delegate = min(inner["members"]) if inner["members"] else None
+    if delegate is not None:
+        _delegate_of(upper.store, upper.scope_base, round_number, region, delegate, time.monotonic() + budget)
+
+    combined = None
+    result_extra: Dict[str, Any] = {}
+    delegates_seen: List[int] = []
+    if delegate == rank:
+        # 2. Between regions, among the delegates.
+        summed, tally = partial(inner["contributions"], loop.combine_mode)
+        nodes = [
+            {"rank": int(c.metadata.get("rank", rank)), "steps": int(c.steps), "metrics": c.metrics or {}}
+            for c in inner["contributions"]
+        ]
+        aggregate = Contribution(
+            delta=summed,
+            steps=int(tally["steps"]),
+            node=region,
+            metadata={"extra": {"region": region, "tally": tally, "nodes": nodes}},
+        )
+        # A region whose round ran to its deadline - a node waited for and
+        # never heard from - names its delegate only then, so the other
+        # regions wait for it until that deadline and one budget more, not
+        # one budget from when they themselves were ready.
+        upper_deadline = max(deadline, time.monotonic()) + budget
+        for other in other_regions:
+            seen = _delegate_of(upper.store, upper.scope_base, round_number, other, None, upper_deadline)
+            if seen is not None:
+                delegates_seen.append(seen)
+        outer = _collect_round(upper, round_number, aggregate, wide, sorted(delegates_seen), upper_deadline)
+        upper.decided(round_number, outer["members"])
+        parts = []
+        everyone = []
+        for contribution in outer["contributions"]:
+            extra = contribution.metadata.get("extra") or {}
+            if not extra.get("tally") or "region" not in extra:
+                raise RoundSplitError(
+                    "round %d: a delegate's aggregate did not say whose reports it "
+                    "holds; it cannot be combined" % round_number
+                )
+            parts.append((extra["region"], contribution.delta, extra["tally"]))
+            everyone.extend(extra.get("nodes") or [])
+        if not parts:
+            # Decided empty among the delegates: nobody vouched for anything,
+            # every delegate reads the same empty set and serves nothing.
+            result_extra = {"empty": True}
+        else:
+            combined = combine_partials(parts, loop.combine_mode)
+            result_extra = {"nodes": sorted(everyone, key=lambda n: n["rank"]), "regions": sorted(p[0] for p in parts)}
+        # 3. Served to every node of every region, this one's own included.
+        results.publish(combined if combined is not None else {k: v for k, v in summed.items()},
+                        round_number, int(sum(n["steps"] for n in everyone)), extra=result_extra)
+    else:
+        # 3. From this region's delegate, or any other one. The delegate
+        # serves the result only after its own round among the delegates, which
+        # may run to the regions' deadline and one budget more, and then
+        # decide and recover: two budgets past the deadline is that whole span.
+        got = None
+        fetch_deadline = max(deadline, time.monotonic()) + 2 * budget
+        if delegate is not None:
+            got = results.fetch(delegate, round_number, wide, fetch_deadline)
+        candidates = [delegate] if delegate is not None else []
+        if got is None:
+            # Every delegate serves the same tensor, so another region's will
+            # do: slowly, over the link between regions, for this one round.
+            # Asked only now, with a budget of its own, so that an ordinary
+            # round never sends a member across regions.
+            fallback_deadline = time.monotonic() + budget
+            for other in other_regions:
+                seen = _delegate_of(upper.store, upper.scope_base, round_number, other, None, fallback_deadline)
+                if seen is None or seen in candidates:
+                    continue
+                candidates.append(seen)
+                got = results.fetch(seen, round_number, wide, fallback_deadline)
+                if got is not None:
+                    logger.warning(
+                        "Round %d: this region's delegate did not serve the result; "
+                        "took it from rank %d in another region.", round_number, seen,
+                    )
+                    break
+        if got is None:
+            raise RoundSplitError(
+                "round %d: no delegate served the combined result (asked %s); "
+                "stopping rather than guessing whether the others took the step"
+                % (round_number, candidates or "nobody")
+            )
+        result_extra = got.extra or {}
+        if not result_extra.get("empty"):
+            combined = got.delta
+
+    applying = time.monotonic()
+    if combined is not None:
+        nodes = result_extra.get("nodes") or []
+        try:
+            report = loop.apply_combined(combined, [int(n["steps"]) for n in nodes])
         except Exception as exc:
-            # After the decision there is no way back: the others are taking
-            # this step, and a node that cannot is no longer holding their
-            # model. Out, and - with a rendezvous - back in (GPU-142).
             raise RoundSplitError(
                 "could not apply round %d, which the others are applying: %s"
                 % (round_number, exc)
             ) from exc
-        exchange.applied(round_number)
+        local.applied(round_number)
+        if delegate == rank:
+            upper.applied(round_number)
+        members = sorted(int(n["rank"]) for n in nodes)
+        model_metrics = model_means([(int(n["steps"]), n.get("metrics") or {}) for n in nodes])
     else:
-        # Decided empty: the proposer held nothing it could vouch for. Every
-        # node reads the same empty set, so every node skips the same step,
-        # which is the one case where not applying keeps them together.
         loop.abandon_round()
         report = {"round": round_number, "nodes": 0, "steps": []}
+        members, model_metrics = [], {}
     report.update(
         {
-            "members": sorted(int(r) for r in members),
-            "model_metrics": model_means([(c.steps, c.metrics) for c in contributions]),
-            "decided_by": decided_by,
-            "recovered": len(missing),
-            "delta_seconds": subtracted - started,
-            "publish_seconds": published - subtracted,
-            "publish_wait_seconds": exchange.publish_wait,
-            "gather_seconds": gathered - published,
-            "gather_wait_seconds": exchange.gather_wait,
-            "decide_seconds": decided - gathered,
-            "recover_seconds": recovered_at - decided,
-            "apply_seconds": time.monotonic() - recovered_at,
+            "members": members,
+            "model_metrics": model_metrics,
+            "decided_by": inner["decided_by"],
+            "recovered": inner["recovered"],
+            "region": region,
+            "delegate": delegate,
+            "regions": result_extra.get("regions") or [],
+            "publish_seconds": inner["publish_seconds"],
+            "publish_wait_seconds": local.publish_wait,
+            "gather_seconds": inner["gather_seconds"],
+            "gather_wait_seconds": local.gather_wait,
+            "decide_seconds": inner["decide_seconds"],
+            "recover_seconds": inner["recover_seconds"],
+            "apply_seconds": time.monotonic() - applying,
         }
     )
     return report
@@ -624,8 +946,24 @@ class DeltaExchange:
         compression_level: int = 3,
         save_dtype=None,
         route_toward: Optional[str] = None,
+        namespace: str = "",
+        inherit: Optional["DeltaExchange"] = None,
     ):
         self.rank = int(rank)
+        #: An exchange of this node's that already started, whose token and
+        #: job scope this one takes instead of reading them off the store
+        #: (GPU-143). Not optional for a second exchange: without
+        #: ``RAVEX_JOB_TOKEN``, rank 0 makes the token and the scope new every
+        #: time it starts an exchange, so a node's later exchanges would hold
+        #: a different token and scope than its peers' earlier ones - proofs
+        #: that never verify, and keys nobody else reads.
+        self.inherit = inherit
+        #: Which of a node's exchanges this is, when it has more than one
+        #: (GPU-143): its own advertised address and its own round decisions,
+        #: so a region's set and the delegates' set are never the same key.
+        #: Empty for the one exchange of a flat run, which keeps the keys it
+        #: always had.
+        self.namespace = namespace
         #: A host on the network the peers share, to pick the address this
         #: node advertises by. See :func:`advertise`.
         self.route_toward = route_toward
@@ -637,6 +975,10 @@ class DeltaExchange:
         #: This life of the job, which scopes its keys on the store. Not the
         #: token, which can be the same across restarts (GPU-134).
         self.scope: Optional[bytes] = None
+        #: The job's scope before the namespace is mixed in: what keys shared
+        #: by all of a node's exchanges - its region, a region's delegate -
+        #: are scoped by.
+        self.scope_base: Optional[bytes] = None
         self.address: Optional[str] = None
 
         #: This node's reports and the peers', **one directory per round on
@@ -728,6 +1070,11 @@ class DeltaExchange:
 
     # -- setup ------------------------------------------------------------
 
+    def _address_key(self, rank: int) -> str:
+        if self.namespace:
+            return NAMESPACE_ADDRESS_KEY % (self.namespace, int(rank))
+        return ADDRESS_KEY % int(rank)
+
     def start(self) -> bool:
         """Bind, take the token, advertise, and start serving. False if not.
 
@@ -740,7 +1087,10 @@ class DeltaExchange:
 
         try:
             deadline = time.monotonic() + self.patience
-            self.secret = RingLink._shared_secret(self.store, self.rank, deadline)
+            if self.inherit is not None:
+                self.secret = self.inherit.secret
+            else:
+                self.secret = RingLink._shared_secret(self.store, self.rank, deadline)
             if self.secret is None:
                 logger.warning(
                     "No job token on the rendezvous store after %.0fs; this "
@@ -748,7 +1098,13 @@ class DeltaExchange:
                     self.patience,
                 )
                 return False
-            self.scope = RingLink._incarnation(self.store, self.rank, deadline)
+            if self.inherit is not None:
+                self.scope = self.inherit.scope_base or self.inherit.scope
+            else:
+                self.scope = RingLink._incarnation(self.store, self.rank, deadline)
+            self.scope_base = self.scope
+            if self.scope is not None and self.namespace:
+                self.scope = self.scope + b"/" + self.namespace.encode("utf-8")
             if self.scope is None:
                 logger.warning(
                     "Rank 0 did not say which life of the job this is within "
@@ -765,7 +1121,7 @@ class DeltaExchange:
             self.listener = listener
 
             self.address = advertise(listener.getsockname()[1], self.route_toward)
-            self.store.set(ADDRESS_KEY % self.rank, self.address.encode("utf-8"))
+            self.store.set(self._address_key(self.rank), self.address.encode("utf-8"))
         except OSError as exc:
             logger.warning("Could not open the round exchange: %s", exc)
             self.close()
@@ -906,7 +1262,7 @@ class DeltaExchange:
 
     # -- publishing -------------------------------------------------------
 
-    def publish(self, delta, round_number: int, steps: int, metrics=None) -> None:
+    def publish(self, delta, round_number: int, steps: int, metrics=None, extra=None) -> None:
         """Write this node's report and offer it to whoever asks.
 
         The round number is the snapshot's step, so a peer asks for a round by
@@ -935,6 +1291,7 @@ class DeltaExchange:
             compression_level=self.compression_level,
             save_dtype=self.save_dtype,
             metrics=metrics,
+            extra=extra,
         )
         wrote = time.monotonic() - began
 
@@ -1323,7 +1680,7 @@ class DeltaExchange:
         ``get`` blocks to the store's own timeout rather than to this round's,
         which is how a deadline stops being a deadline.
         """
-        key = ADDRESS_KEY % peer
+        key = self._address_key(peer)
         while time.monotonic() < deadline and not self._stop.is_set():
             try:
                 if self.store.check([key]):

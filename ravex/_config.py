@@ -662,6 +662,14 @@ class RavexConfig:
     #: Also ``RAVEX_OUTER_MIN_NODES``.
     outer_min_nodes: int = 2
 
+    #: Which region this node is in - ``eu``, ``us`` - when the run spans
+    #: several (GPU-143). Set, the round is closed in steps: within each
+    #: region, then among one delegate per region, so the slow link between
+    #: regions carries one aggregate per region instead of every node's
+    #: delta. Every node of the run sets one, or none does. Unset, the round
+    #: is the flat one. Also ``RAVEX_OUTER_REGION``.
+    outer_region: Optional[str] = None
+
     log_file: Optional[str] = None
     log_level: str = "INFO"
     fallback_on_error: bool = True
@@ -865,6 +873,8 @@ class RavexConfig:
             self.outer_job = value
         if (value := get("OUTER_MIN_NODES")) is not None:
             self.outer_min_nodes = _as_int(value, self.outer_min_nodes)
+        if (value := get("OUTER_REGION")) is not None:
+            self.outer_region = value.strip() or None
         if (value := get("HANDLE_SIGTERM")) is not None:
             self.handle_sigterm = _as_bool(value, self.handle_sigterm)
         if (value := get("EMERGENCY_COORDINATION")) is not None:

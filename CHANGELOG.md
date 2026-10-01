@@ -4,6 +4,20 @@
 
 ### Added
 
+- **Rounds over regions: `outer_region` (GPU-143).** With nodes in several
+  regions, the round closes within each region first; one delegate per region
+  sends a single aggregate of its region's deltas across the slow link, every
+  delegate combines the same aggregates in the same order, and every node takes
+  the outer step with that result - bit for bit the same everywhere. The link
+  between regions carries `(R-1) x S` per region per round instead of
+  `(N-1) x S` per node. A region is in a round whole or not at all; a node whose
+  delegate does not serve the result takes it from another region's. Unset,
+  the round is the flat one, unchanged. `DeltaExchange` gained `namespace`
+  (a node's exchanges keep their keys apart) and `inherit` (a node's second
+  exchange takes the first one's token and job scope, which rank 0 otherwise
+  makes new at every start); a round report gained an optional `extra`
+  metadata key, which an older node never reads.
+
 - **`ravex export --to deepspeed` (GPU-145).** A checkpoint leaves Ravex as a
   DeepSpeed universal checkpoint, which DeepSpeed resumes at ZeRO stage 1, 2
   or 3 and any data-parallel size with `"checkpoint": {"load_universal":

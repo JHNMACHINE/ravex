@@ -1085,6 +1085,33 @@ network.** Behind NAT, nothing a process can ask its own kernel returns the
 address a peer dials. Set it to the address peers should reach this node at,
 optionally with a port.
 
+**Nodes in several regions: `outer_region`** (GPU-143). A flat round has every
+node download every other node's delta, `(N-1) x S` bytes per node per round,
+over whatever link joins them - and between regions that link is the slow one,
+5-12 MB/s measured between Europe and the US. Give each node its region and
+the round closes in steps instead:
+
+```yaml
+outer_region: eu                     # or RAVEX_OUTER_REGION; another node: us
+```
+
+1. within each region, the round as usual among that region's nodes;
+2. one delegate per region - the lowest node of its region's round - sums its
+   region's deltas into one aggregate, and only the delegates exchange those:
+   the link between regions carries `(R-1) x S` per region instead of
+   `(N-1) x S` per node;
+3. every delegate combines the same aggregates in the same order and serves
+   the result, and every node takes the outer step with it - so every node
+   holds the same parameters, bit for bit.
+
+A region enters a round whole or not at all, and the combine modes give the
+answer they give flat, up to the order of the additions. A node whose delegate
+cannot serve the result takes it from another region's delegate - over the slow
+link, for that round - and stops and rejoins only if none answers. Every node
+of the run sets a region, or none does; with none the round is the flat one.
+It pays from two nodes per region up: with one node per region the delegate is
+that node, and the round is the flat one plus a step.
+
 **What `outer_inner_steps` costs the loss, measured.** A byte-level transformer
 on two contiguous shards, 2048 local steps per node, held-out loss: H=1 **2.69**,
 H=8 1.51, H=64 **1.45**, H=512 1.78 — against 1.55 for one node given the same

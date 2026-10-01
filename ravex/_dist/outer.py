@@ -303,24 +303,8 @@ def combine(contributions: List[Contribution], mode: str = "mean") -> ParamMap:
     # how ``normalized`` silently became a weighted average of the deltas
     # instead of an even average of per-step movement — an answer with the
     # right shape, plausible values, and a scale off by the spread in speeds.
-    if mode == "mean":
-        weights = [1.0] * len(contributions)
-        denominator = float(len(contributions))
-        scale = 1.0
-    elif mode == "step_weighted":
-        weights = [float(max(c.steps, 0)) for c in contributions]
-        denominator = sum(weights)
-        scale = 1.0
-    else:  # normalized: one node, one vote, at the scale of a round
-        weights = [1.0 / c.steps if c.steps > 0 else 0.0 for c in contributions]
-        voting = [c.steps for c in contributions if c.steps > 0]
-        denominator = float(len(voting))
-        # Back to the scale of a round rather than of a step, so the outer
-        # learning rate keeps meaning the same thing across modes. Without it
-        # `normalized` would be `mean` divided by the average step count, and
-        # comparing the two at one learning rate would compare scales instead
-        # of weightings.
-        scale = (sum(voting) / len(voting)) if voting else 0.0
+    weights = _weights(contributions, mode)
+    scale, denominator = _scale(_tally(contributions), mode)
 
     if sum(weights) <= 0 or denominator <= 0:
         raise ValueError(
@@ -338,6 +322,134 @@ def combine(contributions: List[Contribution], mode: str = "mean") -> ParamMap:
                     continue
                 term = contribution.delta[name].to(torch.float32) * weight
                 acc = term if acc is None else acc.add_(term)
+            combined[name] = acc.mul_(scale / denominator)
+    return combined
+
+
+def _weights(contributions: List[Contribution], mode: str) -> List[float]:
+    """Each contribution's weight in ``sum(weight_i * delta_i)``, per mode."""
+    if mode == "mean":
+        return [1.0] * len(contributions)
+    if mode == "step_weighted":
+        return [float(max(c.steps, 0)) for c in contributions]
+    # normalized: one node, one vote, at the scale of a round
+    return [1.0 / c.steps if c.steps > 0 else 0.0 for c in contributions]
+
+
+def _tally(contributions: List[Contribution]) -> Dict[str, float]:
+    """The four numbers every mode's scale and denominator are made of.
+
+    Sums, so the tallies of two disjoint sets add up to the tally of their
+    union - which is what lets a region carry its own and the round add them
+    (GPU-143).
+    """
+    voting = [c.steps for c in contributions if c.steps > 0]
+    return {
+        "count": float(len(contributions)),
+        "steps": float(sum(max(int(c.steps), 0) for c in contributions)),
+        "voters": float(len(voting)),
+        "voter_steps": float(sum(voting)),
+    }
+
+
+def _scale(tally: Dict[str, float], mode: str) -> Tuple[float, float]:
+    """``(scale, denominator)`` for a mode, from a tally."""
+    if mode == "mean":
+        return 1.0, tally["count"]
+    if mode == "step_weighted":
+        return 1.0, tally["steps"]
+    # Back to the scale of a round rather than of a step, so the outer
+    # learning rate keeps meaning the same thing across modes. Without it
+    # `normalized` would be `mean` divided by the average step count, and
+    # comparing the two at one learning rate would compare scales instead
+    # of weightings.
+    voters = tally["voters"]
+    return (tally["voter_steps"] / voters if voters else 0.0), voters
+
+
+def partial(contributions: List[Contribution], mode: str = "mean") -> Tuple[ParamMap, Dict[str, float]]:
+    """A region's share of the round: ``sum(weight_i * delta_i)`` and its tally.
+
+    GPU-143. :func:`combine` divides once, at the end, by numbers that are sums
+    over every contribution - so a region can do the summing for its own nodes
+    and send one tensor per parameter over the slow link instead of one per
+    node, and :func:`combine_partials` finishes the job across regions. Same
+    weights as :func:`combine`, same canonical order, in fp32.
+    """
+    import torch
+
+    if not contributions:
+        raise ValueError("a region with no contributions has no partial to send")
+    if mode not in COMBINE_MODES:
+        raise ValueError(
+            "unknown combine mode %r, expected one of %s" % (mode, ", ".join(COMBINE_MODES))
+        )
+    contributions = sorted(contributions, key=lambda c: (c.node or "", c.steps))
+    names = list(contributions[0].delta)
+    for other in contributions[1:]:
+        if set(other.delta) != set(names):
+            raise KeyError(
+                "the contribution from %r covers different parameters than the "
+                "first one; a region of two models has no partial" % (other.node or "?")
+            )
+    weights = _weights(contributions, mode)
+    with torch.no_grad():
+        summed: ParamMap = {}
+        for name in names:
+            acc = None
+            for weight, contribution in zip(weights, contributions):
+                term = contribution.delta[name].to(torch.float32) * weight
+                acc = term if acc is None else acc.add_(term)
+            summed[name] = acc
+    return summed, _tally(contributions)
+
+
+def combine_partials(partials: List[Tuple[str, ParamMap, Dict[str, float]]], mode: str = "mean") -> ParamMap:
+    """The round's pseudo-gradient out of each region's :func:`partial`.
+
+    ``partials`` is ``(region, summed, tally)`` per region in the round. Added
+    in region order, whoever calls this and whatever order the regions arrived
+    in, so every delegate computes the same bits - the property
+    :func:`combine` keeps by sorting its nodes (GPU-121).
+
+    Equal to :func:`combine` over every node of every region up to the order
+    of the additions, which is the one thing a hierarchy changes.
+    """
+    import torch
+
+    if not partials:
+        raise ValueError(
+            "no region contributed. An empty round is not an outer step of zero, "
+            "and the caller has to decide what it is"
+        )
+    if mode not in COMBINE_MODES:
+        raise ValueError(
+            "unknown combine mode %r, expected one of %s" % (mode, ", ".join(COMBINE_MODES))
+        )
+    partials = sorted(partials, key=lambda entry: entry[0])
+    names = list(partials[0][1])
+    for region, summed, _ in partials[1:]:
+        if set(summed) != set(names):
+            raise KeyError(
+                "region %r's partial covers different parameters than %r's; averaging "
+                "the intersection would build one outer step out of two models"
+                % (region, partials[0][0])
+            )
+    total = {key: sum(float(entry[2].get(key, 0.0)) for entry in partials) for key in ("count", "steps", "voters", "voter_steps")}
+    scale, denominator = _scale(total, mode)
+    if denominator <= 0:
+        raise ValueError(
+            "every region weighs zero under mode %r (tallies %s). A round in which "
+            "nobody took a step is not an update" % (mode, [entry[2] for entry in partials])
+        )
+    with torch.no_grad():
+        combined: ParamMap = {}
+        for name in names:
+            acc = None
+            for _, summed, _ in partials:
+                term = summed[name].to(torch.float32)
+                acc = term.clone() if acc is None else acc.add_(term)
+            assert acc is not None  # partials is not empty, checked above
             combined[name] = acc.mul_(scale / denominator)
     return combined
 
@@ -553,14 +665,26 @@ class OuterLoop:
         is a defect that surfaces only as slightly worse convergence.
         """
         gradient = combine(contributions, mode=self.combine_mode)
+        return self.apply_combined(gradient, [c.steps for c in contributions])
+
+    def apply_combined(self, gradient: ParamMap, steps: List[int]) -> Dict[str, Any]:
+        """Take the outer step with a pseudo-gradient already combined, and
+        start the next round.
+
+        What a node does when its round was combined elsewhere (GPU-143): the
+        region's delegate combined it, and every node takes the step with the
+        same tensor, so every node holds the same parameters without each one
+        combining the same reports. ``steps`` are the local step counts behind
+        it, one per node, for the round's record and the model's step axis.
+        """
         self.optimizer.step(self.outer, gradient)
         self.write_back()
 
-        steps = [c.steps for c in contributions]
+        steps = [int(s) for s in steps]
         self.model_steps += sum(max(int(s), 0) for s in steps)
         report = {
             "round": self.round_number,
-            "nodes": len(contributions),
+            "nodes": len(steps),
             "steps": steps,
             "slowest": min(steps),
             "fastest": max(steps),
@@ -569,7 +693,7 @@ class OuterLoop:
         logger.info(
             "Outer round %d closed over %d node(s), %d-%d local steps each.",
             self.round_number,
-            len(contributions),
+            len(steps),
             report["slowest"],
             report["fastest"],
         )

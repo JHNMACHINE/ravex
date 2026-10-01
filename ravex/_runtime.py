@@ -200,6 +200,11 @@ class RavexRuntime:
         #: same distinction `_ring_link` makes.
         self._outer: Any = None
         self._exchange: Any = None
+        #: The three exchanges of a round over regions (GPU-143), by role:
+        #: ``region``, ``delegates``, ``results``. None for a flat round, which
+        #: uses ``_exchange`` alone; with regions ``_exchange`` stays open for
+        #: the joins it serves.
+        self._region_exchanges: Optional[Dict[str, Any]] = None
         self._outer_peers: List[int] = []
         #: Who is in the run, evaluated per round. None until the outer loop is
         #: built, because it needs the rendezvous store the exchange takes its
@@ -1007,6 +1012,7 @@ class RavexRuntime:
         )
         exchange = self._open_exchange(rank, store, root)
         self._exchange = exchange
+        self._region_exchanges = self._open_region_exchanges(rank, store, root, exchange)
 
         loop = OuterLoop(
             models[0],
@@ -1097,6 +1103,65 @@ class RavexRuntime:
             raise RuntimeError("the round exchange could not open its listener")
         return exchange
 
+    def _open_region_exchanges(self, rank, store, root, main) -> Optional[Dict[str, Any]]:
+        """The exchanges of a round over regions, or None for a flat round.
+
+        GPU-143. Three, each with a namespace of its own on the store - the
+        region's, the delegates', the results' - so the round each one decides
+        is never another's. This node's region goes on the store for the life
+        of the job, where every node reads its peers' from.
+        """
+        region = self.config.outer_region
+        if not region:
+            return None
+        from ravex._dist import rendezvous as _rendezvous
+        from ravex._dist.exchange import (
+            DELEGATES_NAMESPACE, REGION_NAMESPACE, RESULTS_NAMESPACE,
+            DeltaExchange, announce_region,
+        )
+
+        address = self.config.outer_rendezvous
+        roles = {
+            "region": (REGION_NAMESPACE % region, self.config.outer_save_dtype),
+            # The link between regions is the slow one: the aggregates travel
+            # cast exactly as a node's delta does on a flat round.
+            "delegates": (DELEGATES_NAMESPACE, self.config.outer_save_dtype),
+            # Exact: every node takes the step with this very tensor, and a
+            # cast here would be one rounding nobody combines away.
+            "results": (RESULTS_NAMESPACE, None),
+        }
+        opened: Dict[str, Any] = {}
+        for role, (namespace, save_dtype) in roles.items():
+            exchange = DeltaExchange(
+                rank,
+                store,
+                root=os.path.join(root, role),
+                node=str(rank),
+                compression_level=self.config.compression_level,
+                save_dtype=save_dtype,
+                route_toward=_rendezvous.parse_address(address)[0] if address else None,
+                namespace=namespace,
+                inherit=main,
+            )
+            if not exchange.start():
+                for other in opened.values():
+                    other.close()
+                raise RuntimeError("the %s exchange could not open its listener" % role)
+            opened[role] = exchange
+        announce_region(store, main.scope_base or main.scope, rank, region)
+        logger.info("Outer rounds over regions: this node is in region %r.", region)
+        return opened
+
+    def _close_region_exchanges(self, linger: float) -> None:
+        if not self._region_exchanges:
+            return
+        for exchange in self._region_exchanges.values():
+            try:
+                exchange.close(linger=linger, expect=self._outer_peers)
+            except Exception:
+                pass
+        self._region_exchanges = None
+
     def _leave_and_rejoin(self, cause: Exception) -> None:
         """This node cannot stay on the run's model: leave it, and come back.
 
@@ -1143,6 +1208,7 @@ class RavexRuntime:
             )
         except Exception:
             pass
+        self._close_region_exchanges(min(60.0, float(self.config.outer_deadline)))
 
         node = _rendezvous.register(store)
         membership = Membership(
@@ -1155,6 +1221,7 @@ class RavexRuntime:
         )
         exchange = self._open_exchange(node, store, root)
         self._exchange = exchange
+        self._region_exchanges = self._open_region_exchanges(node, store, root, exchange)
         self._outer.node = str(node)
         deadline = time.monotonic() + self.config.outer_deadline
         if not join_run(
@@ -1255,7 +1322,7 @@ class RavexRuntime:
         anything that leaves this node off the others' model goes to
         :meth:`_leave_and_rejoin`.
         """
-        from ravex._dist.exchange import RoundSplitError, close_round
+        from ravex._dist.exchange import RoundSplitError, close_round, close_round_regions
         from ravex._dist.membership import MembershipError, serve_joins
 
         if not self._outer or self._exchange is None:
@@ -1294,14 +1361,26 @@ class RavexRuntime:
                     # Last round's peers. Who is asked no longer decides what
                     # is averaged; the store does.
                     logger.warning("Could not refresh the peer set: %s", exc)
-            report = close_round(
-                self._outer,
-                self._exchange,
-                self._outer_peers,
-                time.monotonic() + self.config.outer_deadline,
-                metrics=self._round_means.take() if self._round_means is not None else None,
-                error_feedback=self.config.outer_error_feedback,
-            )
+            means = self._round_means.take() if self._round_means is not None else None
+            if self._region_exchanges:
+                report = close_round_regions(
+                    self._outer,
+                    str(self.config.outer_region),
+                    self._region_exchanges,
+                    self._outer_peers,
+                    time.monotonic() + self.config.outer_deadline,
+                    metrics=means,
+                    error_feedback=self.config.outer_error_feedback,
+                )
+            else:
+                report = close_round(
+                    self._outer,
+                    self._exchange,
+                    self._outer_peers,
+                    time.monotonic() + self.config.outer_deadline,
+                    metrics=means,
+                    error_feedback=self.config.outer_error_feedback,
+                )
         except MembershipError as exc:
             # `RoundSplitError` among them. Not swallowed and not abandoned:
             # the averages have differed, or would if this node carried on.
@@ -3048,6 +3127,7 @@ class RavexRuntime:
                     expect=self._outer_peers,
                 )
                 self._exchange = None
+            self._close_region_exchanges(min(60.0, float(self.config.outer_deadline)))
             logger.info("Ravex shutdown complete at step %d", self.registry.step_count)
         except Exception as exc:
             logger.warning("Shutdown error: %s", exc)

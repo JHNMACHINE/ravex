@@ -96,6 +96,10 @@ METRICS = "ravex.metrics"
 #: The block format the delta was quantized to by Ravex before Moonclip saw it
 #: (GPU-139), when it was. Its absence means the tensors are the delta itself.
 QUANT = "ravex.quant"
+#: What an aggregate or a combined result says about itself, as JSON
+#: (GPU-143): whose reports it holds, and their steps and metrics. Absent on an
+#: ordinary report, and an older node never asks for it.
+EXTRA = "ravex.extra"
 #: Suffix of the tensor that carries a quantized tensor's per-block exponents.
 #: Not a character a parameter name can contain, so it cannot collide with one.
 EXPONENTS = "::exponents"
@@ -115,14 +119,18 @@ class ReportError(ValueError):
 class Report:
     """One node's round: what it did, and the delta it did it with."""
 
-    __slots__ = ("delta", "steps", "node", "round_number", "metrics")
+    __slots__ = ("delta", "steps", "node", "round_number", "metrics", "extra")
 
-    def __init__(self, delta, steps, node, round_number, metrics=None):
+    def __init__(self, delta, steps, node, round_number, metrics=None, extra=None):
         self.delta = delta
         self.steps = steps
         self.node = node
         self.round_number = round_number
         self.metrics = metrics or {}
+        #: What a report that is not one node's says about itself: a region's
+        #: aggregate, or a round's combined result (GPU-143). Empty for an
+        #: ordinary node's report.
+        self.extra = extra or {}
 
     def __repr__(self) -> str:
         return "Report(node=%r, round=%d, steps=%d, tensors=%d)" % (
@@ -238,6 +246,7 @@ def publish_round(
     compression_level: int = 3,
     save_dtype=None,
     metrics=None,
+    extra=None,
 ) -> str:
     """Write one round into its own directory, and mark it servable last.
 
@@ -253,7 +262,7 @@ def publish_round(
         path, compression_level=compression_level, save_dtype=save_dtype
     )
     quantize = save_dtype if _quant.is_block(save_dtype) else None
-    write(store, delta, round_number, steps, node, metrics, quantize=quantize)
+    write(store, delta, round_number, steps, node, metrics, quantize=quantize, extra=extra)
     with open(os.path.join(path, ROUND_OK), "wb"):
         pass
     return path
@@ -320,6 +329,7 @@ def write(
     node: str,
     metrics=None,
     quantize: Optional[str] = None,
+    extra=None,
 ) -> str:
     """Put this node's report in the store, under ``round_number`` as the step.
 
@@ -331,6 +341,8 @@ def write(
     metadata = {STEPS: str(int(steps)), NODE: str(node)}
     if metrics:
         metadata[METRICS] = json.dumps(metrics, allow_nan=True)
+    if extra:
+        metadata[EXTRA] = json.dumps(extra, allow_nan=True)
     if quantize:
         # Each tensor becomes its codes under its own name and its exponents
         # beside it. The format rides in the metadata, so a reader never has
@@ -461,6 +473,7 @@ def read(store, round_number: int, expected) -> Report:
         node=str(metadata.get(NODE, "")),
         round_number=int(described.get("step", round_number)),
         metrics=_metrics_of(metadata),
+        extra=_extra_of(metadata),
     )
 
 
@@ -542,7 +555,26 @@ def _read_block(store, snapshot_id, described, tensors, metadata, round_number,
         node=str(metadata.get(NODE, "")),
         round_number=int(described.get("step", round_number)),
         metrics=_metrics_of(metadata),
+        extra=_extra_of(metadata),
     )
+
+
+def _extra_of(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    """What an aggregate says about itself, or nothing for a node's report.
+
+    Unlike the metrics, an aggregate that cannot say whose reports it holds is
+    not usable - the round's members and steps come from here - so the caller
+    decides what an empty answer means; this only never raises.
+    """
+    raw = metadata.get(EXTRA)
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        logger.debug("A report's extra could not be read: %s", exc)
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def _metrics_of(metadata: Dict[str, Any]) -> Dict[str, Any]:
