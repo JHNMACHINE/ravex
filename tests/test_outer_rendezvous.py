@@ -17,7 +17,6 @@ train, and their loss still falls.
 import hashlib
 import multiprocessing as mp
 import os
-import socket
 import sys
 import threading
 import time
@@ -34,17 +33,13 @@ from ravex._dist.membership import Membership, announce  # noqa: E402
 LAST_KEY = "test/last-round"
 
 
-def free_port():
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        return probe.getsockname()[1]
-
-
 @pytest.fixture
 def server():
-    port = free_port()
-    store = rendezvous.serve("127.0.0.1", port)
-    yield "127.0.0.1:%d" % port
+    # Port 0, and the port read back from the server: a port probed free and
+    # then handed over could be taken by another worker's server in between,
+    # and under `pytest -n` it was - EADDRINUSE at the listen (GPU-175).
+    store = rendezvous.serve("127.0.0.1", 0)
+    yield "127.0.0.1:%d" % store.port
     del store
 
 
@@ -56,9 +51,8 @@ def gated_server(monkeypatch):
     inherit it the way a node started by the platform would.
     """
     monkeypatch.setenv(rendezvous.TOKEN_ENV, "the-job-token")
-    port = free_port()
-    gated = rendezvous.serve("127.0.0.1", port)
-    yield "127.0.0.1:%d" % port
+    gated = rendezvous.serve("127.0.0.1", 0)
+    yield "127.0.0.1:%d" % gated.port
     gated.close()
 
 

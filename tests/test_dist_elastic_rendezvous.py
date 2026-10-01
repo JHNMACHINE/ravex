@@ -6,8 +6,8 @@ Elastic-without-restart needs a rendezvous point that survives
 world_size, inside the same process, with a genuinely new process attaching
 for the first time. That is not what ``env://`` rendezvous gives you - the
 default store it builds is scoped to one ``init_process_group`` call. This
-tests the alternative: a raw ``TCPStore`` created once, held by rank 0 for the
-whole test, and passed explicitly as ``store=`` to every
+tests the alternative: a raw ``TCPStore`` created once, held by the test's own
+process for the whole test, and passed explicitly as ``store=`` to every
 ``init_process_group`` call on every rank, original or joining.
 
 **What this does not prove.** Three processes on one box, gloo, loopback. No
@@ -38,15 +38,18 @@ alive past a 10 s timeout - and also not on every run. Both platforms need
 the same fix: wrap the shared store in a fresh ``PrefixStore`` per
 rendezvous "generation" (``gen0`` for the world_size=2 call, ``gen1`` for
 world_size=3), so the two calls never read each other's leftover handshake
-keys off the same store. Because the failure is intermittent, the negative
-test below repeats the naive attempt several times and requires at least one
-failure, rather than asserting it fails outright - a single clean pass does
-not mean the bug is gone, only that this particular run got lucky.
+keys off the same store.
+
+The naive version is not run here. It used to be, repeated five times and
+required to break at least once; in CI torch got through all five (GPU-175),
+which made the suite fail on a race going our way. Because the failure is
+intermittent it cannot be asserted, only described - which is what the
+paragraph above is for. The test below pins the mechanism the fix relies on
+instead: each generation reads only its own keys.
 """
 
 import datetime
 import multiprocessing as mp
-import socket
 import traceback
 
 import pytest
@@ -55,13 +58,7 @@ PHASE2_TIMEOUT = datetime.timedelta(seconds=10)
 GET_TIMEOUT = 20
 
 
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-def _rejoin_worker(rank, is_rank0, port, join_evt, out, use_generations):
+def _rejoin_worker(rank, port, out):
     """One rank of: world_size 2 -> destroy -> world_size 3, rank 2 is new.
 
     Top-level and argument-driven because ``spawn`` has to pickle it - the
@@ -71,22 +68,14 @@ def _rejoin_worker(rank, is_rank0, port, join_evt, out, use_generations):
         import torch
         import torch.distributed as dist
 
-        if is_rank0:
-            # Rank 0 owns the TCPStore server. It must outlive both
-            # generations, which is the entire point: the rendezvous point
-            # cannot be torn down with the process group.
-            store = dist.TCPStore(
-                "127.0.0.1", port, world_size=None, is_master=True, use_libuv=False
-            )
-            join_evt.set()
-        else:
-            join_evt.wait(timeout=15)
-            store = dist.TCPStore(
-                "127.0.0.1", port, world_size=None, is_master=False, use_libuv=False
-            )
+        from ravex._dist.elastic import generation_store
+
+        store = dist.TCPStore(
+            "127.0.0.1", port, world_size=None, is_master=False, use_libuv=False
+        )
 
         if rank in (0, 1):
-            gen0 = dist.PrefixStore("gen0", store) if use_generations else store
+            gen0 = generation_store(store, 0)
             dist.init_process_group("gloo", store=gen0, rank=rank, world_size=2)
             t = torch.tensor([1.0])
             dist.all_reduce(t)
@@ -99,7 +88,7 @@ def _rejoin_worker(rank, is_rank0, port, join_evt, out, use_generations):
         # init_process_group's store-based rendezvous blocks until world_size
         # parties show up, so rank 2 can walk straight in without waiting on
         # any hand-off from 0/1.
-        gen1 = dist.PrefixStore("gen1", store) if use_generations else store
+        gen1 = generation_store(store, 1)
         dist.init_process_group(
             "gloo", store=gen1, rank=rank, world_size=3, timeout=PHASE2_TIMEOUT
         )
@@ -111,7 +100,7 @@ def _rejoin_worker(rank, is_rank0, port, join_evt, out, use_generations):
         out.put((rank, "EXC", traceback.format_exc()))
 
 
-def _run_three_rank_rejoin(use_generations):
+def _run_three_rank_rejoin():
     """Spawn 0 and 1 at world_size=2, then all three at world_size=3.
 
     Returns a dict of rank -> list of (phase, value) messages received before
@@ -120,12 +109,21 @@ def _run_three_rank_rejoin(use_generations):
     exists to avoid (see GPU-92's rationale for a short, independent
     timeout), so it is reported as data, not swallowed as cleanup.
     """
+    import torch.distributed as dist
+
+    # The TCPStore server, held here: it must outlive both generations, which
+    # is the entire point - the rendezvous point cannot be torn down with the
+    # process group. On port 0 and already listening when the ranks are
+    # spawned, because a port probed free and handed to a rank to listen on
+    # can be taken by another worker in between (GPU-175).
+    server = dist.TCPStore(
+        "127.0.0.1", 0, world_size=None, is_master=True, use_libuv=False
+    )
+    port = server.port
     ctx = mp.get_context("spawn")
-    port = _free_port()
-    join_evt = ctx.Event()
     out = ctx.Queue()
     procs = [
-        ctx.Process(target=_rejoin_worker, args=(r, r == 0, port, join_evt, out, use_generations))
+        ctx.Process(target=_rejoin_worker, args=(r, port, out))
         for r in (0, 1, 2)
     ]
     for p in procs:
@@ -157,12 +155,12 @@ class TestARankThatNeverExistedCanJoin:
     """
 
     def test_generation_prefixed_store_lets_a_new_rank_join_cleanly(self):
-        messages, killed = _run_three_rank_rejoin(use_generations=True)
+        messages, killed = _run_three_rank_rejoin()
 
         assert killed == [], (
             "a process had to be killed rather than exiting on its own - "
             "that is a hang, not a clean failure, and it is exactly the "
-            "failure mode the naive version below produces"
+            "failure mode the naive version in the module docstring produces"
         )
         assert messages[0] == [("phase1", "ok"), ("phase2", 3.0)]
         assert messages[1] == [("phase1", "ok"), ("phase2", 3.0)]
@@ -170,50 +168,51 @@ class TestARankThatNeverExistedCanJoin:
         # and its only result is the phase-2 collective it joined fresh.
         assert messages[2] == [("phase2", 3.0)]
 
-    def test_reusing_the_bare_store_across_generations_is_not_reliable(self):
-        """The negative case, kept rather than deleted once the fix was
-        found - the same discipline as GPU-98's rule 5: this is what proves
-        the ``PrefixStore`` above is load-bearing and not decoration.
+    def test_each_generation_reads_only_its_own_handshake_keys(self):
+        """What the ``PrefixStore`` above is for, checked without a race.
 
-        Reusing the same raw store directly for both the world_size=2 and
-        world_size=3 ``init_process_group`` calls is the version that looked
-        like it should work and was tried first. Phase 1 always succeeds -
-        the two original ranks agree on world_size=2 with a store they are
-        both new to. Phase 2 is where it breaks, because the store still
-        holds handshake keys from phase 1 that a fresh rendezvous at a
-        different world_size was never meant to see - but it does not break
-        *every* time (see the module docstring), which is why this repeats
-        the attempt several times rather than asserting failure on a single
-        run: on this box (Windows) 5 repeats failed 5/5 with a deterministic
-        ``RuntimeError`` from gloo's own transport layer before a later,
-        unrelated run passed cleanly with no code change. Cross-checked in a
-        Linux container the failure shape is different again - "Connection
-        reset by peer", or every process still alive past the 10 s phase-2
-        timeout - and also not on every run there either. What is pinned
-        here is the one thing constant across both platforms and both
-        failure shapes: over several repeats, at least one must fail to
-        deliver three correct results. A test that required failure on
-        every single run would itself be wrong about what was actually
-        observed.
+        This used to be the negative case run for real: the bare store reused
+        across generations, five times over, passing if any attempt broke. It
+        bet on a race, and in CI torch won it five times running (GPU-175) -
+        a test that goes red when the bug fails to show up says nothing about
+        our code. The failure itself is written up in the module docstring.
+
+        What is pinned instead is the mechanism the fix relies on, in one
+        process and deterministically: a rendezvous leaves its handshake keys
+        behind on the shared store, and the next generation's view of that
+        store cannot see them, while the same generation number reaches the
+        same keys again. It goes through ``ravex._dist.elastic.generation_store``,
+        the function the runtime calls, not a copy of it.
         """
-        attempts = 5
-        any_failure = False
-        for _ in range(attempts):
-            messages, killed = _run_three_rank_rejoin(use_generations=False)
-            phase2_by_rank = {
-                rank: [v for phase, v in msgs if phase == "phase2"]
-                for rank, msgs in messages.items()
-            }
-            all_correct = all(values == [3.0] for values in phase2_by_rank.values())
-            if killed or not all_correct:
-                any_failure = True
-                break
+        import torch
+        import torch.distributed as dist
 
-        assert any_failure, (
-            "reusing the bare store across generations succeeded cleanly on "
-            "every rank across %d repeats - if torch has started tolerating "
-            "this reliably, the PrefixStore-per-generation workaround (in "
-            "ravex._dist.elastic.generation_store and in this test) is no longer "
-            "needed and should be revisited, not left in out of caution"
-            % attempts
+        from ravex._dist.elastic import generation_store
+
+        store = dist.TCPStore(
+            "127.0.0.1", 0, world_size=None, is_master=True, use_libuv=False
         )
+        before = store.num_keys()
+
+        gen0 = generation_store(store, 0)
+        dist.init_process_group("gloo", store=gen0, rank=0, world_size=1)
+        t = torch.tensor([1.0])
+        dist.all_reduce(t)
+        dist.destroy_process_group()
+        gen0.set("leftover", "from generation 0")
+
+        # The cause, as it stands: the first rendezvous is gone, its keys are
+        # not. A bare store reused at another world_size would read them.
+        assert store.num_keys() > before
+
+        gen1 = generation_store(store, 1)
+        assert not gen1.check(["leftover"])
+        assert generation_store(store, 0).check(["leftover"])
+        assert generation_store(store, 0).get("leftover") == b"from generation 0"
+
+        # And generation 1 still rendezvous on the same store, around them.
+        dist.init_process_group("gloo", store=gen1, rank=0, world_size=1)
+        t = torch.tensor([1.0])
+        dist.all_reduce(t)
+        dist.destroy_process_group()
+        assert t.item() == 1.0

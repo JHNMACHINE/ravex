@@ -785,12 +785,29 @@ NEEDS_NUMPY = pytest.mark.skipif(
 )
 
 
-def _free_port():
-    import socket
+def _store_server():
+    """A rendezvous store for one spawned group, held by the test's own process.
 
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    On port 0, with the port read back from the store. The probe it replaces
+    found a free port, closed it and handed the number to rank 0 to listen on;
+    under `pytest -n` another worker's store took it in between, and rank 1
+    dialled a stranger's server - "Connection reset by peer", then a queue
+    that never filled (GPU-175). A server that is already listening has no
+    such window. The caller keeps it alive until its ranks are done.
+    """
+    from ravex._dist.rendezvous import _tcp_store
+
+    return _tcp_store("127.0.0.1", 0, True, 120.0)
+
+
+def _join_gloo(rank, world_size, port):
+    """Join the gloo group whose store `_store_server` opened, as a client."""
+    import torch.distributed as dist
+
+    from ravex._dist.rendezvous import _tcp_store
+
+    store = _tcp_store("127.0.0.1", port, False, 120.0)
+    dist.init_process_group("gloo", store=store, rank=rank, world_size=world_size)
 
 
 def _object_gather_worker(rank, world_size, port, no_numpy, payload, out):
@@ -800,8 +817,6 @@ def _object_gather_worker(rank, world_size, port, no_numpy, payload, out):
     """
     import os
 
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
     if no_numpy:
         os.environ["RAVEX_ASSUME_NO_NUMPY"] = "1"
     else:
@@ -817,7 +832,7 @@ def _object_gather_worker(rank, world_size, port, no_numpy, payload, out):
         distributed._torch_numpy = None
         took_the_new_path = not distributed._torch_can_reach_numpy()
 
-        dist.init_process_group("gloo", rank=rank, world_size=world_size)
+        _join_gloo(rank, world_size, port)
         try:
             got = distributed._all_gather_object(dist, payload)
         finally:
@@ -833,7 +848,8 @@ def _gather_across_two_ranks(no_numpy_by_rank, payloads):
 
     ctx = mp.get_context("spawn")
     out = ctx.Queue()
-    port = _free_port()
+    server = _store_server()
+    port = server.port
     procs = [
         ctx.Process(
             target=_object_gather_worker,
@@ -928,8 +944,6 @@ def _object_broadcast_worker(rank, world_size, port, no_numpy, payload, src, out
     """One rank of a real gloo group, receiving `payload` from `src`."""
     import os
 
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
     if no_numpy:
         os.environ["RAVEX_ASSUME_NO_NUMPY"] = "1"
     else:
@@ -943,7 +957,7 @@ def _object_broadcast_worker(rank, world_size, port, no_numpy, payload, src, out
         distributed._torch_numpy = None
         took_the_new_path = not distributed._torch_can_reach_numpy()
 
-        dist.init_process_group("gloo", rank=rank, world_size=world_size)
+        _join_gloo(rank, world_size, port)
         try:
             got = distributed._broadcast_object(
                 dist, payload if rank == src else None, src
@@ -960,7 +974,8 @@ def _broadcast_across_two_ranks(no_numpy_by_rank, payload, src=0):
 
     ctx = mp.get_context("spawn")
     out = ctx.Queue()
-    port = _free_port()
+    server = _store_server()
+    port = server.port
     procs = [
         ctx.Process(
             target=_object_broadcast_worker,
@@ -1044,17 +1059,12 @@ class TestTheObjectBroadcastOnTwoRanks:
 
 def _drain_split_worker(rank, world_size, port, sharded, out):
     """One rank deciding whether to split `drain`, the way the runtime does."""
-    import os
-
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
-
     try:
         import torch.distributed as dist
 
         from ravex._dist.collectives import all_ranks_agree, barrier, get_world_size
 
-        dist.init_process_group("gloo", rank=rank, world_size=world_size)
+        _join_gloo(rank, world_size, port)
         try:
             # The runtime's own guard, not a copy of it: `sharded and
             # get_world_size() > 1`, unconditional since GPU-98 — no
@@ -1077,7 +1087,8 @@ def _decide_drain_split_across_two_ranks(sharded):
 
     ctx = mp.get_context("spawn")
     out = ctx.Queue()
-    port = _free_port()
+    server = _store_server()
+    port = server.port
     procs = [
         ctx.Process(target=_drain_split_worker, args=(rank, 2, port, sharded, out))
         for rank in (0, 1)

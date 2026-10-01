@@ -134,10 +134,11 @@ def generation_store(base_store, generation: int):
     namespace, and that is enough — no platform-specific handling needed on
     top of it.
 
-    See ``tests/test_dist_elastic_rendezvous.py`` for the reproduction of both
-    failures and the negative test that keeps this from silently stopping
-    being necessary if a future torch release changes the underlying
-    behaviour.
+    ``tests/test_dist_elastic_rendezvous.py`` writes up both failures and
+    pins what this relies on: each generation reads only its own keys. The
+    failure itself is no longer run there, because it is a race and CI kept
+    winning it (GPU-175) - so if a future torch makes the bare store safe to
+    reuse, nothing will say so; that has to be checked by hand.
     """
     import torch.distributed as dist
 
