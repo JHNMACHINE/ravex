@@ -250,6 +250,44 @@ prints which case it was:
 What leaves is the model and its optimizer. The sampler position, the RNG and
 the schedulers stay behind: a DCP reader has nowhere to put them.
 
+#### Exporting to DeepSpeed
+
+To resume a Ravex run under DeepSpeed - "start in FSDP, resume in DeepSpeed":
+
+```bash
+ravex export --storage ./checkpoints --out ./exported-ds --to deepspeed
+```
+
+What comes out is a DeepSpeed **universal checkpoint**: one file per parameter
+and per optimizer buffer, whole, which DeepSpeed partitions itself when it
+loads. So it resumes at ZeRO stage 1, 2 or 3 and at any data-parallel size,
+none of which the export has to know. Resume it with
+
+```json
+"checkpoint": {"load_universal": true}
+```
+
+in the DeepSpeed config and `engine.load_checkpoint("./exported-ds")`. Use
+DeepSpeed's own Adam (its default), not `torch_adam`: the universal loader puts
+the step back as an int, as DeepSpeed's own converter writes it, and torch's
+Adam wants a tensor there.
+
+The moments need parameter names, and the export has them in two cases: a
+sharded model in `gather` layout, and an optimizer built from
+`model.named_parameters()`, for which torch records the names. An optimizer
+built from `model.parameters()` holds its moments by position only; the export
+then writes the weights and leaves the moments out, and says so - DeepSpeed
+resumes those weights with a fresh optimizer.
+
+The loss scaler, the overflow flag and the gradient clipping are not written:
+they are the resuming run's to set, in its DeepSpeed config.
+
+`integration/frameworks/check_deepspeed_export.py` checks all of this against
+DeepSpeed itself, and is the check to rerun after a DeepSpeed upgrade: the
+export resumed at stages 1 to 3 and one to three ranks, the weights and moments
+read back equal by name, and the next step equal to the one from DeepSpeed's own
+`ds_to_universal` - verified with DeepSpeed 0.19.7.
+
 ### Elastic training: a cluster that changes size while it runs
 
 A job whose nodes come and go needs no Ravex API of its own. `torchrun` already

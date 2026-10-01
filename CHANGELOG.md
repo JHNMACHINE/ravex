@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`ravex export --to deepspeed` (GPU-145).** A checkpoint leaves Ravex as a
+  DeepSpeed universal checkpoint, which DeepSpeed resumes at ZeRO stage 1, 2
+  or 3 and any data-parallel size with `"checkpoint": {"load_universal":
+  true}`. Weights always; Adam's moments when the parameter names are known
+  (a sharded group in `gather` layout, or an optimizer built from
+  `model.named_parameters()`), and otherwise left out with a note. Checked
+  against DeepSpeed 0.19.7 by `integration/frameworks/check_deepspeed_export.py`:
+  weights and moments equal by name after DeepSpeed resumes and saves again,
+  and the next step identical to the one from DeepSpeed's own converter.
+
 ## 0.5.0 — 2026-09-30
 
 ### Added

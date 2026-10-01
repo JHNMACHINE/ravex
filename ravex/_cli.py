@@ -21,7 +21,8 @@ get" is not always obvious from where you are standing.
 ``export`` is the other kind of question a command line is for: an operation on
 a store after the run that wrote it is gone. It writes a checkpoint out as a
 ``torch.distributed.checkpoint`` directory (GPU-90) — the format other
-frameworks read, where Ravex's own store is a format only Ravex reads.
+frameworks read, where Ravex's own store is a format only Ravex reads — or,
+with ``--to deepspeed``, as a DeepSpeed universal checkpoint (GPU-145).
 
 ``audit`` is the same kind: reading, listing and verifying the audit log a run
 with ``audit_log: true`` left in its store (GPU-93). The person who needs it is
@@ -78,12 +79,14 @@ def _status(_args) -> int:
 
 def _export(args) -> int:
     from ravex._interop.convert import CannotConvert
-    from ravex._interop.export import load_store, to_dcp
+    from ravex._interop.export import load_store, to_dcp, to_deepspeed
 
     # Refused rather than written into. DCP names its files by rank and
     # overwrites its metadata, so an export on top of an earlier one leaves
     # the earlier one's extra files beside a manifest that no longer lists
-    # them — a directory that loads, and holds more than it says.
+    # them — a directory that loads, and holds more than it says. A DeepSpeed
+    # export the same: a parameter left over from another model would sit in
+    # its zero/ folder looking like part of this one.
     if os.path.isdir(args.out) and os.listdir(args.out):
         print(
             f"ravex export: {args.out} exists and is not empty; export into a "
@@ -94,12 +97,13 @@ def _export(args) -> int:
 
     try:
         state = load_store(args.storage, backend=args.backend, step=args.step)
-        notes = to_dcp(state, args.out, key=args.model)
+        write = to_deepspeed if args.to == "deepspeed" else to_dcp
+        notes = write(state, args.out, key=args.model)
     except CannotConvert as exc:
         print(f"ravex export: {exc}", file=sys.stderr)
         return 2
 
-    print(f"exported step {state.get('step')} of {args.storage} to {args.out}")
+    print(f"exported step {state.get('step')} of {args.storage} to {args.out} as {args.to}")
     for note in notes:
         print(f"  {note}")
     return 0
@@ -300,10 +304,17 @@ def main(argv=None) -> int:
 
     export = subparsers.add_parser(
         "export",
-        help="write a checkpoint out as a torch distributed checkpoint (DCP)",
+        help="write a checkpoint out for another framework: DCP, or a DeepSpeed universal checkpoint",
     )
     export.add_argument("--storage", required=True, help="the Ravex store to read")
-    export.add_argument("--out", required=True, help="a new directory to write the DCP into")
+    export.add_argument("--out", required=True, help="a new directory to write the export into")
+    export.add_argument(
+        "--to",
+        default="dcp",
+        choices=("dcp", "deepspeed"),
+        help="dcp: torch distributed checkpoint (FSDP, Megatron-core); deepspeed: a "
+        'universal checkpoint, resumed with "checkpoint": {"load_universal": true} (default: dcp)',
+    )
     export.add_argument(
         "--backend",
         default="moonclip",
