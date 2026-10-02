@@ -24,10 +24,11 @@ SCP=(scp -i "$KEY" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new)
 . "$HERE/boxes.env"
 KIT_ROOT="${KIT_ROOT:-/root}"
 
-[ $# -ge 1 ] || { echo "usage: $0 '<command>' [--node 0|1]" >&2; exit 2; }
+[ $# -ge 1 ] || { echo "usage: $0 '<command>' [--node N]" >&2; exit 2; }
 CMD="$1"; shift
 ONLY=""
 [ "${1:-}" = "--node" ] && ONLY="$2"
+NBOXES="${NBOXES:-2}"
 
 run() {
     local host="$1" port="$2" node="$3"
@@ -37,7 +38,12 @@ run() {
     echo "[node$node] exit ${PIPESTATUS[0]}"
 }
 
+# Every box, however many push.sh was given: "both" is from when there were
+# two, and the rounds over regions (GPU-143) take four.
 pids=()
-[ "$ONLY" = "1" ] || { run "$HOST0" "$PORT0" 0 & pids+=($!); }
-[ "$ONLY" = "0" ] || { run "$HOST1" "$PORT1" 1 & pids+=($!); }
+for ((i = 0; i < NBOXES; i++)); do
+    [ -z "$ONLY" ] || [ "$ONLY" = "$i" ] || continue
+    host="HOST$i"; port="PORT$i"
+    run "${!host}" "${!port}" "$i" & pids+=($!)
+done
 for pid in "${pids[@]}"; do wait "$pid"; done

@@ -22,9 +22,10 @@ KIT_ROOT="${KIT_ROOT:-/root}"
 
 TAG="${1:-$(date +%H%M%S)}"
 DEST="$HERE/results/$TAG"
-mkdir -p "$DEST/node0" "$DEST/node1"
-
-"${SCP[@]}" -P "$PORT0" -r "$HOST0:$KIT_ROOT/out/." "$DEST/node0/" || echo "node0: nothing yet"
-"${SCP[@]}" -P "$PORT1" -r "$HOST1:$KIT_ROOT/out/." "$DEST/node1/" || echo "node1: nothing yet"
+for ((i = 0; i < ${NBOXES:-2}; i++)); do
+    host="HOST$i"; port="PORT$i"
+    mkdir -p "$DEST/node$i"
+    "${SCP[@]}" -P "${!port}" -r "${!host}:$KIT_ROOT/out/." "$DEST/node$i/" || echo "node$i: nothing yet"
+done
 echo
 find "$DEST" -type f | sed "s|$HERE/||"

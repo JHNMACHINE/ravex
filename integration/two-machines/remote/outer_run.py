@@ -56,6 +56,12 @@ FIELDS = (
     "decide_seconds", "recover_seconds", "apply_seconds",
 )
 
+#: The second line a round over regions logs (GPU-143), after the first: of
+#: the network seconds above only the gather within the region, the regions'
+#: share apart.
+REGION_LINE = "Outer round %d over regions %s"
+REGION_FIELDS = ("round", "regions", "region", "delegate", "between_seconds", "between_wait_seconds")
+
 
 class Heartbeat:
     """Says where the run is, every few seconds, while it is there.
@@ -134,6 +140,17 @@ class Rounds(logging.Handler):
                     % (entry["round"], entry["nodes"], entry["total_seconds"],
                        entry["gather_seconds"])
                 )
+        elif message.startswith(REGION_LINE) and record.args:
+            entry = dict(zip(REGION_FIELDS, record.args))
+            for seen in reversed(self.seen):
+                if seen["round"] == entry["round"]:
+                    seen.update(entry)
+                    break
+            if self.heartbeat is not None:
+                self.heartbeat.say(
+                    "round %s in region %s (delegate %s): %.2fs between regions"
+                    % (entry["round"], entry["region"], entry["delegate"], entry["between_seconds"])
+                )
         elif record.levelno >= logging.WARNING:
             self.other.append(record.getMessage())
             if self.heartbeat is not None:
@@ -207,6 +224,10 @@ def main():
     )
     parser.add_argument("--name", default="", help="names the rounds file")
     parser.add_argument(
+        "--region", default="",
+        help="this node's region: rounds close within it, then among one delegate per region (GPU-143)",
+    )
+    parser.add_argument(
         "--until-round", type=int, default=0,
         help="stop once this round has closed, instead of after --rounds",
     )
@@ -267,6 +288,7 @@ def main():
         outer_rendezvous=(args.rendezvous or None),
         outer_job=args.job,
         outer_min_nodes=args.min_nodes,
+        outer_region=(args.region or None),
         enabled=True,
         resume=False,
         checkpoint_every=10 ** 9,

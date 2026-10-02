@@ -46,6 +46,8 @@ look() {
     " 2>&1 | sed "s/^/[$node] /" &
 }
 
-look "$HOST0" "$PORT0" node0
-look "$HOST1" "$PORT1" node1
+for ((i = 0; i < ${NBOXES:-2}; i++)); do
+    host="HOST$i"; port="PORT$i"
+    look "${!host}" "${!port}" "node$i"
+done
 wait

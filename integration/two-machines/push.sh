@@ -48,20 +48,27 @@ parse() {  # "ssh -p N root@host ..." -> "host port"
     echo "$host $port"
 }
 
-[ $# -eq 2 ] || { echo "usage: $0 '<ssh string box0>' '<ssh string box1>'" >&2; exit 2; }
+[ $# -ge 2 ] || { echo "usage: $0 '<ssh string box0>' '<ssh string box1>' [more boxes]" >&2; exit 2; }
 
-read -r HOST0 PORT0 <<< "$(parse "$1")"
-read -r HOST1 PORT1 <<< "$(parse "$2")"
-
-cat > "$HERE/boxes.env" <<ENV
-HOST0=$HOST0
-PORT0=$PORT0
-HOST1=$HOST1
-PORT1=$PORT1
-KIT_ROOT=$KIT_ROOT
-ENV
-echo "node 0: $HOST0:$PORT0"
-echo "node 1: $HOST1:$PORT1"
+# Two boxes or more, numbered in the order given: every phase takes two, and
+# the rounds over regions of GPU-143 (`120-regions.sh`) take four - two
+# regions, two nodes in each.
+{
+    echo "NBOXES=$#"
+    i=0
+    for spec in "$@"; do
+        read -r host port <<< "$(parse "$spec")"
+        echo "HOST$i=$host"
+        echo "PORT$i=$port"
+        i=$((i + 1))
+    done
+    echo "KIT_ROOT=$KIT_ROOT"
+} > "$HERE/boxes.env"
+. "$HERE/boxes.env"
+for ((i = 0; i < NBOXES; i++)); do
+    host="HOST$i"; port="PORT$i"
+    echo "node $i: ${!host}:${!port}"
+done
 
 send() {
     local host="$1" port="$2" node="$3"
@@ -78,18 +85,19 @@ send() {
     "${SSH[@]}" -p "$port" "$host" "chmod +x $KIT_ROOT/kit/*.sh; ls $KIT_ROOT/kit"
 }
 
-send "$HOST0" "$PORT0" 0
-send "$HOST1" "$PORT1" 1
+for ((i = 0; i < NBOXES; i++)); do
+    host="HOST$i"; port="PORT$i"
+    send "${!host}" "${!port}" "$i"
+done
 
 echo
 echo "Now the private addresses. What each box sees:"
 echo "  vast.ai: the interface that is NOT the one this SSH arrived on."
 echo "  RunPod:  not an interface at all — use <pod-id>.runpod.internal."
-for spec in "$HOST0 $PORT0 0" "$HOST1 $PORT1 1"; do
-    # shellcheck disable=SC2086
-    set -- $spec
-    echo "-- node $3 ($1) --"
-    "${SSH[@]}" -p "$2" "$1" 'hostname; ip -o -4 addr show | awk "{printf \"  %-8s %s\n\", \$2, \$4}"'
+for ((i = 0; i < NBOXES; i++)); do
+    host="HOST$i"; port="PORT$i"
+    echo "-- node $i (${!host}) --"
+    "${SSH[@]}" -p "${!port}" "${!host}"'hostname; ip -o -4 addr show | awk "{printf \"  %-8s %s\n\", \$2, \$4}"'
 done
 echo
-echo "Then: bash addrs.sh <node0 address-or-name> <node1 address-or-name>"
+echo "Then: bash addrs.sh <node0 address-or-name> <node1 address-or-name> [...]"

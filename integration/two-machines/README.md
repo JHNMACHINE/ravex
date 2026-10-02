@@ -218,6 +218,28 @@ any key and read the job token. A RunPod pod exposes only the ports it was
 created with, so 29400 is reachable over `podnet1` and not from outside; keep
 it that way even with the token.
 
+## More than two boxes: rounds over regions
+
+`120-regions.sh` is GPU-143, and it needs four machines: two regions, two nodes
+in each, or a round over regions is the flat round plus a step. Every laptop
+script takes as many boxes as `push.sh` was given, numbered in that order, and
+`addrs.sh` takes a region after each address:
+
+```sh
+bash push.sh '<eu 0>' '<eu 1>' '<us 0>' '<us 1>'
+bash addrs.sh <a>.runpod.internal@eu <b>.runpod.internal@eu <c>.runpod.internal@us <d>.runpod.internal@us
+bash on-both.sh 'bash $KIT/120-regions.sh flat';    bash fetch.sh regions-flat
+bash on-both.sh 'bash $KIT/120-regions.sh regions'; bash fetch.sh regions-regions
+bash on-both.sh 'bash $KIT/120-regions.sh report' --node 0
+```
+
+The two arms are the same run on the same boxes, flat and then over regions.
+In the second, `network` is only the gather within the region and `between`
+is what the regions cost; their sum is what stands against the flat round's
+`network`. Check the regions are real before reading either: `mount | grep
+mfs` names the cluster, and two pods in one region look like two regions by
+their `10.x` addresses alone.
+
 ## Rules that cost money to relearn
 
 **Interrupting the command on your machine does not stop the phase on the box.**
@@ -269,6 +291,7 @@ anything that exists only there is a result that can be taken away.
 | `remote/46-gpu92-sigterm.sh` | one rank preempted, every rank saving together |
 | `remote/100-outer.sh` | the outer loop over the link: base, bf16, a node killed, resume |
 | `remote/110-rendezvous.sh` | the outer loop with no torchrun: base, a node joining late, node 0 killed |
+| `remote/120-regions.sh` | four boxes in two regions: the flat round, then the round over regions (GPU-143) |
 | `remote/00-preflight.sh` | the go/no-go |
 | `remote/10-setup.sh` | install moonclip and this ravex, fix torch if the GPU needs it |
 | `remote/20-correctness.sh` | train, replicate, die like a preempted box, lose a machine, resume |
