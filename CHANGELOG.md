@@ -30,6 +30,17 @@
 
 ### Fixed
 
+- **A node out of a run that has ended finishes, it does not fail
+  (GPU-186).** A node that left to rejoin and finds every member gone now ends
+  its training as finished, through an internal `RunOver` - a `BaseException`, so a
+  script's own `except Exception` does not swallow it - instead of raising the
+  round's error. On four rented machines that one node made the whole run look
+  failed.
+- **A node says at the start which peers it cannot reach (GPU-186).** Once
+  the run's nodes have met, each opens a connection to every peer's exchange
+  and warns about any that does not answer, naming the address. Two pods in
+  one data centre that could not reach each other used to show up only as
+  peers that did not answer a round.
 - **A node does not wait to join a run that has ended (GPU-186).** A node
   finishing its training now says on the rendezvous that it has left, and a
   node trying to (re)join gives up as soon as every member has - it used to

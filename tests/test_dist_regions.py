@@ -255,3 +255,33 @@ class TestTheRound:
                 assert torch.equal(loops[rank].outer[name], loops[0].outer[name]), rank
         assert reports[3]["members"] == [0, 1, 2, 3]
         assert "took it from rank 0 in another region" in caplog.text
+
+
+class TestWhoIsUnreachable:
+    """GPU-186: a node says at the start which peers it cannot connect to."""
+
+    def test_a_live_peer_is_reachable_and_a_closed_one_is_not(self, store, tmp_path):
+        made = []
+        for rank in range(3):
+            exchange = DeltaExchange(rank, store, root=os.path.join(str(tmp_path), "r%d" % rank),
+                                     node=str(rank), patience=5.0)
+            assert exchange.start()
+            made.append(exchange)
+        try:
+            made[2].close()
+            missing = made[0].unreachable([1, 2], timeout=3.0)
+            assert list(missing) == [2]
+            assert missing[2] is not None, "a closed peer still has the address it advertised"
+        finally:
+            for exchange in made[:2]:
+                exchange.close()
+
+    def test_a_peer_that_never_said_where_it_listens(self, store, tmp_path):
+        exchange = DeltaExchange(0, store, root=str(tmp_path / "r0"), node="0", patience=5.0)
+        assert exchange.start()
+        try:
+            began = time.monotonic()
+            assert exchange.unreachable([7], timeout=1.0) == {7: None}
+            assert time.monotonic() - began < 3.0
+        finally:
+            exchange.close()

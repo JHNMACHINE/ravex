@@ -1686,6 +1686,43 @@ class DeltaExchange:
         os.makedirs(path, exist_ok=True)
         return path
 
+    def unreachable(self, peers, timeout: float = 10.0) -> Dict[int, Optional[str]]:
+        """The peers this node cannot open a connection to, with their address.
+
+        GPU-186. Asked once, when the run starts, so a node that cannot reach
+        a peer says so then - rather than in its first round, as a peer that
+        did not answer, which reads like a slow link. On rented machines two
+        pods of one data centre did not reach each other at all, and the run
+        trained as two halves for minutes with nothing to say why. A peer with
+        no address yet is reported with ``None``. Nothing is sent: the
+        connection is opened and closed, and the server drops it as an
+        incomplete request.
+        """
+        deadline = time.monotonic() + timeout
+        found: Dict[int, Optional[str]] = {}
+        lock = threading.Lock()
+
+        def probe(peer: int) -> None:
+            address = self._address_of(peer, deadline)
+            if address is None:
+                with lock:
+                    found[peer] = None
+                return
+            host, _, port = address.rpartition(":")
+            try:
+                left = max(0.5, deadline - time.monotonic())
+                _socket.create_connection((host, int(port)), timeout=left).close()
+            except (OSError, ValueError):
+                with lock:
+                    found[peer] = address
+
+        threads = [threading.Thread(target=probe, args=(int(peer),), daemon=True) for peer in peers]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout + 1.0)
+        return found
+
     def _address_of(self, peer: int, deadline: float) -> Optional[str]:
         """Poll for a peer's advertisement. ``check``, never ``get``.
 
