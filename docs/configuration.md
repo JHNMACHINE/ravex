@@ -1120,8 +1120,27 @@ answer they give flat, up to the order of the additions. A node whose delegate
 cannot serve the result takes it from another region's delegate - over the slow
 link, for that round - and stops and rejoins only if none answers. Every node
 of the run sets a region, or none does; with none the round is the flat one.
-It pays from two nodes per region up: with one node per region the delegate is
-that node, and the round is the flat one plus a step.
+
+**When it pays, measured - and when it does not.** The round over regions
+cuts what crosses regions and pays for it in time: its three steps run one
+after the other, where the flat round fetches from every peer at once. On
+2026-10-02, four RunPod boxes, two in Romania and two in North America
+(Montreal and North Carolina), 116 ms apart (GPU-143):
+
+| delta per node | flat round | over regions | bytes across the ocean, per round |
+| -- | -- | -- | -- |
+| 100 MB | 4.5 s | 8.3 s | 800 MB flat, 200 MB over regions |
+| 400 MB | 12 s | 17 s | 3.2 GB flat, 800 MB over regions |
+
+That link carried some 80 MB/s per node across the Atlantic, so the flat
+round's two crossings overlapped and cost little more than one. A region
+pays in time when a crossing costs more than twice a fetch within a region -
+on the 5-12 MB/s measured between the same continents in September, the same
+arithmetic puts a 400 MB round at about half the flat round's time - and the more
+nodes per region, the sooner: a flat node fetches every node outside its
+region, a delegate one aggregate per region. With one node per region it never
+pays: the delegate is that node, and the round is the flat one plus a step.
+Where bytes across regions are what is billed, it pays from the first round.
 
 **What `outer_inner_steps` costs the loss, measured.** A byte-level transformer
 on two contiguous shards, 2048 local steps per node, held-out loss: H=1 **2.69**,

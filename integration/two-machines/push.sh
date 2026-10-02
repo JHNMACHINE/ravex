@@ -97,7 +97,7 @@ echo "  RunPod:  not an interface at all — use <pod-id>.runpod.internal."
 for ((i = 0; i < NBOXES; i++)); do
     host="HOST$i"; port="PORT$i"
     echo "-- node $i (${!host}) --"
-    "${SSH[@]}" -p "${!port}" "${!host}"'hostname; ip -o -4 addr show | awk "{printf \"  %-8s %s\n\", \$2, \$4}"'
+    "${SSH[@]}" -p "${!port}" "${!host}" 'hostname; ip -o -4 addr show | awk "{printf \"  %-8s %s\n\", \$2, \$4}"'
 done
 echo
 echo "Then: bash addrs.sh <node0 address-or-name> <node1 address-or-name> [...]"
