@@ -114,7 +114,7 @@ def unshard(found, loader) -> Dict[str, Any]:
     if not ranks:
         raise ZeroUnsupported("no ZeRO optimizer shard was found in %s" % found.root)
 
-    shapes, step = _shapes_and_step(found, loader, os)
+    shapes, step, model_blob = _shapes_and_step(found, loader, os)
     if shapes is None:
         raise ZeroUnsupported(
             "no model state file in %s, so the parameter shapes are unknown - "
@@ -199,6 +199,7 @@ def unshard(found, loader) -> Dict[str, Any]:
     model: Dict[str, Any] = {}
     for index, parts in enumerate(groups):
         model.update(assemble(parts, index))
+    model = _with_the_rest_of_the_model(model, found, loader, os, stage, model_blob, notes)
 
     # The moments go through the identical assembly: they are partitioned the
     # same way as the weights, and that assembly is already proven bit-exact
@@ -460,8 +461,77 @@ def _shapes_and_step(found, loader, os):
         step = blob.get("global_steps")
         return [dict(group) for group in shapes], (
             int(step) if step is not None else None
-        )
-    return None, None
+        ), blob
+    return None, None, None
+
+
+def _with_the_rest_of_the_model(model, found, loader, os, stage, blob, notes):
+    """What the optimizer's partitions do not hold, added the way DeepSpeed does.
+
+    GPU-145. The partitions hold the parameters the optimizer steps, and a
+    model is more than that; ``zero_to_fp32`` adds three things from the model
+    files, and this reader once added none of them:
+
+    * **buffers** - BatchNorm's running statistics and the like, named in
+      ``buffer_names`` and saved in ``module``; cast to fp32 as
+      ``zero_to_fp32`` casts them;
+    * **frozen parameters** - ``requires_grad=False``, so in no optimizer
+      group: the base weights of a LoRA fine-tune. ``frozen_param_fragments``
+      holds them whole at stages 1 and 2, and at stage 3 each rank's model file
+      holds its piece of each, concatenated in rank order and cut to size;
+    * **tied parameters** - ``shared_params`` maps a name to the one it shares
+      storage with, saved once: GPT-2's ``lm_head.weight`` is
+      ``transformer.wte.weight``. Found on the first real model handed to this
+      reader, where the head was simply missing.
+
+    In ``zero_to_fp32``'s order - buffers, frozen, trained, tied - so a name in
+    two of them resolves as it does there.
+    """
+    if not blob:
+        return model
+    out: Dict[str, Any] = {}
+    names = blob.get("buffer_names") or ()
+    module = blob.get("module") or {}
+    for name in names:
+        if name in module and hasattr(module[name], "float"):
+            out[name] = module[name].float()
+
+    frozen_shapes = blob.get("frozen_param_shapes") or {}
+    if frozen_shapes:
+        if stage == 3:
+            from ravex._interop.foreign import _ZERO_MODEL_PER_RANK
+
+            per_rank = {}
+            for name in found.files:
+                match = _ZERO_MODEL_PER_RANK.match(name)
+                if match:
+                    per_rank[int(match.group(1))] = name
+            fragments = [
+                (loader(os.path.join(found.root, per_rank[r])).get("frozen_param_fragments") or {})
+                for r in sorted(per_rank)
+            ]
+            import torch
+
+            for name, shape in frozen_shapes.items():
+                pieces = [part[name].flatten() for part in fragments if name in part]
+                count = int(torch.Size(shape).numel())
+                out[name] = torch.cat(pieces).narrow(0, 0, count).view(shape)
+        else:
+            fragments = blob.get("frozen_param_fragments") or {}
+            for name in frozen_shapes:
+                if name in fragments:
+                    out[name] = fragments[name]
+        notes.append("%d frozen parameter(s), from the model file" % len(frozen_shapes))
+
+    out.update(model)
+    tied = blob.get("shared_params") or {}
+    for alias, source in tied.items():
+        if source in out:
+            out[alias] = out[source]
+    if tied:
+        notes.append("%d tied parameter(s): %s" % (
+            len(tied), ", ".join("%s = %s" % pair for pair in sorted(tied.items()))))
+    return out
 
 
 def _flat_partitions(osd, blob):

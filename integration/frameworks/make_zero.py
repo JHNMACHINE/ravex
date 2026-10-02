@@ -58,6 +58,23 @@ def main() -> None:
         help="stage 3: cut each rank's flat partition into sub-groups of this many elements, "
         "as DeepSpeed does past its default of 1e9 on a large model",
     )
+    parser.add_argument(
+        "--gpt2",
+        action="store_true",
+        help="GPT-2 medium (355M, random weights) instead of the stack of Linear layers: "
+        "a vocabulary of 50257 rows that no world size divides, and the embedding "
+        "tied to the output head",
+    )
+    parser.add_argument(
+        "--frozen",
+        action="store_true",
+        help="the first layer requires no grad, as a LoRA's base weights: in no optimizer group",
+    )
+    parser.add_argument(
+        "--batchnorm",
+        action="store_true",
+        help="a BatchNorm after each Linear: running statistics, which are buffers",
+    )
     args = parser.parse_args()
 
     import deepspeed
@@ -67,13 +84,26 @@ def main() -> None:
     deepspeed.init_distributed(dist_backend="nccl" if torch.cuda.is_available() else "gloo")
 
     torch.manual_seed(0)
-    model = nn.Sequential(
-        *[
-            layer
-            for _ in range(args.layers)
-            for layer in (nn.Linear(args.hidden, args.hidden), nn.ReLU())
-        ]
-    )
+    if args.gpt2:
+        from transformers import GPT2Config, GPT2LMHeadModel
+
+        model = GPT2LMHeadModel(GPT2Config(n_embd=1024, n_layer=24, n_head=16))
+    else:
+        model = nn.Sequential(
+            *[
+                layer
+                for _ in range(args.layers)
+                for layer in (
+                    (nn.Linear(args.hidden, args.hidden), nn.BatchNorm1d(args.hidden), nn.ReLU())
+                    if args.batchnorm
+                    else (nn.Linear(args.hidden, args.hidden), nn.ReLU())
+                )
+            ]
+        )
+    if args.frozen:
+        first = model.transformer.h[0] if args.gpt2 else model[0]
+        for parameter in first.parameters():
+            parameter.requires_grad_(False)
 
     zero = {"stage": args.stage}
     if args.sub_group_size:
@@ -90,21 +120,28 @@ def main() -> None:
         "wall_clock_breakdown": False,
     }
 
+    trained = [p for p in model.parameters() if p.requires_grad]
     if args.groups == 2:
         parameters = [
-            {"params": [p for p in model.parameters() if p.ndim > 1], "weight_decay": 0.01},
-            {"params": [p for p in model.parameters() if p.ndim <= 1], "weight_decay": 0.0},
+            {"params": [p for p in trained if p.ndim > 1], "weight_decay": 0.01},
+            {"params": [p for p in trained if p.ndim <= 1], "weight_decay": 0.0},
         ]
     else:
-        parameters = model.parameters()
+        parameters = trained
     engine, _, _, _ = deepspeed.initialize(model=model, model_parameters=parameters, config=config)
 
     def batch():
         held = next(engine.module.parameters())
         return torch.randn(4, args.hidden).to(engine.device, dtype=torch.bfloat16 if args.bf16 else held.dtype)
 
+    def loss_of():
+        if args.gpt2:
+            tokens = torch.randint(0, model.config.vocab_size, (4, 64), device=engine.device)
+            return engine(input_ids=tokens, labels=tokens).loss.float()
+        return engine(batch()).float().sum()
+
     for _ in range(args.steps):
-        loss = engine(batch()).float().sum()
+        loss = loss_of()
         engine.backward(loss)
         engine.step()
 
@@ -118,7 +155,7 @@ def main() -> None:
     # earlier ones and checks. A moment reassembled onto the wrong parameter
     # has the right shape, plausible values, and fails that.
     if args.pair:
-        loss = engine(batch()).float().sum()
+        loss = loss_of()
         engine.backward(loss)
         engine.step()
         engine.save_checkpoint(args.out, tag="step4")

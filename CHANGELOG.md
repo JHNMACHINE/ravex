@@ -36,6 +36,13 @@
   `convert_foreign` nor `ravex export` would take it. Checked against
   `zero_to_fp32` at stages 1, 2 and 3, with two parameter groups and with
   stage 3 cut into sub-groups.
+- **A DeepSpeed checkpoint reads back as the whole model (GPU-145).** The
+  ZeRO reader returned the parameters the optimizer steps and nothing else:
+  no buffers (BatchNorm's running statistics), no frozen parameters (a LoRA's
+  base weights), and no tied ones - GPT-2's `lm_head.weight`, the first real
+  model tried, came back missing. All three are now added as `zero_to_fp32`
+  adds them, and checked bit for bit against it on GPT-2 medium at stages 1,
+  2 and 3.
 
 ## 0.5.0 — 2026-09-30
 

@@ -425,3 +425,76 @@ def test_a_checkpoint_with_no_optimizer_state_still_gives_the_weights(tmp_path):
     assert got["optimizer"]["state"] == {}
     for name, tensor in whole_tensors().items():
         assert torch.equal(got["model"][name], tensor), name
+
+
+# ── what the partitions do not hold (GPU-145) ───────────────────────────────
+
+
+def with_model_file(found, loader, **extra):
+    """The same checkpoint, its model file(s) carrying ``extra`` as well."""
+
+    def serve(path):
+        blob = loader(path)
+        if "model_states" in path:
+            blob = dict(blob, **(extra(path) if callable(extra) else extra))
+        return blob
+
+    return found, serve
+
+
+@pytest.mark.parametrize("stage", [1, 3])
+def test_a_tied_parameter_comes_back_under_both_names(stage, tmp_path):
+    """GPT-2's head is its embedding, saved once; it was missing here."""
+    found, loader = with_model_file(*checkpoint(stage, 2, tmp_path), shared_params={"head.weight": "b.weight"})
+    got = unshard(found, loader)
+    assert torch.equal(got["model"]["head.weight"], whole_tensors()["b.weight"])
+    assert any("tied" in note for note in got["notes"])
+
+
+def test_buffers_come_from_the_module_as_fp32(tmp_path):
+    """BatchNorm's running statistics are in no optimizer group."""
+    running = torch.arange(HIDDEN, dtype=torch.bfloat16)
+    found, loader = with_model_file(
+        *checkpoint(2, 2, tmp_path),
+        buffer_names=["norm.running_mean"],
+        module={"norm.running_mean": running, "a.weight": torch.zeros(HIDDEN, HIDDEN)},
+    )
+    got = unshard(found, loader)
+    assert got["model"]["norm.running_mean"].dtype == torch.float32
+    assert torch.equal(got["model"]["norm.running_mean"], running.float())
+    # The module's own copy of a trained parameter never wins over the master.
+    assert torch.equal(got["model"]["a.weight"], whole_tensors()["a.weight"])
+
+
+def test_frozen_parameters_at_stages_one_and_two_are_whole(tmp_path):
+    base = torch.arange(12, dtype=torch.float32).view(3, 4)
+    found, loader = with_model_file(
+        *checkpoint(1, 2, tmp_path),
+        frozen_param_shapes={"base.weight": torch.Size([3, 4])},
+        frozen_param_fragments={"base.weight": base},
+    )
+    got = unshard(found, loader)
+    assert torch.equal(got["model"]["base.weight"], base)
+
+
+def test_frozen_parameters_at_stage_three_are_joined_across_ranks(tmp_path):
+    """Each rank's model file holds its piece, padded to an equal length."""
+    base = torch.arange(15, dtype=torch.float32).view(3, 5)
+    padded = torch.cat([base.flatten(), torch.zeros(1)])
+    found, loader = checkpoint(3, 2, tmp_path)
+    found.files = sorted(found.files + ["zero_pp_rank_1_mp_rank_00_model_states.pt"])
+
+    def serve(path):
+        rank = 1 if "rank_1_" in path else 0
+        if "model_states" in path:
+            return dict(
+                model_file(),
+                frozen_param_shapes={"base.weight": torch.Size([3, 5])},
+                frozen_param_fragments={"base.weight": padded[rank * 8:(rank + 1) * 8]},
+            )
+        return loader(path)
+
+    got = unshard(found, serve)
+    assert torch.equal(got["model"]["base.weight"], base)
+    for name, tensor in whole_tensors().items():
+        assert torch.equal(got["model"][name], tensor), name
