@@ -20,12 +20,14 @@ rather than by hoping: if they go, :func:`read` goes through
 ``dcp_to_torch_save`` and a temporary file instead. Slower, and the point is
 that it still answers.
 
-**What this does not do is reshape anything.** A DCP checkpoint written by a
-job with tensor or pipeline parallelism records how the pieces of each tensor
-were laid out, and the metadata says so; turning that into a different
-parallelism is the same class of problem as :mod:`ravex._dist.reshard` and is not
-attempted here. What comes back is what the checkpoint holds, in the structure
-it was saved in.
+**Tensor and pipeline parallelism need nothing here.** A job with TP or PP
+saves every piece as a chunk of one global tensor, at its offset, and DCP's
+planner puts the chunks back together: checked against Megatron's own loader
+at TP and PP up to 2 x 2 (``integration/frameworks/probe_megatron.py``,
+GPU-145), every piece equal. What this does not do is rename anything. What
+comes back is what the checkpoint holds, in the structure it was saved in -
+for Megatron, a block's layers stacked into one tensor with the layer as the
+first axis, under Megatron's names rather than a module's.
 """
 
 from __future__ import annotations

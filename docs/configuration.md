@@ -196,7 +196,18 @@ What comes across and what does not:
 
 - **Weights and optimizer moments**, matched by parameter name. Verified
   bit-exact against DeepSpeed's own `zero_to_fp32` across ZeRO stages 1, 2 and
-  3 at several world sizes.
+  3 at several world sizes, in fp32 and in bf16 (where the fp32 masters in the
+  optimizer are what comes across, not the bf16 copy in the module), with the
+  parameters split into groups, and with stage 3 cut into sub-groups as a
+  large model is.
+- **A Megatron checkpoint at any tensor and pipeline parallelism** reads whole:
+  every tensor comes back as Megatron's own loader reassembles it, checked at
+  TP and PP up to 2 x 2. Under Megatron's names, though, and those are not a
+  module's: Megatron saves a block's layers as **one tensor with the layer as
+  its first axis** (`decoder.layers.mlp.linear_fc1.weight`, shape
+  `[layers, ...]`) and renames a few on the way (the input norm is saved as
+  `linear_qkv.layer_norm_weight`). A model that names its layers one by one
+  does not match them, and the conversion says which names it could not place.
 - **Not the step count's meaning, the data order, or the RNG.** A foreign
   checkpoint carries no Ravex sampler position and no per-rank generator state.
   The model continues; the run does not.
