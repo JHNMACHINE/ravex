@@ -2,7 +2,10 @@
 # GPU-90: a plain PyTorch script resumes from a DeepSpeed checkpoint, with no
 # code of its own to make that happen.
 #
-#   bash check_resume_conversion.sh [stage] [world] [hidden]
+#   bash check_resume_conversion.sh [stage] [world] [hidden] [make_zero flags]
+#
+# The flags go to make_zero.py as they are: "--bf16 --groups 2" is a job in
+# mixed precision with decay split from the biases (GPU-145).
 #
 # Everything the earlier checks prove happens inside a function somebody calls.
 # This one proves the thing the feature is actually for: a `ravex.yaml`, a
@@ -21,6 +24,7 @@ set -uo pipefail
 STAGE="${1:-1}"
 WORLD="${2:-2}"
 HIDDEN="${3:-97}"
+EXTRA="${4:-}"
 LAYERS=3
 ROOT=/tmp/convert_resume
 KIT=/app/integration/frameworks
@@ -30,7 +34,7 @@ rm -rf "$ROOT"; mkdir -p "$ROOT/run"
 echo "-- a DeepSpeed ZeRO stage $STAGE checkpoint over $WORLD ranks --"
 torchrun --nproc-per-node="$WORLD" --master-port=38001 \
     "$KIT/make_zero.py" --stage "$STAGE" --hidden "$HIDDEN" --layers "$LAYERS" \
-    --out "$ROOT/zero" >/dev/null 2>&1 \
+    --out "$ROOT/zero" $EXTRA >/dev/null 2>&1 \
     || { echo "  ** could not produce the checkpoint **"; exit 1; }
 ls "$ROOT/zero" | sed 's/^/     /'
 

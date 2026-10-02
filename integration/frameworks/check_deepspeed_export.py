@@ -71,6 +71,9 @@ def main() -> int:
     parser.add_argument("--stage", type=int, default=2, choices=[1, 2, 3])
     parser.add_argument("--out", required=True)
     parser.add_argument("--positional", action="store_true")
+    # Mixed precision on the resuming side (GPU-145): bf16 in the module, and
+    # the fp32 masters the export writes are what its optimizer must hold.
+    parser.add_argument("--bf16", action="store_true")
     args = parser.parse_args()
 
     import deepspeed
@@ -79,7 +82,7 @@ def main() -> int:
     from ravex._interop.foreign import confirm_stage, identify
     from ravex._interop.zero import unshard
 
-    deepspeed.init_distributed(dist_backend="gloo")
+    deepspeed.init_distributed(dist_backend="nccl" if torch.cuda.is_available() else "gloo")
     rank, world = dist.get_rank(), dist.get_world_size()
     data = batches(4)
     config = {
@@ -92,9 +95,13 @@ def main() -> int:
         "optimizer": {"type": "Adam", "params": {"lr": LR, "adam_w_mode": False}},
         "zero_optimization": {"stage": args.stage},
         "fp16": {"enabled": False},
-        "bf16": {"enabled": False},
+        "bf16": {"enabled": args.bf16},
     }
     universal = dict(config, checkpoint={"load_universal": True})
+
+    def fed(engine, x):
+        """A batch where the engine holds its module, in the module's dtype."""
+        return engine(x.to(engine.device, dtype=torch.bfloat16 if args.bf16 else torch.float32)).float().sum()
 
     def engine_from(directory):
         model = build()
@@ -148,7 +155,7 @@ def main() -> int:
         native = build()
         trained, _, _, _ = deepspeed.initialize(model=native, model_parameters=native.parameters(), config=config)
         for x in data[:3]:
-            trained.backward(trained(x).sum())
+            trained.backward(fed(trained, x))
             trained.step()
         theirs_dir, ours_dir = os.path.join(args.out, "native"), os.path.join(args.out, "ours")
         trained.save_checkpoint(theirs_dir, tag="step3")
@@ -179,9 +186,9 @@ def main() -> int:
         results = []
         for directory in (theirs_dir, ours_dir):
             resumed = engine_from(directory)
-            resumed.backward(resumed(data[3]).sum())
+            resumed.backward(fed(resumed, data[3]))
             resumed.step()
-            results.append({n: p.detach().clone() for n, p in resumed.module.named_parameters()})
+            results.append({n: p.detach().cpu().clone() for n, p in resumed.module.named_parameters()})
         for name in results[0]:
             if not torch.equal(results[0][name], results[1][name]):
                 failures.append(
@@ -193,7 +200,8 @@ def main() -> int:
     dist.all_gather_object(report, failures)
     if rank == 0:
         merged = sorted(set(f for part in report for f in part))
-        label = "stage %d, %d rank(s)%s" % (args.stage, world, ", positional optimizer" if args.positional else "")
+        label = "stage %d, %d rank(s)%s%s" % (
+            args.stage, world, ", positional optimizer" if args.positional else "", ", bf16" if args.bf16 else "")
         if merged:
             print("FAIL %s:" % label)
             for line in merged[:12]:

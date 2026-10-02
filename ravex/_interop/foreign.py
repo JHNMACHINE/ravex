@@ -39,9 +39,12 @@ from typing import List, Optional
 
 #: ``zero_pp_rank_<dp>_mp_rank_<mp>_optim_states.pt`` — one per data-parallel
 #: rank. The ``mp_rank`` half is the tensor/pipeline coordinate and is ``00``
-#: for a job that is only data-parallel.
+#: for a job that is only data-parallel. A job in bf16 writes the same files
+#: prefixed ``bf16_`` (DeepSpeed's ``_get_zero_ckpt_prefix``), and only these:
+#: its model files keep their names. Found by the first bf16 checkpoint read
+#: (GPU-145), which identified as nothing at all.
 _ZERO_OPTIM = re.compile(
-    r"^zero_pp_rank_(\d+)_mp_rank_(\d+)_optim_states\.pt$"
+    r"^(?:bf16_)?zero_pp_rank_(\d+)_mp_rank_(\d+)_optim_states\.pt$"
 )
 #: ``mp_rank_<mp>_model_states.pt`` at stages 1 and 2, where the parameters are
 #: replicated and one copy is written; ``zero_pp_rank_<dp>_mp_rank_<mp>_model_

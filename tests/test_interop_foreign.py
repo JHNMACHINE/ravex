@@ -79,6 +79,28 @@ def test_zero_stage_three_is_visible_in_the_layout(tmp_path):
     assert found.world_size == 2
 
 
+def test_a_bf16_checkpoint_is_recognised(tmp_path):
+    """bf16 prefixes the optimizer shards and leaves the model files alone.
+
+    Transcribed from ``make_zero.py --bf16`` (DeepSpeed 0.19.7, 2026-10-02),
+    the first bf16 checkpoint the reader was handed - which it identified as
+    nothing at all (GPU-145).
+    """
+    root = tree(
+        tmp_path / "bf16",
+        "step3/mp_rank_00_model_states.pt",
+        "step3/bf16_zero_pp_rank_0_mp_rank_00_optim_states.pt",
+        "step3/bf16_zero_pp_rank_1_mp_rank_00_optim_states.pt",
+    )
+    with open(os.path.join(root, "latest"), "w", encoding="utf-8") as handle:
+        handle.write("step3")
+
+    found = identify(root)
+    assert found.format == "deepspeed"
+    assert found.world_size == 2
+    assert "bf16_zero_pp_rank_1_mp_rank_00_optim_states.pt" in found.files
+
+
 def test_a_tag_directory_on_its_own_is_still_recognised(tmp_path):
     """What someone copies out when they want one step, without the `latest`."""
     root = tree(

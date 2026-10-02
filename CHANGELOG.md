@@ -28,6 +28,15 @@
   weights and moments equal by name after DeepSpeed resumes and saves again,
   and the next step identical to the one from DeepSpeed's own converter.
 
+### Fixed
+
+- **A DeepSpeed checkpoint saved in bf16 is recognised (GPU-145).** DeepSpeed
+  names its optimizer shards `bf16_zero_pp_rank_*` when bf16 is on, and the
+  reader identified such a checkpoint as nothing at all - so neither
+  `convert_foreign` nor `ravex export` would take it. Checked against
+  `zero_to_fp32` at stages 1, 2 and 3, with two parameter groups and with
+  stage 3 cut into sub-groups.
+
 ## 0.5.0 — 2026-09-30
 
 ### Added

@@ -38,11 +38,33 @@ def main() -> None:
         action="store_true",
         help="also save one step later, for the Adam-consistency check",
     )
+    # What a real job's checkpoint has and a small fp32 one does not (GPU-145).
+    parser.add_argument(
+        "--bf16",
+        action="store_true",
+        help="mixed precision: bf16 weights in the module, fp32 masters in the optimizer",
+    )
+    parser.add_argument(
+        "--groups",
+        type=int,
+        default=1,
+        choices=[1, 2],
+        help="2: weights with decay and biases without, as Hugging Face's Trainer splits them",
+    )
+    parser.add_argument(
+        "--sub-group-size",
+        type=int,
+        default=None,
+        help="stage 3: cut each rank's flat partition into sub-groups of this many elements, "
+        "as DeepSpeed does past its default of 1e9 on a large model",
+    )
     args = parser.parse_args()
 
     import deepspeed
 
-    deepspeed.init_distributed(dist_backend="gloo")
+    # NCCL where there is a GPU: the backend a real job's partitions were
+    # made under, and the only one DeepSpeed's CUDA path takes.
+    deepspeed.init_distributed(dist_backend="nccl" if torch.cuda.is_available() else "gloo")
 
     torch.manual_seed(0)
     model = nn.Sequential(
@@ -53,24 +75,36 @@ def main() -> None:
         ]
     )
 
+    zero = {"stage": args.stage}
+    if args.sub_group_size:
+        zero["sub_group_size"] = args.sub_group_size
     config = {
         "train_micro_batch_size_per_gpu": 4,
         "gradient_accumulation_steps": 1,
         "optimizer": {"type": "Adam", "params": {"lr": 0.001}},
-        "zero_optimization": {"stage": args.stage},
-        # fp32 throughout: the point here is the *layout* of a ZeRO
+        "zero_optimization": zero,
+        # fp32 unless asked: the first point here was the *layout* of a ZeRO
         # checkpoint, and a CPU box has no bf16 story worth trusting.
         "fp16": {"enabled": False},
-        "bf16": {"enabled": False},
+        "bf16": {"enabled": args.bf16},
         "wall_clock_breakdown": False,
     }
 
-    engine, _, _, _ = deepspeed.initialize(
-        model=model, model_parameters=model.parameters(), config=config
-    )
+    if args.groups == 2:
+        parameters = [
+            {"params": [p for p in model.parameters() if p.ndim > 1], "weight_decay": 0.01},
+            {"params": [p for p in model.parameters() if p.ndim <= 1], "weight_decay": 0.0},
+        ]
+    else:
+        parameters = model.parameters()
+    engine, _, _, _ = deepspeed.initialize(model=model, model_parameters=parameters, config=config)
+
+    def batch():
+        held = next(engine.module.parameters())
+        return torch.randn(4, args.hidden).to(engine.device, dtype=torch.bfloat16 if args.bf16 else held.dtype)
 
     for _ in range(args.steps):
-        loss = engine(torch.randn(4, args.hidden)).sum()
+        loss = engine(batch()).float().sum()
         engine.backward(loss)
         engine.step()
 
@@ -84,7 +118,7 @@ def main() -> None:
     # earlier ones and checks. A moment reassembled onto the wrong parameter
     # has the right shape, plausible values, and fails that.
     if args.pair:
-        loss = engine(torch.randn(4, args.hidden)).sum()
+        loss = engine(batch()).float().sum()
         engine.backward(loss)
         engine.step()
         engine.save_checkpoint(args.out, tag="step4")
