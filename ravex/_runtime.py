@@ -3161,6 +3161,16 @@ class RavexRuntime:
                 )
                 self._exchange = None
             self._close_region_exchanges(min(60.0, float(self.config.outer_deadline)))
+            if self.store_for_joins is not None and self._outer is not None:
+                # Done for good: said on the rendezvous, so a node still trying
+                # to join learns there is nobody left to take it in rather than
+                # waiting out its deadline on a run that has ended (GPU-186).
+                try:
+                    from ravex._dist.membership import leave
+
+                    leave(self.store_for_joins, int(self._outer.node), self._outer.round_number)
+                except Exception as exc:
+                    logger.debug("Could not say this node has left: %s", exc)
             logger.info("Ravex shutdown complete at step %d", self.registry.step_count)
         except Exception as exc:
             logger.warning("Shutdown error: %s", exc)

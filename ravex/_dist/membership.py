@@ -494,8 +494,22 @@ def join(store, exchange, loop, rank: int, base_world: int, deadline: float,
     members = [peer for peer in range(base_world) if peer != rank]
     want_in(store, rank)
     announced_at: Optional[int] = None
+    looked_for_members = 0.0
 
     while time.monotonic() < deadline:
+        # A run every member has left - finished, every one of them - has
+        # nobody to take this node in, and waiting would last the whole
+        # deadline: on rented machines, fifteen minutes billed for a node
+        # alone (GPU-186). Asked once a second, not at every poll.
+        if members and time.monotonic() - looked_for_members >= 1.0:
+            looked_for_members = time.monotonic()
+            if all(has_left(store, member) for member in members):
+                logger.warning(
+                    "Every member of the run has left it; there is nobody to "
+                    "join. Giving up rather than waiting out the deadline."
+                )
+                break
+
         observed = state_round(store)
         if observed is None:
             time.sleep(poll)

@@ -381,3 +381,27 @@ def test_a_joiner_publishes_nothing_until_every_member_acknowledged(tmp_path):
         assert [report["nodes"] for report in member.reports] == (
             [BASE_WORLD] * len(member.reports)
         )
+
+
+def test_a_run_every_member_has_left_is_not_waited_for():
+    """A node rejoining a run whose nodes have all finished gives up at once.
+
+    On rented machines it waited out its whole deadline - fifteen minutes,
+    billed - for members that had ended and would never take it in (GPU-186).
+    """
+    store = FakeStore()
+    for member in range(BASE_WORLD):
+        _membership.leave(store, member, 7)
+    began = time.monotonic()
+    assert not _membership.join(store, None, None, BASE_WORLD, BASE_WORLD, time.monotonic() + 60)
+    assert time.monotonic() - began < 5
+
+
+def test_one_member_still_there_is_waited_for():
+    store = FakeStore()
+    for member in range(1, BASE_WORLD):
+        _membership.leave(store, member, 7)
+    began = time.monotonic()
+    # Nobody serves the run's state, so it waits to its (short) deadline.
+    assert not _membership.join(store, None, None, BASE_WORLD, BASE_WORLD, time.monotonic() + 2)
+    assert time.monotonic() - began >= 2

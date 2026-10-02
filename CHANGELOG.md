@@ -30,6 +30,12 @@
 
 ### Fixed
 
+- **A node does not wait to join a run that has ended (GPU-186).** A node
+  finishing its training now says on the rendezvous that it has left, and a
+  node trying to (re)join gives up as soon as every member has - it used to
+  wait out `outer_deadline`, fifteen minutes by default, for members that
+  would never take it in. Seen on four rented machines, where it kept a node
+  billed after the run was over.
 - **A DeepSpeed checkpoint saved in bf16 is recognised (GPU-145).** DeepSpeed
   names its optimizer shards `bf16_zero_pp_rank_*` when bf16 is on, and the
   reader identified such a checkpoint as nothing at all - so neither
