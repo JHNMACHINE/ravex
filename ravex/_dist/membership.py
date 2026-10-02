@@ -375,6 +375,23 @@ def leave(store, rank: int, round_number: int) -> None:
     store.set(LEFT_KEY % rank, json.dumps(int(round_number)).encode("utf-8"))
 
 
+class RunOver(BaseException):
+    """The run ended while this node was out of it (GPU-186).
+
+    Raised from inside the training loop when a node that left to rejoin
+    finds every member has left the run - finished. Nothing went wrong: there
+    is no run left to train in, and ``ravex.train_loop`` ends the training
+    there and records it as finished. A ``BaseException``, like
+    ``KeyboardInterrupt``, so a script's own ``except Exception`` around its
+    step does not swallow it and train on alone.
+    """
+
+
+def everyone_left(store, members) -> bool:
+    """Whether every one of ``members`` has said it left the run for good."""
+    return bool(members) and all(has_left(store, member) for member in members)
+
+
 def has_left(store, rank: int) -> bool:
     try:
         return bool(store.check([LEFT_KEY % rank]))
@@ -503,7 +520,7 @@ def join(store, exchange, loop, rank: int, base_world: int, deadline: float,
         # alone (GPU-186). Asked once a second, not at every poll.
         if members and time.monotonic() - looked_for_members >= 1.0:
             looked_for_members = time.monotonic()
-            if all(has_left(store, member) for member in members):
+            if everyone_left(store, members):
                 logger.warning(
                     "Every member of the run has left it; there is nobody to "
                     "join. Giving up rather than waiting out the deadline."

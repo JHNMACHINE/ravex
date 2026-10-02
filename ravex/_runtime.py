@@ -1074,6 +1074,7 @@ class RavexRuntime:
             # Training rounds start after the seed round, which used number 0.
             loop.round_number = SEED_ROUND + 1
         self._outer_peers = self._membership.peers_at(loop.round_number)
+        self._say_who_is_unreachable(exchange, self._outer_peers)
         logger.info(
             "Outer loop on: %s, %d inner step(s) per round%s, reports staged "
             "in %s.",
@@ -1087,6 +1088,32 @@ class RavexRuntime:
             root,
         )
         return loop
+
+    def _say_who_is_unreachable(self, exchange, peers) -> None:
+        """Warn, at the start, about every peer this node cannot connect to.
+
+        It changes nothing about the run - a round closes over whoever
+        answered either way - but it says *why* a node will be left out, and
+        says it before the first round rather than as a peer that seemed slow
+        (GPU-186).
+        """
+        try:
+            missing = exchange.unreachable(peers)
+        except Exception as exc:
+            logger.debug("Could not check which peers are reachable: %s", exc)
+            return
+        for peer, address in sorted(missing.items()):
+            if address is None:
+                logger.warning(
+                    "Node %s has not said where it listens: it may still be "
+                    "starting, or it never reached the rendezvous.", peer,
+                )
+            else:
+                logger.warning(
+                    "This node cannot connect to node %s at %s. Every round "
+                    "will close without one of the two: the network between "
+                    "them does not carry it.", peer, address,
+                )
 
     def _open_exchange(self, rank, store, root):
         from ravex._dist import rendezvous as _rendezvous
@@ -1245,6 +1272,13 @@ class RavexRuntime:
             window=membership.span(),
         ):
             exchange.close()
+            from ravex._dist.membership import RunOver, everyone_left
+
+            if everyone_left(store, [peer for peer in range(base) if peer != node]):
+                # Not a failure: the others finished while this node was out.
+                raise RunOver(
+                    "the run ended while node %d was out of it; every member has finished" % old
+                ) from cause
             raise cause
         membership.take_in_joined()
         self._membership = membership

@@ -405,3 +405,25 @@ def test_one_member_still_there_is_waited_for():
     # Nobody serves the run's state, so it waits to its (short) deadline.
     assert not _membership.join(store, None, None, BASE_WORLD, BASE_WORLD, time.monotonic() + 2)
     assert time.monotonic() - began >= 2
+
+
+def test_a_run_that_ended_while_this_node_was_out_finishes_the_training(tmp_path, monkeypatch):
+    """`RunOver` ends the training as finished, not as a failure (GPU-186)."""
+    import ravex
+
+    monkeypatch.chdir(tmp_path)
+    steps = []
+
+    @ravex.train_loop(storage={"type": "local", "path": str(tmp_path / "store")}, checkpoint_every=10 ** 9)
+    def train():
+        steps.append(1)
+        raise _membership.RunOver("the run ended while node 2 was out of it; every member has finished")
+
+    assert train() is None
+    assert steps == [1]
+
+
+def test_a_script_catching_exceptions_does_not_swallow_run_over():
+    """A BaseException, like KeyboardInterrupt: a script's own `except
+    Exception` around its step must not catch it and train on alone."""
+    assert not issubclass(_membership.RunOver, Exception)

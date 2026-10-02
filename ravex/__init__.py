@@ -36,8 +36,11 @@ underneath code that does not know about it.
 from __future__ import annotations
 
 import functools
+import logging
 from collections.abc import Mapping
 from typing import Any, Callable, Optional, TypeVar
+
+from ravex._dist.membership import RunOver as _RunOver
 
 #: The version, written here and in ``Cargo.toml``, which is what maturin builds
 #: the wheel from. Two places, because maturin has no equivalent of setuptools'
@@ -136,6 +139,16 @@ def train_loop(
             _activate(**overrides)
             try:
                 return function(*args, **kwargs)
+            except _RunOver as over:
+                # The run ended while this node was out of it (GPU-186): the
+                # training stops here, as the others' did, and it finished.
+                from ravex._runtime import get_runtime
+
+                logging.getLogger("ravex").warning("Stopping: %s.", over)
+                runtime = get_runtime(create=False)
+                if runtime is not None:
+                    runtime.exit_state = "finished"
+                return None
             except BaseException as exc:
                 # So `status.json`, and the dashboard reading it, says how the
                 # run ended rather than that it finished.
