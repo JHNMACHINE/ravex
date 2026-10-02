@@ -1417,6 +1417,20 @@ class RavexRuntime:
             report.get("recover_seconds", 0.0),
             report.get("apply_seconds", 0.0),
         )
+        if report.get("region") is not None:
+            # A round over regions (GPU-143): of the network seconds above,
+            # only the gather within this node's region; what the regions
+            # cost is said here, apart.
+            logger.info(
+                "Outer round %d over regions %s: this node in %r, delegate rank %s; "
+                "%.1fs between regions (%.1fs of it waiting for another region).",
+                report["round"],
+                ",".join(report.get("regions") or []) or "-",
+                report["region"],
+                report.get("delegate"),
+                report.get("between_seconds", 0.0),
+                report.get("between_wait_seconds", 0.0),
+            )
         self._write_model_series(report, time.monotonic() - started)
 
     def _write_model_series(self, report: Dict[str, Any], seconds: float) -> None:

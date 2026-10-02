@@ -185,6 +185,9 @@ class TestTheRound:
             assert report["delegate"] == (0 if REGIONS[rank] == "eu" else 2)
             assert loops[rank].round_number == 2
             assert loops[rank].model_steps == sum(STEPS.values())
+            # What the regions cost is reported apart from the region's gather.
+            assert report["between_seconds"] >= 0.0
+            assert report["between_wait_seconds"] >= 0.0
 
     def test_only_delegates_cross_regions(self, opened, monkeypatch):
         nodes = {rank: opened(rank) for rank in REGIONS}

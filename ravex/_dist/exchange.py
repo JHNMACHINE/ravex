@@ -657,6 +657,10 @@ def close_round_regions(loop, region: str, exchanges: Dict[str, "DeltaExchange"]
     combined = None
     result_extra: Dict[str, Any] = {}
     delegates_seen: List[int] = []
+    # The seconds the round over regions adds to the flat one: for a delegate,
+    # its round among the delegates - the one that crosses regions; for a
+    # member, waiting for the result. The number GPU-143 is measured by.
+    between = time.monotonic()
     if delegate == rank:
         # 2. Between regions, among the delegates.
         summed, tally = partial(inner["contributions"], loop.combine_mode)
@@ -740,6 +744,7 @@ def close_round_regions(loop, region: str, exchanges: Dict[str, "DeltaExchange"]
         if not result_extra.get("empty"):
             combined = got.delta
 
+    between = time.monotonic() - between
     applying = time.monotonic()
     if combined is not None:
         nodes = result_extra.get("nodes") or []
@@ -768,6 +773,8 @@ def close_round_regions(loop, region: str, exchanges: Dict[str, "DeltaExchange"]
             "region": region,
             "delegate": delegate,
             "regions": result_extra.get("regions") or [],
+            "between_seconds": between,
+            "between_wait_seconds": upper.gather_wait if delegate == rank else 0.0,
             "publish_seconds": inner["publish_seconds"],
             "publish_wait_seconds": local.publish_wait,
             "gather_seconds": inner["gather_seconds"],
