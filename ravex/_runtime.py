@@ -205,6 +205,9 @@ class RavexRuntime:
         #: uses ``_exchange`` alone; with regions ``_exchange`` stays open for
         #: the joins it serves.
         self._region_exchanges: Optional[Dict[str, Any]] = None
+        #: The last round over regions' report: who fetches from which
+        #: exchange, for the linger when they close.
+        self._last_region_report: Optional[Dict[str, Any]] = None
         self._outer_peers: List[int] = []
         #: Who is in the run, evaluated per round. None until the outer loop is
         #: built, because it needs the rendezvous store the exchange takes its
@@ -1155,9 +1158,22 @@ class RavexRuntime:
     def _close_region_exchanges(self, linger: float) -> None:
         if not self._region_exchanges:
             return
-        for exchange in self._region_exchanges.values():
+        # Each waits for the peers that fetch from it, and only those. Waiting
+        # on every peer of the run, as the flat exchange does, held each of
+        # the three for the whole linger - nobody outside a region fetches
+        # from its exchange - and a node took four minutes to leave a run on
+        # four real machines (GPU-143).
+        report = self._last_region_report or {}
+        rank = next(iter(self._region_exchanges.values())).rank
+        mates = [m for m in report.get("region_members") or [] if m != rank]
+        expect = {
+            "region": mates,
+            "delegates": [d for d in report.get("delegates") or [] if d != rank],
+            "results": mates if report.get("delegate") == rank else [],
+        }
+        for role, exchange in self._region_exchanges.items():
             try:
-                exchange.close(linger=linger, expect=self._outer_peers)
+                exchange.close(linger=linger, expect=expect.get(role) or None)
             except Exception:
                 pass
         self._region_exchanges = None
@@ -1418,6 +1434,7 @@ class RavexRuntime:
             report.get("apply_seconds", 0.0),
         )
         if report.get("region") is not None:
+            self._last_region_report = report
             # A round over regions (GPU-143): of the network seconds above,
             # only the gather within this node's region; what the regions
             # cost is said here, apart.
@@ -3138,7 +3155,9 @@ class RavexRuntime:
                 # contributor short - see `DeltaExchange.close`.
                 self._exchange.close(
                     linger=min(60.0, float(self.config.outer_deadline)),
-                    expect=self._outer_peers,
+                    # Over regions no round goes through this one - it
+                    # serves joins - so there is no last report to wait on.
+                    expect=None if self._region_exchanges else self._outer_peers,
                 )
                 self._exchange = None
             self._close_region_exchanges(min(60.0, float(self.config.outer_deadline)))

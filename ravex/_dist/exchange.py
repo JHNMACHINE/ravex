@@ -773,6 +773,11 @@ def close_round_regions(loop, region: str, exchanges: Dict[str, "DeltaExchange"]
             "region": region,
             "delegate": delegate,
             "regions": result_extra.get("regions") or [],
+            # Who fetches from which of this node's exchanges, for the linger
+            # on the way out: a region's nodes from the region's exchange and
+            # from their delegate's results, the delegates from each other.
+            "region_members": sorted(int(m) for m in inner["members"]),
+            "delegates": sorted(delegates_seen + [rank]) if delegate == rank else [],
             "between_seconds": between,
             "between_wait_seconds": upper.gather_wait if delegate == rank else 0.0,
             "publish_seconds": inner["publish_seconds"],

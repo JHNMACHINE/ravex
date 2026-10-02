@@ -188,6 +188,9 @@ class TestTheRound:
             # What the regions cost is reported apart from the region's gather.
             assert report["between_seconds"] >= 0.0
             assert report["between_wait_seconds"] >= 0.0
+            # Who fetches from which exchange, for the linger on the way out.
+            assert report["region_members"] == [r for r in REGIONS if REGIONS[r] == REGIONS[rank]]
+            assert report["delegates"] == ([0, 2] if rank in (0, 2) else [])
 
     def test_only_delegates_cross_regions(self, opened, monkeypatch):
         nodes = {rank: opened(rank) for rank in REGIONS}
