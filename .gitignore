@@ -29,3 +29,6 @@ ravex/_core*.pyd
 # Debug symbols maturin leaves beside the extension on Windows.
 ravex/*.pdb
 ravex/_core*.so
+
+# Notes for the agent working here: kept local, not published.
+CLAUDE.md
