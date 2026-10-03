@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Wheels for Python 3.14t, the free-threaded build (GPU-189).** The
+  extension declares itself safe without the GIL, so importing it on 3.14t
+  leaves the GIL off; until now a 3.14t install had no wheel to pick and
+  compiled from the source distribution, which needs a Rust toolchain. CI
+  runs the test suite on 3.14t as well.
+
 ## 0.6.0 — 2026-10-03
 
 ### Changed
