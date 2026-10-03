@@ -15,8 +15,10 @@
   everything that changes the binary: CPU, each GPU's compute capability,
   Python, torch with its CUDA, and the version of each library named with
   `--with`. It is stored whole beside the files and compared field by field
-  on every pull, so a machine with another key loads nothing. Only a
-  directory as the store for now; a bucket follows.
+  on every pull, so a machine with another key loads nothing. The store is
+  a directory or a bucket (`s3://bucket/prefix`, keys in
+  `RAVEX_CACHE_ACCESS_KEY`/`RAVEX_CACHE_SECRET_KEY`), reached through a SigV4
+  client in the compiled core copied from Moonclip's, `_core.S3Store`.
 
 - **Rounds over regions: `outer_region` (GPU-143).** With nodes in several
   regions, the round closes within each region first; one delegate per region

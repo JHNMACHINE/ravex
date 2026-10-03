@@ -18,6 +18,7 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod reshard;
+pub mod s3;
 pub mod transport;
 
 #[cfg(feature = "extension-module")]

@@ -28,6 +28,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyInt, PyList, PySet, PyTuple};
 
 use crate::reshard::{self, Homes, Piece, Placement, ReshardError};
+use crate::s3::{S3Config, S3Error, S3Storage, SINGLE_PUT_LIMIT};
 use crate::transport::{self, TransportError};
 
 create_exception!(
@@ -744,6 +745,73 @@ pub fn register_transport(module: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
+// ─── the cache's bucket (GPU-181) ───────────────────────────────────
+
+/// A bucket ``ravex cache`` reads and writes, through [`crate::s3`].
+///
+/// Three calls, the shape of ``ravex._cache.Store``, and every one of them
+/// releases the GIL: they are network round trips, and a node pulling a
+/// cache has nothing else for Python to do but it should not hold the
+/// interpreter for minutes either.
+#[pyclass(module = "ravex._core")]
+struct S3Store {
+    inner: S3Storage,
+}
+
+#[pymethods]
+impl S3Store {
+    #[new]
+    #[pyo3(signature = (bucket, access_key, secret_key, prefix = String::new(), endpoint = None, region = None, path_style = None, timeout = 30))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        bucket: String,
+        access_key: String,
+        secret_key: String,
+        prefix: String,
+        endpoint: Option<String>,
+        region: Option<String>,
+        path_style: Option<bool>,
+        timeout: u64,
+    ) -> Self {
+        // `us-east-1`, as for a run's store (`StorageConfig.region`): R2 takes
+        // it as its `auto`, and S3-compatible servers that check the region
+        // expect it, where they would refuse `auto`.
+        let region = region.unwrap_or_else(|| "us-east-1".into());
+        let config = S3Config {
+            bucket,
+            prefix,
+            region,
+            endpoint,
+            access_key,
+            secret_key,
+            path_style: path_style.unwrap_or(false),
+            timeout_secs: timeout,
+            single_put_limit: SINGLE_PUT_LIMIT,
+        };
+        let config = if path_style.is_none() { config.with_auto_path_style() } else { config };
+        S3Store { inner: S3Storage::new(config) }
+    }
+
+    /// The object's bytes, or None when there is none.
+    fn get<'py>(&self, py: Python<'py>, path: &str) -> PyResult<Option<Bound<'py, PyBytes>>> {
+        match py.detach(|| self.inner.get(path)) {
+            Ok(data) => Ok(Some(PyBytes::new(py, &data))),
+            Err(S3Error::NotFound(_)) => Ok(None),
+            Err(error) => Err(PyOSError::new_err(error.to_string())),
+        }
+    }
+
+    fn put(&self, py: Python<'_>, path: &str, data: Vec<u8>) -> PyResult<()> {
+        py.detach(|| self.inner.put(path, &data))
+            .map_err(|error| PyOSError::new_err(error.to_string()))
+    }
+
+    fn list(&self, py: Python<'_>, prefix: &str) -> PyResult<Vec<String>> {
+        py.detach(|| self.inner.list(prefix))
+            .map_err(|error| PyOSError::new_err(error.to_string()))
+    }
+}
+
 /// The compiled half of Ravex.
 ///
 /// Underscored because nothing outside the package should import it:
@@ -759,6 +827,7 @@ pub fn register_transport(module: &Bound<'_, PyModule>) -> PyResult<()> {
 fn _core(module: &Bound<'_, PyModule>) -> PyResult<()> {
     register_reshard(module)?;
     register_transport(module)?;
+    module.add_class::<S3Store>()?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

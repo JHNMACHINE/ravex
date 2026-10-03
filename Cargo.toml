@@ -35,6 +35,11 @@ pyo3 = { version = "0.29", features = ["extension-module"], optional = true }
 # hand-parser would silently disagree with the module it is replacing on
 # exactly the inputs nobody thought to test.
 regex = "1"
+# The S3 client for `ravex cache` (GPU-181), the same three Moonclip signs and
+# sends with; see `src/s3.rs` for why it is a copy rather than a call.
+hmac = "0.12"
+sha2 = "0.10"
+ureq = "2"
 
 [features]
 default = ["extension-module"]

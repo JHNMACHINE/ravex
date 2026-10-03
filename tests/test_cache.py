@@ -133,8 +133,11 @@ def test_the_command_line_pulls_what_it_pushed(tmp_path, monkeypatch, capsys):
     assert _read(second) == {"w.whl": b"wheel"}
 
 
-def test_a_bucket_is_refused_with_a_reason_until_it_is_supported(tmp_path, capsys):
+def test_a_bucket_without_its_keys_is_refused_by_name(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("RAVEX_CACHE_ACCESS_KEY", raising=False)
+    monkeypatch.delenv("RAVEX_CACHE_SECRET_KEY", raising=False)
+
     code = main(["cache", "pull", "--name", "wheels", "--dir", str(tmp_path), "--store", "s3://gpuzero-cache"])
 
     assert code == 1
-    assert "bucket" in capsys.readouterr().err
+    assert "RAVEX_CACHE_ACCESS_KEY" in capsys.readouterr().err

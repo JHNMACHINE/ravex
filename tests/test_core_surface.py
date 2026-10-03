@@ -27,7 +27,12 @@ STUB = PACKAGE / "_core.pyi"
 #: The modules that stand in front of the transport half of the core. Two,
 #: because the framing is `replication`'s and the socket that carries it
 #: between machines is `elastic`'s.
-SHIMS = (PACKAGE / "_dist" / "replication.py", PACKAGE / "_dist" / "elastic.py")
+SHIMS = (
+    PACKAGE / "_dist" / "replication.py",
+    PACKAGE / "_dist" / "elastic.py",
+    # And the bucket client, which only ``ravex cache`` uses (GPU-181).
+    PACKAGE / "_cache.py",
+)
 
 #: Not part of the exported surface: dunders, and the version the extension
 #: carries for `test_version_is_single.py` to check.

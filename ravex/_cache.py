@@ -33,8 +33,17 @@ The layout under the store's root::
     <name>/<id>/key.json      the whole key, written by the first push
     <name>/<id>/files/<path>  one object per file of the directory
 
-Only the standard library, like the rest of Ravex: the store is a small
-interface, :class:`Store`, so the transport is whatever implements it.
+The store is a small interface, :class:`Store`: a directory, or a bucket
+through ``_core.S3Store``, the SigV4 client Ravex's compiled core carries
+for this (``src/s3.rs``). A bucket's keys come from the environment, never
+from the command line, where any user of the machine can read them:
+
+``RAVEX_CACHE_ACCESS_KEY``, ``RAVEX_CACHE_SECRET_KEY``
+    The bucket's keys. Not the run's ``RAVEX_S3_*``: a cache is a bucket of
+    its own, and a machine that may read it is not always one that may write.
+``RAVEX_CACHE_ENDPOINT``, ``RAVEX_CACHE_REGION``, ``RAVEX_CACHE_PATH_STYLE``
+    Where the bucket is: for R2 the endpoint alone,
+    ``https://<account>.r2.cloudflarestorage.com``.
 """
 
 from __future__ import annotations
@@ -294,15 +303,34 @@ def push(store: Store, key: Key, directory: str) -> Outcome:
     return Outcome(raw is not None, count, size)
 
 
-def open_store(address: str) -> Store:
-    """The store at ``address``: ``file://<path>`` or a plain path.
+def open_store(address: str, environ: Optional[Dict[str, str]] = None) -> Store:
+    """The store at ``address``: ``s3://<bucket>/<prefix>``, ``file://<path>``
+    or a plain path.
 
-    A bucket is not here yet: which S3 client Ravex uses for it is still to be
-    decided (GPU-181), and until then a pull or push to ``s3://`` says so
-    rather than guess.
+    A bucket without both keys is refused here rather than at its first
+    request, where the service's answer would be a signature error that does
+    not say which variable is missing.
     """
     if address.startswith("s3://"):
-        raise NotImplementedError("ravex cache does not reach a bucket yet; use a directory (GPU-181)")
+        env = os.environ if environ is None else environ
+        bucket, _, prefix = address[len("s3://"):].partition("/")
+        access, secret = env.get("RAVEX_CACHE_ACCESS_KEY"), env.get("RAVEX_CACHE_SECRET_KEY")
+        if not bucket:
+            raise ValueError("%r names no bucket" % address)
+        if not (access and secret):
+            raise ValueError("a bucket needs RAVEX_CACHE_ACCESS_KEY and RAVEX_CACHE_SECRET_KEY")
+        from ravex import _core
+
+        style = env.get("RAVEX_CACHE_PATH_STYLE")
+        return _core.S3Store(
+            bucket,
+            access,
+            secret,
+            prefix=prefix.strip("/"),
+            endpoint=env.get("RAVEX_CACHE_ENDPOINT") or None,
+            region=env.get("RAVEX_CACHE_REGION") or None,
+            path_style=None if style is None else style.lower() in ("1", "true", "yes"),
+        )
     if address.startswith("file://"):
         address = address[len("file://"):]
     return LocalStore(address)

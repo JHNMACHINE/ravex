@@ -265,7 +265,7 @@ def _cache(args) -> int:
         store = _cache.open_store(args.store)
         run = _cache.pull if args.action == "pull" else _cache.push
         outcome = run(store, key, args.dir)
-    except (NotImplementedError, ValueError, OSError) as exc:
+    except (ValueError, OSError) as exc:
         # A cache is never worth failing the work for: the caller compiles
         # what it would have downloaded, and the line says why.
         print(f"ravex cache {args.action}: {exc}", file=sys.stderr)
@@ -397,7 +397,7 @@ def main(argv=None) -> int:
     cache.add_argument("action", choices=("key", "pull", "push"))
     cache.add_argument("--name", required=True, help="which directory: wheels, triton, inductor, tilelang...")
     cache.add_argument("--dir", default=None, help="the directory to fill or send (pull, push)")
-    cache.add_argument("--store", default=None, help="where the cache lives: a directory (pull, push)")
+    cache.add_argument("--store", default=None, help="where the cache lives: s3://bucket/prefix or a directory (pull, push)")
     cache.add_argument(
         "--with",
         dest="libraries",
