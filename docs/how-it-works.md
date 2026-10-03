@@ -28,7 +28,7 @@ Ravex knows about, so a process that has finished training is a process with an
 unmodified PyTorch in it, and a second call starts clean rather than inheriting
 the first run's registry.
 
-Through 0.0.5 startup was a `.pth` file in site-packages holding the single line
+Early releases started from a `.pth` file in site-packages holding the single line
 `import ravex._bootstrap`, executed by Python in *every* interpreter before any
 user code. That module checked for `RAVEX_ENABLED` or a `ravex.yaml`, and if it
 found one, installed a meta-path finder that waited for `import torch` before

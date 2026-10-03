@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Changed
+
+- **The licence is PolyForm Noncommercial 1.0.0, free for non-commercial use.**
+  It replaces Apache-2.0 for what is published from here on; versions already
+  on PyPI keep the licence they were released under. Package metadata,
+  `LICENSE`, `NOTICE` and the README say so. The README's project layout and
+  size figures, and the CI paths it names, now match the repository.
+
 ### Added
 
 - **Rounds over regions: `outer_region` (GPU-143).** With nodes in several

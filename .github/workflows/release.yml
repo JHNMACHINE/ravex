@@ -24,10 +24,10 @@ permissions:
 # minus the crate job — the Ravex crate is `publish = false` and exists to be
 # built into this package, not to be depended on from Cargo.
 #
-# The split into separate jobs is not cosmetic: Codeberg's hosted runners have a
-# per-job time and memory budget, and the memory quota counts filesystem writes,
-# so `target/` counts. Moonclip had a single job building six wheels torn out
-# from under it mid-build. Four smaller jobs each fit on their own.
+# The split into separate jobs dates from Codeberg's hosted runners, which had a
+# per-job time and memory budget that counted filesystem writes, so `target/`
+# counted too: Moonclip had a single job building six wheels torn out from
+# under it mid-build. It stays so a failed wheel is retried alone.
 jobs:
   # The source distribution, once — not per interpreter, and before any wheel.
   #

@@ -15,7 +15,7 @@ edition = "2021"
 # unrelated error from deep inside a dependency.
 rust-version = "1.83"
 description = "The arithmetic core of Ravex: reshard planning, checkpoint format readers"
-license = "Apache-2.0"
+license-file = "LICENSE"
 repository = "https://github.com/JHNMACHINE/ravex"
 readme = "README.md"
 publish = false

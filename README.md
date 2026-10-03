@@ -12,10 +12,9 @@ pip install ravex
 Ravex has a small Rust core — the reshard planner and the replica
 transport — so wheels are built per
 interpreter for Linux x86_64. On any other platform pip falls back to the source
-distribution, which builds if you have a Rust toolchain. Through 0.0.5 Ravex was
-pure Python and installed anywhere; what that bought and what it cost is in the
-[CHANGELOG](https://github.com/JHNMACHINE/ravex/blob/main/CHANGELOG.md),
-along with everything else that changed between versions.
+distribution, which builds if you have a Rust toolchain. What changed between
+versions is in the
+[CHANGELOG](https://github.com/JHNMACHINE/ravex/blob/main/CHANGELOG.md).
 
 Its default checkpoint engine, [Moonclip](https://github.com/JHNMACHINE/moonclip),
 ships wheels for the same platform — so `pip install "ravex[moonclip]"` is a
@@ -95,7 +94,7 @@ an `atexit` hook hoping to run, and it holds the function **before the model
 exists** — which is what resuming onto a different number of ranks needs and
 could never have.
 
-**What it replaced.** Through 0.0.5 `pip install ravex` also put a one-line
+**What it replaced.** Early releases of `pip install ravex` also put a one-line
 `.pth` file in site-packages that ran in *every* Python process in the
 environment and attached Ravex to any of them that had a `ravex.yaml` above the
 working directory. It is gone. It was genuinely zero-code-changes, and it existed
@@ -283,9 +282,8 @@ says which case you are in rather than letting you find out at the first resume.
 Two ways out, and they are not equivalent:
 
 - **A bucket** (`storage.type: s3`). Checkpoints leave the machines on their
-  own, and since 0.0.4 a rank that comes up with an empty disk pulls its store
-  back. Before that the remote was push-only — a backup you could not resume
-  from.
+  own, and a rank that comes up with an empty disk pulls its store back, so
+  the bucket is something you can resume from and not only a backup.
 - **`replicate_every`**, when there is no bucket and no shared filesystem. Each
   rank copies its store to a peer on another machine every N checkpoints.
   Survives losing any one machine, at a cost of at most N checkpoints of
@@ -363,17 +361,17 @@ and nothing in `_interop` is imported by anything outside it except `_runtime`.
 
 | Path | |
 |---|---|
-| `tests/` | 821 unit tests, in-process, no GPU and no container. Named for what they cover: `test_dist_*`, `test_interop_*` |
+| `tests/` | About 800 unit tests, in-process, no GPU and no container. Named for what they cover: `test_dist_*`, `test_interop_*` |
 | `integration/` | What only exists across a real process boundary — a resume from an empty interpreter, `torchrun`, a SIGKILL that runs no `finally`. Linux, in Docker |
 | `integration/scripts/` | The training scripts those tests kill and restart |
 | `integration/multinode/` | One container per rank, for questions `--nproc_per_node` cannot ask ([README](integration/multinode/README.md)) |
 | `integration/two-machines/` | The rented-box harness: two real hosts, real network |
 | `docs/` | [configuration.md](docs/configuration.md), [how-it-works.md](docs/how-it-works.md) |
 | `src/` | The Rust core: `reshard.rs` is the planner, `transport.rs` frames and moves a store, `python.rs` is the only file that knows an interpreter exists |
-| `.forgejo/workflows/` | `checks.yml` on branches; `ci.yml` on main adds the moonclip backend and both integration jobs |
+| `.github/workflows/` | `checks.yml` on branches; `ci.yml` on main adds the moonclip backend and both integration jobs |
 
-As of 0.1.0 that is about 13k lines across 26 Python modules, plus 2.7k of
-Rust, against 12k lines of tests.
+That is about 22k lines across 38 Python modules (the two subpackages
+included), plus 2.7k of Rust, against 19k lines of tests.
 
 ## Development
 
@@ -403,4 +401,5 @@ docker run --rm ravex-integration
 
 ## Licence
 
-Apache-2.0 — [GPU Zero](https://gpuzero.dev)
+[PolyForm Noncommercial 1.0.0](LICENSE): free for non-commercial use.
+For anything else, get in touch via [GPU Zero](https://gpuzero.dev).
