@@ -9,6 +9,15 @@
 
 ### Added
 
+- **`ravex cache key|pull|push` (GPU-181).** A directory of compiled wheels or
+  kernels (Triton, Inductor, TileLang) is filled from what a machine with the
+  same key already built, and what this one added is sent back. The key is
+  everything that changes the binary: CPU, each GPU's compute capability,
+  Python, torch with its CUDA, and the version of each library named with
+  `--with`. It is stored whole beside the files and compared field by field
+  on every pull, so a machine with another key loads nothing. Only a
+  directory as the store for now; a bucket follows.
+
 - **Rounds over regions: `outer_region` (GPU-143).** With nodes in several
   regions, the round closes within each region first; one delegate per region
   sends a single aggregate of its region's deltas across the slow link, every

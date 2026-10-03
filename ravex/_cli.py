@@ -30,6 +30,10 @@ usually not the one who ran the training, and is asking months later.
 
 ``ship`` too acts on a store whose run is gone: it sends a backend what that
 run could not (GPU-156), for a run that ended while its backend was down.
+
+``cache`` is the one that acts on a machine rather than a store: it fills a
+directory of compiled wheels or kernels from what a machine with the same key
+already built, and sends back what this one added (GPU-181).
 """
 
 from __future__ import annotations
@@ -250,6 +254,26 @@ def _held_steps(storage):
         return None
 
 
+def _cache(args) -> int:
+    from ravex import _cache
+
+    key = _cache.compute_key(args.name, _cache.libraries(args.libraries))
+    if args.action == "key":
+        print(json.dumps({"id": key.id, **key.fields}, indent=2, sort_keys=True))
+        return 0
+    try:
+        store = _cache.open_store(args.store)
+        run = _cache.pull if args.action == "pull" else _cache.push
+        outcome = run(store, key, args.dir)
+    except (NotImplementedError, ValueError, OSError) as exc:
+        # A cache is never worth failing the work for: the caller compiles
+        # what it would have downloaded, and the line says why.
+        print(f"ravex cache {args.action}: {exc}", file=sys.stderr)
+        return 1
+    print(_cache.describe(outcome, args.action, key))
+    return 0
+
+
 def _ship(args) -> int:
     """Send a backend what a store's executions never got to send (GPU-156).
 
@@ -366,7 +390,26 @@ def main(argv=None) -> int:
     )
     ship.set_defaults(handler=_ship)
 
+    cache = subparsers.add_parser(
+        "cache",
+        help="fill a directory of compiled wheels or kernels from a store, or send it back",
+    )
+    cache.add_argument("action", choices=("key", "pull", "push"))
+    cache.add_argument("--name", required=True, help="which directory: wheels, triton, inductor, tilelang...")
+    cache.add_argument("--dir", default=None, help="the directory to fill or send (pull, push)")
+    cache.add_argument("--store", default=None, help="where the cache lives: a directory (pull, push)")
+    cache.add_argument(
+        "--with",
+        dest="libraries",
+        action="append",
+        default=[],
+        help="a library whose version is part of the key; repeat, or comma-separate",
+    )
+    cache.set_defaults(handler=_cache)
+
     args = parser.parse_args(argv)
+    if getattr(args, "command", None) == "cache" and args.action != "key" and not (args.dir and args.store):
+        parser.error("ravex cache %s needs --dir and --store" % args.action)
     if not hasattr(args, "handler"):
         parser.print_help()
         return 1
