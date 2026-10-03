@@ -403,4 +403,4 @@ docker run --rm ravex-integration
 
 ## Licence
 
-Apache 2.0. See [LICENSE](LICENSE).
+Apache-2.0 — [GPU Zero](https://gpuzero.dev)
