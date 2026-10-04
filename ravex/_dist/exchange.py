@@ -1186,6 +1186,15 @@ class DeltaExchange:
             self._lock.notify_all()
         listener, self.listener = self.listener, None
         if listener is not None:
+            # Shut down before closing. On Linux a close() while the accepting
+            # thread waits on the socket leaves it listening until that wait
+            # ends - up to half a second - and a peer probing in that window
+            # (unreachable()) finds a closed node reachable. Windows refuses
+            # shutdown() on a listening socket, and does not need it.
+            try:
+                listener.shutdown(_socket.SHUT_RDWR)
+            except OSError:
+                pass
             try:
                 listener.close()
             except OSError:
