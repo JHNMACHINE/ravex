@@ -223,6 +223,32 @@ class TestUnreachable:
         # And nothing was lost: every chunk is still on disk, none marked sent.
         assert written(storage) and not shipped(storage)
 
+    def test_a_refused_run_is_tried_again_not_given_up(self, storage, backend):
+        # What the first run on a hosted backend hit (GPU-193): a proxy
+        # refused the run's description, the refusal ended the sending
+        # thread, and nothing more went out for the rest of the run.
+        backend.refuse = True
+
+        @ravex.train_loop(
+            backend="torch_save",
+            checkpoint_every=10_000,
+            metrics_chunk_every=0,
+            system_metrics_every=0,
+            metrics_endpoint=backend.url,
+        )
+        def train():
+            tiny(3)
+            deadline = time.monotonic() + 10
+            while not backend.refused and time.monotonic() < deadline:
+                time.sleep(0.05)
+            backend.refuse = False
+
+        train()
+        assert backend.refused
+        run_id = ravex.runs.describe(str(storage))["run_id"]
+        assert backend.runs[run_id]["status"]["state"] == "finished"
+        assert backend.points(run_id, "train/loss") == [1, 2, 3]
+
     def test_what_was_left_unsent_goes_first_next_time(self, storage, backend):
         backend.down = True
 

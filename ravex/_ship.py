@@ -243,7 +243,13 @@ class Shipper:
                     return
             try:
                 self._send_all()
-            except (_Unknown, OSError, urllib.error.URLError, ValueError) as exc:
+            # A refusal ends up here only from the run's description or its
+            # checkpoints (a refused chunk is dropped in _send_all). Nothing
+            # can be sent before the run is described, so it is waited out
+            # like a backend that is down: a proxy in front of the backend
+            # turning us away is not a reason to stop sending for the rest of
+            # the run, and an exception here would end this thread for good.
+            except (_Unknown, _Rejected, OSError, urllib.error.URLError, ValueError) as exc:
                 self._unreachable(exc)
                 with self._condition:
                     if self._closing:
