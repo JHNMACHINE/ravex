@@ -10,6 +10,17 @@
   compiled from the source distribution, which needs a Rust toolchain. CI
   runs the test suite on 3.14t as well.
 
+### Fixed
+
+- **Metrics reach a backend behind Cloudflare (GPU-193).** They were sent
+  under urllib's default name, `Python-urllib/3.x`, which Cloudflare refuses
+  as a bot's (403, error 1010) before the request reaches the backend; they
+  now go as `ravex`.
+- **A refused run description no longer stops the metrics for the rest of
+  the run (GPU-193).** The refusal ended the thread that sends them, and
+  nothing more went out until the next execution. It is now waited out and
+  tried again, as when the backend is down.
+
 ## 0.6.0 — 2026-10-03
 
 ### Changed
