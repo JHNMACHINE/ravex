@@ -397,7 +397,7 @@ def main(argv=None) -> int:
     cache.add_argument("action", choices=("key", "pull", "push"))
     cache.add_argument("--name", required=True, help="which directory: wheels, triton, inductor, tilelang...")
     cache.add_argument("--dir", default=None, help="the directory to fill or send (pull, push)")
-    cache.add_argument("--store", default=None, help="where the cache lives: s3://bucket/prefix or a directory (pull, push)")
+    cache.add_argument("--store", default=None, help="where the cache lives: s3://bucket/prefix, sign+https://service, or a directory (pull, push)")
     cache.add_argument(
         "--with",
         dest="libraries",

@@ -141,3 +141,123 @@ def test_a_bucket_without_its_keys_is_refused_by_name(tmp_path, monkeypatch, cap
 
     assert code == 1
     assert "RAVEX_CACHE_ACCESS_KEY" in capsys.readouterr().err
+
+
+class SigningService:
+    """A signing service and the bucket behind it, in one small HTTP server.
+
+    ``POST /sign`` answers the protocol in :mod:`ravex._cache`; its URLs point
+    back at ``/objects/<path>``, which keeps the bytes. Writes under ``ro/``
+    are refused, as a service refuses a part that machines may only read.
+    """
+
+    def __init__(self, token="t0ken"):
+        import threading
+        import urllib.parse
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        self.token = token
+        self.objects = {}
+        self.object_auth = []
+        service = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def _send(self, status, body=b"", kind="application/json"):
+                self.send_response(status)
+                self.send_header("Content-Type", kind)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                if self.headers.get("Authorization") != "Bearer " + service.token:
+                    return self._send(401, b'{"detail": "no token"}')
+                op, path = body["op"], body["path"]
+                if op == "put" and path.startswith("ro/"):
+                    return self._send(403, b'{"detail": "read-only"}')
+                if op == "list":
+                    paths = sorted(p for p in service.objects if p.startswith(path))
+                    return self._send(200, json.dumps({"paths": paths}).encode())
+                url = "%s/objects/%s" % (service.url, urllib.parse.quote(path))
+                return self._send(200, json.dumps({"url": url}).encode())
+
+            def _object(self):
+                service.object_auth.append(self.headers.get("Authorization"))
+                return urllib.parse.unquote(self.path[len("/objects/"):])
+
+            def do_GET(self):
+                path = self._object()
+                if path not in service.objects:
+                    return self._send(404)
+                return self._send(200, service.objects[path], "application/octet-stream")
+
+            def do_PUT(self):
+                path = self._object()
+                service.objects[path] = self.rfile.read(int(self.headers["Content-Length"]))
+                return self._send(200)
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = "http://127.0.0.1:%d" % self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+@pytest.fixture
+def service():
+    running = SigningService()
+    yield running
+    running.close()
+
+
+def test_a_signed_store_pushes_and_pulls_without_a_bucket_key(tmp_path, monkeypatch, capsys, service):
+    monkeypatch.setattr(_cache, "gpu_capabilities", lambda: ["sm_89"])
+    monkeypatch.setenv("RAVEX_CACHE_TOKEN", service.token)
+    for name in ("RAVEX_CACHE_ACCESS_KEY", "RAVEX_CACHE_SECRET_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    first, second = str(tmp_path / "first"), str(tmp_path / "second")
+    _fill(first, {"w.whl": b"wheel", "sub/k.cubin": b"kernel"})
+    store = "sign+%s/sign" % service.url
+
+    assert main(["cache", "push", "--name", "wheels", "--dir", first, "--store", store]) == 0
+    assert main(["cache", "pull", "--name", "wheels", "--dir", second, "--store", store]) == 0
+
+    assert "hit" in capsys.readouterr().out.splitlines()[-1]
+    assert _read(second) == {"w.whl": b"wheel", "sub/k.cubin": b"kernel"}
+    # The token goes to the service only: the bucket's URLs carry their own
+    # signature, and a token sent there would be one more place it leaks.
+    assert service.object_auth and not any(service.object_auth)
+
+
+def test_a_signed_store_reports_a_missing_object_as_none(service):
+    store = _cache.SignedStore(service.url + "/sign", service.token)
+    assert store.get("nothing/here") is None
+
+
+def test_a_refused_write_fails_the_push_and_says_why(tmp_path, monkeypatch, capsys, service):
+    monkeypatch.setattr(_cache, "gpu_capabilities", lambda: ["sm_89"])
+    monkeypatch.setenv("RAVEX_CACHE_TOKEN", service.token)
+    directory = str(tmp_path / "d")
+    _fill(directory, {"w.whl": b"wheel"})
+
+    code = main(["cache", "push", "--name", "wheels", "--dir", directory, "--store", "sign+%s/sign" % service.url])
+    assert code == 0  # wheels/ is writable here
+
+    store = _cache.SignedStore(service.url + "/sign", service.token)
+    with pytest.raises(OSError, match="403"):
+        store.put("ro/wheels/x", b"x")
+
+
+def test_a_signing_service_without_a_token_is_refused_by_name(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("RAVEX_CACHE_TOKEN", raising=False)
+
+    code = main(["cache", "pull", "--name", "wheels", "--dir", str(tmp_path), "--store", "sign+https://example.invalid/sign"])
+
+    assert code == 1
+    assert "RAVEX_CACHE_TOKEN" in capsys.readouterr().err

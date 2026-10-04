@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`ravex cache` with no bucket key on the machine: `sign+https://<service>`**
+  **(GPU-200).** A machine that runs somebody else's code cannot keep a
+  bucket's keys from that code, and a bucket key is worth the whole bucket.
+  This store holds only `RAVEX_CACHE_TOKEN` for a service that signs one
+  operation at a time (`get` and `put` answer with a presigned URL, `list`
+  with the paths) and decides which it allows; the bytes go straight between
+  the machine and the bucket.
+
 ## 0.6.1 — 2026-10-04
 
 ### Added

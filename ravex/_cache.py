@@ -44,6 +44,21 @@ from the command line, where any user of the machine can read them:
 ``RAVEX_CACHE_ENDPOINT``, ``RAVEX_CACHE_REGION``, ``RAVEX_CACHE_PATH_STYLE``
     Where the bucket is: for R2 the endpoint alone,
     ``https://<account>.r2.cloudflarestorage.com``.
+
+**A store whose keys this machine does not hold**, ``sign+https://<service>``
+(:class:`SignedStore`). A machine that runs somebody else's code cannot keep a
+bucket's keys from that code, and a bucket key is worth the whole bucket. So
+the machine holds only a token for a service, which signs one operation at a
+time and decides which it allows; the bytes go between the machine and the
+bucket, never through the service. The protocol, one ``POST`` to the address
+with ``Authorization: Bearer <RAVEX_CACHE_TOKEN>`` and a JSON body::
+
+    {"op": "get",  "path": "<path>"}    ->  {"url": "<presigned GET>"}
+    {"op": "put",  "path": "<path>"}    ->  {"url": "<presigned PUT>"}
+    {"op": "list", "path": "<prefix>"}  ->  {"paths": ["<path>", ...]}
+
+Paths are this module's, relative to the store's root; where that root is in
+the bucket is the service's business.
 """
 
 from __future__ import annotations
@@ -55,6 +70,8 @@ import platform
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from importlib import metadata
 from typing import Dict, Iterable, List, Optional, Protocol, Sequence
@@ -111,6 +128,83 @@ class LocalStore:
                 full = os.path.join(folder, name)
                 found.append(prefix.rstrip("/") + "/" + os.path.relpath(full, base).replace(os.sep, "/"))
         return sorted(found)
+
+
+#: How long one request of a signed store may take: a wheel can be hundreds
+#: of megabytes on a slow link, and a cache that gives up early only costs
+#: the compilation it would have saved.
+SIGNED_TIMEOUT = 600
+
+
+class SignedStore:
+    """A store whose every operation a service signs (see the module's
+    docstring): no bucket key on this machine, only ``token`` for the service.
+    """
+
+    def __init__(self, address: str, token: str) -> None:
+        self.address = address
+        self.token = token
+
+    def _ask(self, op: str, path: str) -> Dict[str, object]:
+        body = json.dumps({"op": op, "path": path}).encode("utf-8")
+        request = urllib.request.Request(
+            self.address,
+            data=body,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bearer " + self.token,
+                # Not urllib's default name, which a CDN in front of a service
+                # may refuse as a bot's (GPU-193).
+                "User-Agent": "ravex",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                answer = json.loads(response.read().decode("utf-8") or "{}")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")[:300]
+            raise OSError("the signing service refused %s %s: %d %s" % (op, path, exc.code, detail)) from None
+        if not isinstance(answer, dict):
+            raise ValueError("the signing service answered %s %s with %r" % (op, path, answer))
+        return answer
+
+    def _url(self, op: str, path: str) -> str:
+        url = self._ask(op, path).get("url")
+        if not isinstance(url, str) or not url.startswith(("https://", "http://")):
+            raise ValueError("the signing service gave no URL for %s %s" % (op, path))
+        return url
+
+    def get(self, path: str) -> Optional[bytes]:
+        request = urllib.request.Request(self._url("get", path), headers={"User-Agent": "ravex"})
+        try:
+            with urllib.request.urlopen(request, timeout=SIGNED_TIMEOUT) as response:
+                return response.read()
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return None
+            raise OSError("get %s: %d" % (path, exc.code)) from None
+
+    def put(self, path: str, data: bytes) -> None:
+        request = urllib.request.Request(
+            self._url("put", path),
+            data=data,
+            method="PUT",
+            # The presigned URL signs the host alone; a content type is
+            # still sent, or urllib would send a form's.
+            headers={"User-Agent": "ravex", "Content-Type": "application/octet-stream"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=SIGNED_TIMEOUT):
+                pass
+        except urllib.error.HTTPError as exc:
+            raise OSError("put %s: %d" % (path, exc.code)) from None
+
+    def list(self, prefix: str) -> List[str]:
+        paths = self._ask("list", prefix).get("paths")
+        if not isinstance(paths, list) or not all(isinstance(path, str) for path in paths):
+            raise ValueError("the signing service listed %s as %r" % (prefix, paths))
+        return sorted(paths)
 
 
 @dataclass(frozen=True)
@@ -304,8 +398,8 @@ def push(store: Store, key: Key, directory: str) -> Outcome:
 
 
 def open_store(address: str, environ: Optional[Dict[str, str]] = None) -> Store:
-    """The store at ``address``: ``s3://<bucket>/<prefix>``, ``file://<path>``
-    or a plain path.
+    """The store at ``address``: ``s3://<bucket>/<prefix>``,
+    ``sign+https://<service>``, ``file://<path>`` or a plain path.
 
     A bucket without both keys is refused here rather than at its first
     request, where the service's answer would be a signature error that does
@@ -331,6 +425,12 @@ def open_store(address: str, environ: Optional[Dict[str, str]] = None) -> Store:
             region=env.get("RAVEX_CACHE_REGION") or None,
             path_style=None if style is None else style.lower() in ("1", "true", "yes"),
         )
+    if address.startswith(("sign+https://", "sign+http://")):
+        env = os.environ if environ is None else environ
+        token = env.get("RAVEX_CACHE_TOKEN")
+        if not token:
+            raise ValueError("a signing service needs RAVEX_CACHE_TOKEN")
+        return SignedStore(address[len("sign+"):], token)
     if address.startswith("file://"):
         address = address[len("file://"):]
     return LocalStore(address)
