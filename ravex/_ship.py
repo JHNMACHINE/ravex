@@ -378,7 +378,10 @@ class Shipper:
             self.endpoint + path,
             data=body,
             method="POST",
-            headers={"Content-Type": "application/json"},
+            # A name of its own: urllib's default, Python-urllib/3.x, is one
+            # that a CDN in front of a backend may refuse outright as a bot
+            # (Cloudflare answers 403 with error 1010).
+            headers={"Content-Type": "application/json", "User-Agent": "ravex"},
         )
         if self.token:
             request.add_header("Authorization", "Bearer " + self.token)

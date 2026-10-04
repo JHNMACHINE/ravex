@@ -24,6 +24,11 @@ from ravex._ship import LEDGER, Shipper
 class FakeBackend:
     def __init__(self):
         self.down = False
+        # A proxy in front of the backend turning requests away (Cloudflare's
+        # 403, error 1010), as opposed to a backend that is down.
+        self.refuse = False
+        self.refused = 0
+        self.user_agents = set()
         self.runs = {}
         self.batches = []
         self.checkpoints = {}
@@ -36,6 +41,13 @@ class FakeBackend:
 
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                backend.user_agents.add(self.headers.get("User-Agent"))
+                if backend.refuse:
+                    backend.refused += 1
+                    self.send_response(403)
+                    self.end_headers()
+                    self.wfile.write(b"error code: 1010")
+                    return
                 if backend.down:
                     self.send_response(503)
                     self.end_headers()
@@ -169,6 +181,16 @@ class TestSending:
         (document,) = backend.runs.values()
         assert document["status"]["state"] == "failed"
         assert ravex.runs.describe(str(storage))["status"]["state"] == "failed"
+
+    def test_it_does_not_call_itself_python_urllib(self, storage, backend):
+        # Cloudflare refuses urllib's default name as a bot's, before the
+        # request reaches the backend (GPU-193).
+        @ravex.train_loop(backend="torch_save", checkpoint_every=10_000, metrics_endpoint=backend.url)
+        def train():
+            tiny(1)
+
+        train()
+        assert backend.user_agents == {"ravex"}
 
     def test_without_an_endpoint_nothing_is_sent(self, storage, backend):
         @ravex.train_loop(backend="torch_save", checkpoint_every=10_000)
