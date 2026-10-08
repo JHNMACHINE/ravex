@@ -240,14 +240,16 @@ class TestComingBackAtAStep:
         # would take the step first.
         pytest.importorskip("moonclip")
 
-        @ravex.train_loop(backend="moonclip", checkpoint_every=2, async_save=False)
+        # `delta=False`: a full every checkpoint. With deltas the store keeps
+        # the fulls and the newest step, and step 2 would not be one of them.
+        @ravex.train_loop(backend="moonclip", checkpoint_every=2, async_save=False, delta=False)
         def first():
             tiny(6)
 
         first()
         seen = {}
 
-        @ravex.train_loop(backend="moonclip", checkpoint_every=2, async_save=False, resume_step=2)
+        @ravex.train_loop(backend="moonclip", checkpoint_every=2, async_save=False, delta=False, resume_step=2)
         def again():
             tiny(1)
             seen["after"] = ravex.step()
@@ -283,10 +285,10 @@ class TestComingBackAtAStep:
             backend.close()
 
     def test_it_works_on_the_moonclip_backend_too(self, storage):
-        self.run_to(storage, 6, backend="moonclip")
+        self.run_to(storage, 6, backend="moonclip", delta=False)
         seen = {}
 
-        @ravex.train_loop(backend="moonclip", checkpoint_every=2, resume_step=4)
+        @ravex.train_loop(backend="moonclip", checkpoint_every=2, delta=False, resume_step=4)
         def again():
             tiny(1)
             seen["after"] = ravex.step()

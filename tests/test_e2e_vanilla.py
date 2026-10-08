@@ -39,6 +39,11 @@ SEED = 0
 #: resumed run replays 17-20 (identically) before reaching new ground.
 RESUME_FROM = 17
 
+#: The same crash on Moonclip, which saves a delta at every step: the last one
+#: collected is step 19's, at the top of iteration 20, so the resumed run
+#: replays step 20 alone.
+RESUME_FROM_A_DELTA_PER_STEP = CRASH_AT
+
 
 class Killed(RuntimeError):
     """Stands in for the instance disappearing under the training loop."""
@@ -139,7 +144,7 @@ def test_resume_reproduces_the_uninterrupted_run_on_moonclip(tmp_path, monkeypat
         tmp_path, monkeypatch, "moonclip"
     )
 
-    assert sorted(second_half) == list(range(RESUME_FROM, TOTAL_STEPS + 1))
+    assert sorted(second_half) == list(range(RESUME_FROM_A_DELTA_PER_STEP, TOTAL_STEPS + 1))
 
     for step, loss in second_half.items():
         assert loss == reference[step], f"loss at step {step} differs after resume"

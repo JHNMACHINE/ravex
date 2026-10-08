@@ -682,7 +682,10 @@ class RavexRuntime:
             if self.registry.step_count % self.config.emergency_check_every == 0:
                 self._check_emergency_signal()
 
-        if self.registry.step_count % self.config.checkpoint_every == 0:
+        if (
+            self.registry.step_count % self.config.checkpoint_every == 0
+            or self._saves_every_step()
+        ):
             # Not here: this is the middle of the iteration, before the LR
             # scheduler has stepped. Flag it and collect at the top of the next
             # one — see _BatchBoundaryIterator.
@@ -695,6 +698,22 @@ class RavexRuntime:
                 # had, a saved learning rate one step stale.
                 self._checkpoint_due = False
                 self.checkpoint()
+
+    def _saves_every_step(self) -> bool:
+        """Whether a save is due at every step rather than every checkpoint.
+
+        The backend's answer once there is one. Before the first save there is
+        not, and it is the configured backend's: Moonclip with deltas on. If
+        Moonclip then turns out to be unavailable, the fallback answers no from
+        the next step on.
+        """
+        if self._backend is not None:
+            return bool(getattr(self._backend, "saves_every_step", False))
+        return self.config.backend == "moonclip" and self.config.delta
+
+    def _is_checkpoint_step(self, step: int) -> bool:
+        """Whether ``step`` is a checkpoint, and not one of the deltas between."""
+        return step % self.config.checkpoint_every == 0
 
     def on_batch_boundary(self) -> None:
         """Called at the top of each training iteration, before the batch.
@@ -2207,8 +2226,15 @@ class RavexRuntime:
             return False
 
         self._last_saved_step = step
+        # A delta between two checkpoints is a save and nothing else (GPU-209):
+        # the replication, the status, the steps reported to a metrics
+        # endpoint and the log line belong to the checkpoint, and at every step
+        # they would cost the loop and the backend a request each for no
+        # reader.
+        checkpoint = final or emergency or self._is_checkpoint_step(step)
         replicate_started = time.perf_counter()
-        self._replicate_if_due(step)
+        if checkpoint:
+            self._replicate_if_due(step)
         # Named, because on a slow link this *is* the handoff. Measured on two
         # machines with a 100 Mbps link between them: 151s of a 186s handoff,
         # absent from this breakdown and therefore absent from the cadence
@@ -2234,17 +2260,20 @@ class RavexRuntime:
         # so far has started by re-running the job to find out which phase it
         # was. Two perf_counter calls per phase is a cheap way not to.
         finished = time.perf_counter()
-        logger.info(
-            "Checkpoint at step %d handed off in %.3fs (%s)",
+        logger.log(
+            logging.INFO if checkpoint else logging.DEBUG,
+            "%s at step %d handed off in %.3fs (%s)",
+            "Checkpoint" if checkpoint else "Delta",
             step,
             finished - started,
             ", ".join("%s %.3fs" % item for item in phases.items()),
         )
         self._warn_if_cadence_is_expensive(step, started, finished, phases)
-        # Every checkpoint, not every step: it is a small file, and a reader
-        # judging whether a run is alive needs the timestamp refreshed on a
-        # cadence it can reason about.
-        self._record_status("running")
+        if checkpoint:
+            # Every checkpoint, not every step: it is a small file, and a
+            # reader judging whether a run is alive needs the timestamp
+            # refreshed on a cadence it can reason about.
+            self._record_status("running")
         if self._metrics is not None:
             from ravex._metrics import Scalar
 
@@ -2660,6 +2689,21 @@ class RavexRuntime:
             return
 
         self._cadence_warned = True
+        if self._saves_every_step():
+            # `checkpoint_every` is not the lever here: it moves the syncs, and
+            # the cost is the delta taken at every step.
+            logger.warning(
+                "The delta saved at every step is costing %.0f%% of wall time: "
+                "%.1fs of handoff per %.1fs step, at step %d. The run will "
+                "still complete. What a delta costs the loop is the copy of the "
+                "state; save_dtype for the optimizer state halves it, and "
+                "delta: false goes back to a full save every checkpoint_every.",
+                100 * cost / interval,
+                cost,
+                interval,
+                step,
+            )
+            return
         logger.warning(
             "checkpoint_every=%d is costing %.0f%% of wall time: %.1fs of "
             "handoff per %.1fs between checkpoints, at step %d. The run will "

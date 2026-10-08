@@ -233,7 +233,20 @@ class RavexConfig:
 
     # Checkpoint cadence, counted in optimizer steps (not micro-batches, so
     # gradient accumulation is handled for free).
-    checkpoint_every: int = 500
+    #
+    # With Moonclip and `delta` on, the store takes a delta at *every* step and
+    # this is how often the store is sent to the bucket, the run's status
+    # written and its steps told to the platform: what a machine lost between
+    # two of these is what a resume elsewhere has to redo. It is also the
+    # window the store keeps - the last this many steps, each a restore point,
+    # and the full they stand on - in place of `keep_last`. With any other
+    # backend, or `delta: false`, it is the save cadence itself, because there
+    # every save is a full one, and `keep_last` is how many are kept.
+    checkpoint_every: int = 100
+
+    #: Steps between full snapshots, with deltas against the last one in
+    #: between. Only meaningful where deltas are: Moonclip with `delta` on.
+    full_every: int = 1000
     checkpoint_on_exit: bool = True
     resume: bool = True
 
@@ -834,6 +847,8 @@ class RavexConfig:
             self.enabled = _as_bool(value, self.enabled)
         if (value := get("CHECKPOINT_EVERY")) is not None:
             self.checkpoint_every = _as_int(value, self.checkpoint_every)
+        if (value := get("FULL_EVERY")) is not None:
+            self.full_every = _as_int(value, self.full_every)
         if (value := get("CHECKPOINT_ON_EXIT")) is not None:
             self.checkpoint_on_exit = _as_bool(value, self.checkpoint_on_exit)
         if (value := get("RESUME")) is not None:
@@ -982,6 +997,7 @@ class RavexConfig:
         defaults = RavexConfig()
         numeric = (
             "checkpoint_every",
+            "full_every",
             "keep_last",
             "compression_level",
             "replicate_every",
@@ -1126,6 +1142,8 @@ class RavexConfig:
 
         if self.checkpoint_every < 1:
             self.checkpoint_every = 1
+        if self.full_every < 1:
+            self.full_every = 1
         if self.keep_last < 1:
             self.keep_last = 1
         if self.replicate_every < 0:
@@ -1374,6 +1392,7 @@ class RavexConfig:
         )
         return (
             f"backend={self.backend} storage={target} "
-            f"every={self.checkpoint_every} keep_last={self.keep_last} "
+            f"every={self.checkpoint_every} full_every={self.full_every} "
+            f"keep_last={self.keep_last} "
             f"config={self.source or '<defaults>'}"
         )

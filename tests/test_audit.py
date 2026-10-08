@@ -303,8 +303,11 @@ class TestMoonclipBackendFingerprint:
 def audited_run(backend, keep_last=5, steps=6, audit_log=True, seed=0):
     """Six steps checkpointed at 3 and 6, with the audit log as asked."""
 
+    # `delta=False`: the trail is audited per checkpoint, and with Moonclip's
+    # delta per step the steps between are saves too, folded away by the next.
     @ravex.train_loop(
-        backend=backend, checkpoint_every=3, keep_last=keep_last, audit_log=audit_log
+        backend=backend, checkpoint_every=3, keep_last=keep_last, audit_log=audit_log,
+        delta=False,
     )
     def train():
         torch.manual_seed(seed)

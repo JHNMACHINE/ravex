@@ -47,6 +47,12 @@ logger = logging.getLogger("ravex")
 class CheckpointBackend(ABC):
     """Storage interface used by the runtime."""
 
+    #: Whether the runtime hands this backend a save at every step rather than
+    #: every ``checkpoint_every``. True only where a save between two
+    #: checkpoints is a delta against the last full: anywhere else it would be
+    #: a full state dict written at every step.
+    saves_every_step = False
+
     @abstractmethod
     def save(
         self, step: int, state: Dict[str, Any], metadata: Dict[str, str]
@@ -231,6 +237,8 @@ class MoonclipBackend(CheckpointBackend):
         kwargs: Dict[str, Any] = {
             "storage_root": storage.path,
             "compression_level": config.compression_level,
+            # How many snapshots the store keeps, oldest out first. With a
+            # delta per step it is replaced below by the window.
             "max_total_snapshots": config.keep_last,
             "async_save": config.async_save,
             # Ravex owns the topology; Moonclip is handed a value and never
@@ -311,6 +319,32 @@ class MoonclipBackend(CheckpointBackend):
             # No dedicated switch in Moonclip: a full snapshot on every step is
             # exactly "delta disabled".
             kwargs["full_every_steps"] = 1
+        else:
+            # A delta at every step, a full every `full_every`. Moonclip's
+            # own cap on deltas between fulls (10 by default) is lifted to
+            # match, or it would force a full every ten steps.
+            self.saves_every_step = True
+            # A sliding window of `checkpoint_every` steps (GPU-209): the
+            # last that many deltas and the full they are taken against, the
+            # oldest going as each new one arrives - from the bucket too,
+            # where Moonclip mirrors its deletes. `keep_last` does not apply: counted in
+            # saves it would be the last few steps. Retention goes by age and
+            # never removes a full a kept delta needs, so across a new full
+            # the window holds both for as long as it reaches back past it.
+            #
+            # Not the merger: it deletes the deltas just written, which the
+            # sync may not have sent yet, and a pack gone between the sync's
+            # listing and its read aborts the whole sync (seen 2026-10-08,
+            # 20 of 50). What the window drops is the oldest, already sent.
+            window = config.checkpoint_every + 1
+            kwargs.update(
+                full_every_steps=config.full_every,
+                max_deltas_per_full=config.full_every,
+                max_total_snapshots=window,
+                # Fulls are never the binding cap: dropping the oldest one
+                # takes its deltas with it, and would cut the window short.
+                max_full_snapshots=window,
+            )
 
         if storage.is_remote:
             if not (storage.access_key and storage.secret_key):
@@ -327,16 +361,19 @@ class MoonclipBackend(CheckpointBackend):
                 s3_access_key=storage.access_key,
                 s3_secret_key=storage.secret_key,
                 s3_path_style=storage.path_style,
-                # Every checkpoint goes to the bucket as it is written, in
-                # Moonclip's sync thread. Its default is every hundred saves,
-                # which at one save every few hundred steps means at close and
-                # never before: on 2026-10-08 a node the provider took back
-                # had written checkpoints to step 1500 and the bucket held
-                # none of them, so the resume found nothing and started over.
-                # A sync sends only what the bucket lacks - the files are
-                # immutable, the manifest goes last - so each one costs the
-                # new snapshot or delta and no more.
-                sync_every_n_saves=1,
+                # To the bucket every `checkpoint_every` steps. With a save
+                # per step that is this many saves; with a save per
+                # checkpoint it is every one of them. Moonclip's default is a
+                # hundred saves, which at one save every few hundred steps
+                # means at close and never before: on 2026-10-08 a node the
+                # provider took back had written checkpoints to step 1500 and
+                # the bucket held none of them, so the resume found nothing
+                # and started over. A sync sends only what the bucket lacks -
+                # the files are immutable, the manifest goes last - so each
+                # one costs the new snapshot or delta and no more.
+                sync_every_n_saves=(
+                    config.checkpoint_every if self.saves_every_step else 1
+                ),
             )
 
         # `MoonclipManager`, not `CheckpointManager`. The latter is Moonclip's

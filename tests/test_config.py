@@ -9,7 +9,8 @@ def test_defaults_are_sane():
     config = RavexConfig()
     assert config.enabled
     assert config.backend == "moonclip"
-    assert config.checkpoint_every == 500
+    assert config.checkpoint_every == 100
+    assert config.full_every == 1000
     assert config.storage.type == "local"
 
 
@@ -93,7 +94,7 @@ def test_a_truncated_config_does_not_stop_ravex(tmp_path, monkeypatch):
 
     config = RavexConfig.load()
 
-    assert config.checkpoint_every == 500, "should fall back to the default"
+    assert config.checkpoint_every == 100, "should fall back to the default"
     assert config.problems, "the substitution must be reported, not hidden"
     assert "checkpoint_every" in config.problems[0]
 
@@ -102,7 +103,7 @@ def test_a_truncated_config_does_not_stop_ravex(tmp_path, monkeypatch):
     "yaml_text, field, expected",
     [
         ("keep_last: many\n", "keep_last", 5),
-        ("checkpoint_every: []\n", "checkpoint_every", 500),
+        ("checkpoint_every: []\n", "checkpoint_every", 100),
         ("enabled: maybe\n", "enabled", True),
         ("backend: 7\n", "backend", "moonclip"),
     ],

@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### Changed
+
+- **With Moonclip, a delta at every step, and a window of `checkpoint_every`
+  steps (GPU-209).** Ravex saved only every `checkpoint_every` (500 by
+  default), so until the first checkpoint the bucket held no snapshot and no
+  manifest, and a machine lost between two checkpoints cost all the steps in
+  between. Now a delta against the last full is saved at every step: copied in
+  memory, written to disk by Moonclip's writer, sent to the bucket every
+  `checkpoint_every` steps. The store keeps the last `checkpoint_every` steps,
+  each one a step to resume or fork from, and the full they stand on, and the
+  bucket mirrors that window. `checkpoint_every` defaults to 100; status, the
+  steps reported to a metrics endpoint, replication and the log line stay at
+  that cadence. With `delta: false` or `torch_save` nothing changes: a full
+  every `checkpoint_every`, `keep_last` of them.
+
+  Not Moonclip's merger, which was tried first: it deletes the deltas just
+  written, and a pack gone between a sync's listing and its read aborted that
+  sync - 20 syncs of 50 on a 500-step run. The window drops the oldest delta,
+  which the bucket already holds: 0 of 50.
+
+### Added
+
+- **`full_every` (`RAVEX_FULL_EVERY`), default 1000 (GPU-209).** Steps between
+  full snapshots with a delta per step. Moonclip's own cap of ten deltas per
+  full is lifted to match, or it would force a full every ten steps.
+
 ### Fixed
 
 - **A start that must resume and finds nothing writes nothing (GPU-206).**

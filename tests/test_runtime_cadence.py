@@ -15,8 +15,11 @@ class _Collect(logging.Handler):
         self.records.append(record)
 
 
-def _runtime(every=2):
+def _runtime(every=2, delta=False):
     """A runtime plus the records it warns with.
+
+    ``delta`` off by default: with it on, Moonclip saves at every step and the
+    observation is about that delta rather than about ``checkpoint_every``.
 
     The handler goes on *after* construction on purpose: `_setup_logging`
     clears the ravex logger's handlers and turns off propagation, so anything
@@ -24,6 +27,7 @@ def _runtime(every=2):
     """
     config = RavexConfig()
     config.checkpoint_every = every
+    config.delta = delta
     runtime = RavexRuntime(config)
     collector = _Collect()
     logging.getLogger("ravex").addHandler(collector)
@@ -53,6 +57,20 @@ def test_an_expensive_cadence_is_reported_once():
     message = warnings[0].getMessage()
     assert "checkpoint_every=2" in message
     assert "43%" in message
+
+
+def test_with_a_delta_per_step_the_warning_names_the_delta():
+    """`checkpoint_every` is not the lever when a delta is saved at every
+    step: it moves the syncs, and the cost is the save taken in between."""
+    runtime, warnings = _runtime(every=100, delta=True)
+    _handoff(runtime, 1, 0.0, 1.0, {"collect": 0.2, "store": 0.3})
+    _handoff(runtime, 2, 1.0, 2.0, {"collect": 0.2, "store": 0.3})
+
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert "every step" in message
+    assert "50%" in message
+    assert "checkpoint_every=" not in message
 
 
 def test_replication_counts_against_the_cadence():

@@ -21,19 +21,20 @@ ravex status
 | Key | Env var | Default | What it does |
 |---|---|---|---|
 | `enabled` | `RAVEX_ENABLED` | `true` | Master switch. `RAVEX_ENABLED=0` disables Ravex for one run. |
-| `checkpoint_every` | `RAVEX_CHECKPOINT_EVERY` | `500` | Optimizer steps between checkpoints. Not micro-batches: with gradient accumulation, one accumulation cycle is one step. |
+| `checkpoint_every` | `RAVEX_CHECKPOINT_EVERY` | `100` | Optimizer steps between checkpoints. Not micro-batches: with gradient accumulation, one accumulation cycle is one step. With Moonclip and `delta` on, a delta is saved at every step and this is how often the store goes to the bucket, and the window the store keeps: the last this many steps and the full they stand on. See [A delta at every step](#a-delta-at-every-step). |
+| `full_every` | `RAVEX_FULL_EVERY` | `1000` | Moonclip with `delta` on: steps between full snapshots. Every delta is taken against the last full. |
 | `checkpoint_on_exit` | `RAVEX_CHECKPOINT_ON_EXIT` | `true` | Take a final checkpoint when the process exits normally or on SIGTERM. |
 | `resume_step` | `RAVEX_RESUME_STEP` | `null` | Come back at this step instead of the newest. A step the store does not hold stops the run and lists the ones it has; see [The run as a document](#the-run-as-a-document). |
 | `resume` | `RAVEX_RESUME` | `true` | Look for an existing checkpoint at startup. Set false to always start clean. |
 | `max_steps` | `RAVEX_MAX_STEPS` | `null` | Hard stop, in optimizer steps. See [Step budgets](#step-budgets). |
 | `backend` | `RAVEX_BACKEND` | `moonclip` | `moonclip` or `torch_save`. Falls back to `torch_save` if Moonclip is missing. |
-| `delta` | `RAVEX_DELTA` | `true` | Moonclip only: store deltas against the previous snapshot. |
+| `delta` | `RAVEX_DELTA` | `true` | Moonclip only: a delta against the last full at every step. Off, a full every `checkpoint_every`. |
 | `keep_base_in_memory` | `RAVEX_KEEP_BASE_IN_MEMORY` | `true` | Moonclip only: keep the last full snapshot's bytes resident so the next delta does not have to read them back. Costs a copy of the saved state. See [The write path](#the-write-path). |
 | `async_save` | `RAVEX_ASYNC_SAVE` | `true` | Moonclip only: write in the background. Off, the loop stops until the checkpoint is durable. Diagnostic; see [The write path](#the-write-path). |
 | `compression` | `RAVEX_COMPRESSION` | `zstd` | `zstd` or `none`. |
 | `save_dtype` | `RAVEX_SAVE_DTYPE` | `null` | Moonclip only: what precision each part of the checkpoint is stored at. A dtype for everything, or a mapping of component to dtype. See [Precision per component](#precision-per-component). |
 | `compression_level` | `RAVEX_COMPRESSION_LEVEL` | `3` | zstd level. |
-| `keep_last` | `RAVEX_KEEP_LAST` | `5` | Checkpoints to retain. Older ones are deleted. |
+| `keep_last` | `RAVEX_KEEP_LAST` | `5` | Checkpoints to retain. Older ones are deleted. Not used with a delta per step, where `checkpoint_every` is the window. |
 | `sharded_checkpoints` | `RAVEX_SHARDED_CHECKPOINTS` | `gather` | How FSDP state is written: `gather` or `per_rank`. See [Sharded models](#sharded-models). |
 | `reshard_on_resume` | `RAVEX_RESHARD_ON_RESUME` | `false` | Resume a `per_rank` checkpoint at a different world size, rebuilding each shard from the old ones. See [Resuming onto a different number of ranks](#resuming-onto-a-different-number-of-ranks). |
 | `convert_foreign` | `RAVEX_CONVERT_FOREIGN` | `false` | Resume from a checkpoint another framework wrote — DeepSpeed ZeRO, or a torch distributed checkpoint (which is what Megatron-core writes). See [Resuming from another framework's checkpoint](#resuming-from-another-frameworks-checkpoint). |
@@ -353,6 +354,36 @@ seconds and the run resumed from the last checkpoint at world size 2.
 What you give up is what any resharded resume gives up — the data order and the
 per-rank RNG, both described above. What you do not give up is the model, the
 optimizer moments, or the step count.
+
+### A delta at every step
+
+With Moonclip and `delta` on - the default - a save goes through three
+places, each on its own thread:
+
+1. **Memory.** At every step the state is copied, and the training loop goes on.
+   That copy is the whole of what a save costs the loop.
+2. **Disk.** Moonclip's writer takes the delta against the last full,
+   compresses it and writes it to the local store, in the background. One save
+   is in flight at a time; the next waits for it, and measured on a 1.5B model
+   that wait was 4-12% of the save, the rest being the copy.
+3. **The bucket.** Every `checkpoint_every` steps Moonclip's sync sends what
+   the bucket does not hold yet, the manifest last.
+
+A full is written every `full_every` steps, and every delta is taken against
+the last one: loading any step reads two snapshots, never a chain.
+
+The store keeps a **window** of the last `checkpoint_every` steps, each one a
+step to resume or fork from, and the full they stand on; the bucket mirrors it.
+On a 500-step run with `checkpoint_every: 10` the bucket ends with the full at
+step 1 and the deltas from 491 to 500. A step that slid out of the window is
+gone: to keep points further back, set `delta: false`, which writes a full every
+`checkpoint_every` and keeps `keep_last` of them.
+
+Two things follow. A machine lost between two syncs costs up to
+`checkpoint_every` steps, and at most that. And with Adam the optimizer moments
+barely delta, so a delta is close to the size of a full: the window is that many
+of them on disk, and a sync sends that many. `save_dtype: {optimizer: bf16}`
+halves the part that is most of it.
 
 ### The write path
 

@@ -30,6 +30,8 @@ TOTAL_STEPS = 40
 CRASH_AT = 20
 CHECKPOINT_EVERY = 4
 RESUME_FROM = 17  # see test_e2e_vanilla: the checkpoint due at 20 never ran
+#: Moonclip saves a delta at every step, so only step 20 is lost (ditto).
+RESUME_FROM_A_DELTA_PER_STEP = CRASH_AT
 
 
 class Killed(RuntimeError):
@@ -122,7 +124,8 @@ def test_resume_reproduces_the_uninterrupted_run(tmp_path, monkeypatch, backend,
     resumed_weights, resumed_state = states(model, optimizers)
     ravex.deactivate()
 
-    assert sorted(second_half) == list(range(RESUME_FROM, TOTAL_STEPS + 1))
+    first = RESUME_FROM_A_DELTA_PER_STEP if backend == "moonclip" else RESUME_FROM
+    assert sorted(second_half) == list(range(first, TOTAL_STEPS + 1))
     for step, loss in second_half.items():
         assert loss == reference[step], "step %d differs after resume" % step
     for key, value in resumed_weights.items():

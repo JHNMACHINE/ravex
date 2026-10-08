@@ -64,7 +64,9 @@ class TestRequireResume:
 
 
 class TestCheckpointsReachTheBucketAsTheyAreWritten:
-    def test_a_remote_store_syncs_at_every_save(self, tmp_path, monkeypatch):
+    @staticmethod
+    def manager_arguments(tmp_path, monkeypatch, **settings):
+        """What the backend hands Moonclip for a store in a bucket."""
         moonclip = pytest.importorskip("moonclip")
         from ravex import _backends
 
@@ -84,10 +86,39 @@ class TestCheckpointsReachTheBucketAsTheyAreWritten:
         config.storage.endpoint = "http://127.0.0.1:1"
         config.storage.access_key = "key"
         config.storage.secret_key = "secret"
+        for name, value in settings.items():
+            setattr(config, name, value)
         config._normalize()
 
-        _backends.MoonclipBackend(config)
+        backend = _backends.MoonclipBackend(config)
+        return seen, backend
 
+    def test_with_a_delta_per_step_the_bucket_gets_one_every_checkpoint(
+        self, tmp_path, monkeypatch
+    ):
+        seen, backend = self.manager_arguments(
+            tmp_path, monkeypatch, checkpoint_every=50, full_every=400
+        )
+        assert backend.saves_every_step
+        assert seen.get("sync_every_n_saves") == 50, (
+            "a save per step: the sync every checkpoint_every is that many saves"
+        )
+        assert seen.get("full_every_steps") == 400
+        assert seen.get("max_deltas_per_full") == 400, (
+            "Moonclip's default of ten would force a full every ten steps"
+        )
+        assert seen.get("max_total_snapshots") == 51, (
+            "the window: the last checkpoint_every deltas and their full"
+        )
+        assert not seen.get("merge_stride"), (
+            "the merger deletes deltas the sync may not have sent yet"
+        )
+
+    def test_with_a_full_per_save_every_save_is_synced(self, tmp_path, monkeypatch):
+        seen, backend = self.manager_arguments(
+            tmp_path, monkeypatch, checkpoint_every=50, delta=False
+        )
+        assert not backend.saves_every_step
         assert seen.get("sync_every_n_saves") == 1, (
             "Moonclip's default syncs every hundred saves: a node lost before "
             "then leaves no checkpoint in the bucket"

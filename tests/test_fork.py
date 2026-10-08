@@ -216,11 +216,13 @@ class TestFork:
         moonclip = pytest.importorskip("moonclip")
         parent = tmp_path / "base"
         monkeypatch.setenv("RAVEX_STORAGE_PATH", str(parent))
-        ravex.train_loop(backend="moonclip", checkpoint_every=2, async_save=False)(lambda: train_to(6))()
+        # `delta=False`: a full every checkpoint, so step 4 is still there to
+        # fork from. With deltas only the fulls and the newest step are.
+        ravex.train_loop(backend="moonclip", checkpoint_every=2, async_save=False, delta=False)(lambda: train_to(6))()
 
         monkeypatch.setenv("RAVEX_STORAGE_PATH", str(tmp_path / "child"))
         ravex.train_loop(
-            backend="moonclip", checkpoint_every=2, async_save=False, fork_from=str(parent), fork_step=4
+            backend="moonclip", checkpoint_every=2, async_save=False, delta=False, fork_from=str(parent), fork_step=4
         )(lambda: train_to(8))()
 
         manager = moonclip.MoonclipManager(str(parent))
@@ -326,7 +328,9 @@ class TestAParentStillTraining:
 import os, time, torch, ravex
 os.environ["RAVEX_STORAGE_PATH"] = {str(parent)!r}
 
-@ravex.train_loop(backend="moonclip", checkpoint_every=2, async_save=False)
+# keep_last=50: step 4 has to outlive the parent's retention until the child
+# pins it, which is what this test is about; a full per checkpoint keeps five.
+@ravex.train_loop(backend="moonclip", checkpoint_every=2, async_save=False, delta=False, keep_last=50)
 def train():
     torch.manual_seed(0)
     model = torch.nn.Linear(4, 2)
@@ -355,7 +359,7 @@ train()
             monkeypatch.setenv("RAVEX_STORAGE_PATH", str(tmp_path / "child"))
             seen = {}
             ravex.train_loop(
-                backend="moonclip", checkpoint_every=2, async_save=False, fork_from=str(parent), fork_step=4
+                backend="moonclip", checkpoint_every=2, async_save=False, delta=False, fork_from=str(parent), fork_step=4
             )(lambda: train_to(8, seen=seen))()
             assert seen["start"] == 4
             # Forked while the parent was still going.

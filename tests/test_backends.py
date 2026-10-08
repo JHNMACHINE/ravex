@@ -211,10 +211,13 @@ def test_a_backend_can_be_asked_for_a_specific_step(tmp_path):
 @pytest.mark.skipif(not HAVE_MOONCLIP, reason="moonclip not installed")
 def test_moonclip_can_be_asked_for_a_specific_step(tmp_path):
     """The same question against the default backend, where a snapshot is
-    addressed by id and the step is metadata rather than a filename."""
+    addressed by id and the step is metadata rather than a filename.
+
+    Every save a full: a delta between two fulls is folded away by the next
+    one, and what is asked here is how a step is found, not which survive."""
     from ravex._backends import MoonclipBackend
 
-    backend = MoonclipBackend(make_config(tmp_path, backend="moonclip"))
+    backend = MoonclipBackend(make_config(tmp_path, backend="moonclip", full_every=4))
     assert backend.latest_step() is None
 
     for step in (4, 8, 12):
@@ -229,6 +232,26 @@ def test_moonclip_can_be_asked_for_a_specific_step(tmp_path):
         sample_state()["models"]["model_a"]["weight"],
     )
     assert backend.load_step(9) is None
+    backend.close()
+
+
+@pytest.mark.skipif(not HAVE_MOONCLIP, reason="moonclip not installed")
+def test_moonclip_keeps_a_window_of_checkpoint_every_steps(tmp_path):
+    """A delta per step, and the store holds the last `checkpoint_every` of
+    them - each one a step to come back to - plus the full they stand on."""
+    from ravex._backends import MoonclipBackend
+
+    backend = MoonclipBackend(
+        make_config(tmp_path, backend="moonclip", checkpoint_every=4, full_every=100)
+    )
+    assert backend.saves_every_step
+    for step in range(1, 13):
+        backend.save(step, sample_state(step), {"step": str(step)})
+    backend.flush()
+
+    assert backend.known_steps() == [1, 9, 10, 11, 12]
+    assert backend.load_step(10)["step"] == 10
+    assert backend.load_step(8) is None, "step 8 slid out of the window"
     backend.close()
 
 
