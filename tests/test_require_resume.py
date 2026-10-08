@@ -39,6 +39,10 @@ class TestRequireResume:
         with pytest.raises(NothingToResume, match="must resume"):
             loop(lambda: script(4, seen))()
         assert seen == {}, "a run that must resume trained from scratch"
+        # Nor did it give the empty store an identity: uploaded, a new
+        # run.json would land over the one the bucket holds for the run.
+        assert not (storage / "run.json").exists()
+        assert not (storage / "status.json").exists()
 
     def test_a_store_with_a_checkpoint_carries_on(self, storage):
         ravex.train_loop(backend="torch_save", checkpoint_every=2)(lambda: script(4, {}))()

@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **A start that must resume and finds nothing writes nothing (GPU-206).**
+  `NothingToResume` stopped the training but still wrote a `run.json` for the
+  empty store, with a new identity, and uploaded it with `status.json`: in a
+  run's own prefix that would land over the `run.json` the bucket holds for
+  it. Now a refused resume opens no segment and sends nothing.
+
 ## 0.6.3 — 2026-10-08
 
 ### Fixed

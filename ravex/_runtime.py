@@ -1572,23 +1572,38 @@ class RavexRuntime:
             self.registry.apply_pending_rng()
 
     def _try_resume(self, defer_rng: bool = False) -> None:
+        refused = False
         try:
             self._try_resume_body(defer_rng)
+        except NothingToResume:
+            refused = True
+            raise
         finally:
             # Whatever the resume did or did not do, the step it left is the
             # one this execution's metrics continue from - see
-            # `ravex.metrics.read` for why the header has to say so.
-            from ravex._ship import combine
+            # `ravex.metrics.read` for why the header has to say so. Except a
+            # start that must resume and found nothing: it writes no
+            # `run.json`, opens no segment and sends nothing. An empty local
+            # store would get a new identity and upload it over the bucket's -
+            # the very overwrite `require_resume` is there to prevent.
+            # (Not a `return` here: in a `finally` it would swallow the
+            # exception the refusal is.)
+            if not refused:
+                self._open_segment()
 
-            uploader = combine(self._store_uploader(), self._open_shipper())
-            self._metrics_uploader = uploader
-            self._open_run_record(uploader)
-            if self._metrics is not None:
-                self._metrics.begin(
-                    self.registry.step_count,
-                    lambda: self.registry.step_count,
-                    uploader,
-                )
+    def _open_segment(self) -> None:
+        """Open this execution's metrics segment and its ``run.json``."""
+        from ravex._ship import combine
+
+        uploader = combine(self._store_uploader(), self._open_shipper())
+        self._metrics_uploader = uploader
+        self._open_run_record(uploader)
+        if self._metrics is not None:
+            self._metrics.begin(
+                self.registry.step_count,
+                lambda: self.registry.step_count,
+                uploader,
+            )
 
     def _try_resume_body(self, defer_rng: bool) -> None:
         self._resume_attempted = True
