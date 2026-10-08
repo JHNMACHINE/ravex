@@ -82,9 +82,12 @@ class TestForkFromABucket:
         # afterwards, so the only copy left is the bucket's.
         parent_dir = tmp_path / "machine-a" / "base"
         in_bucket(monkeypatch, parent_dir, base + "/base")
-        ravex.train_loop(backend="moonclip", checkpoint_every=2, async_save=False, name="base")(
-            lambda: train_to(6)
-        )()
+        # `delta=False`: a full every checkpoint, so step 4 is still there to
+        # fork from. With deltas the store keeps a window of the last
+        # `checkpoint_every` steps, and step 4 slides out of it (GPU-209).
+        ravex.train_loop(
+            backend="moonclip", checkpoint_every=2, async_save=False, delta=False, name="base"
+        )(lambda: train_to(6))()
         parent_id = ravex.runs.describe(str(parent_dir))["run_id"]
         import shutil
 
@@ -98,6 +101,7 @@ class TestForkFromABucket:
             backend="moonclip",
             checkpoint_every=2,
             async_save=False,
+            delta=False,
             fork_from="s3://%s/%s/base" % (BUCKET, base),
             fork_step=4,
         )(lambda: train_to(8, seen=seen))()

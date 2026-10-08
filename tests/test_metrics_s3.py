@@ -152,4 +152,7 @@ def test_the_bucket_resolves_to_the_same_timeline_as_the_disk(remote, tmp_path):
     mirror = pull(remote, tmp_path / "after")
     from_bucket = ravex.metrics.read(str(mirror))["scalars"]["loss"]
     assert from_bucket == ravex.metrics.read(staging)["scalars"]["loss"]
-    assert from_bucket["value"] == [1.0, 2.0, 3.0, 4.0, 5.0, 106.0, 107.0, 108.0]
+    # A delta at every step (GPU-209): the last one the first run saved is
+    # step 7's, collected at the top of its eighth iteration, so the second
+    # picks up at step 8 and the first's step 8 is cut.
+    assert from_bucket["value"] == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 108.0, 109.0, 110.0]
