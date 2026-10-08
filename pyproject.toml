@@ -100,7 +100,11 @@ dependencies = ["PyYAML>=5.1"]
 #            `status.json` and the metrics a fork or a resume reads from a
 #            bucket stopped parsing. A fork on a machine that never held its
 #            parent lost the parent's id.
-moonclip = ["moonclip>=0.1.4"]
+#            0.1.5 since GPU-209: with a delta per step, retention deletes
+#            while the sync walks the store, and a file gone between the
+#            sync's listing and its read aborted that sync - every file after
+#            it stayed off the bucket while the manifest went up naming them.
+moonclip = ["moonclip>=0.1.5"]
 dev = ["pytest>=7", "numpy"]
 
 [project.urls]

@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.7.0 — 2026-10-08
 
 ### Changed
 
@@ -27,6 +27,12 @@
 - **`full_every` (`RAVEX_FULL_EVERY`), default 1000 (GPU-209).** Steps between
   full snapshots with a delta per step. Moonclip's own cap of ten deltas per
   full is lifted to match, or it would force a full every ten steps.
+
+### Requires
+
+- **Moonclip 0.1.5 (GPU-209).** With a delta per step, retention deletes while
+  the sync walks the store; before 0.1.5 a file gone between the sync's
+  listing and its read aborted that sync.
 
 ### Fixed
 
