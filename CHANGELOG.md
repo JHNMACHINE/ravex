@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **Checkpoints reach the bucket as they are written (GPU-206).** With a
+  remote store, Moonclip synced every hundred saves - its default, which
+  Ravex never changed - so at one save every few hundred steps a run's
+  checkpoints reached the bucket only when it closed. A node the provider
+  took back left none: a run that had checkpointed to step 1500 resumed on a
+  new node with nothing to resume from. Every save is now synced in
+  Moonclip's background thread; each sync sends only what the bucket lacks.
+
+### Added
+
+- **`require_resume` (`RAVEX_REQUIRE_RESUME`) (GPU-206).** A start that must
+  carry on from a checkpoint and finds none, locally or in the remote, raises
+  `NothingToResume` instead of training from step 0 under the same name -
+  which overwrote the run's `run.json` in the bucket and paid for training it
+  had already done. An agent sets it for a resume somebody asked for.
+
 ## 0.6.2 — 2026-10-04
 
 ### Added

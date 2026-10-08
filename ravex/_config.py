@@ -245,6 +245,13 @@ class RavexConfig:
     #: asked to continue.
     resume_step: Optional[int] = None
 
+    #: This start must carry on from a checkpoint: with none in the store,
+    #: here or in its remote, stop rather than train from scratch. For a
+    #: resume somebody asked for - an agent sets it for the platform's
+    #: "resume" - where step 0 under the run's own name would overwrite its
+    #: identity and pay for training it already did.
+    require_resume: bool = False
+
     #: Start this run as a fork of another (GPU-149): the store of the run it
     #: branches from, and the step. The child has a store of its own - this
     #: run's ``storage.path`` - and the first time it starts, with nothing in
@@ -923,6 +930,8 @@ class RavexConfig:
             self.fork_step = _as_int(value, 0) if value else None
         if (value := get("KEEP_HYPERPARAMETERS")) is not None:
             self.keep_hyperparameters = _as_bool(value, self.keep_hyperparameters)
+        if (value := get("REQUIRE_RESUME")) is not None:
+            self.require_resume = _as_bool(value, self.require_resume)
         if (value := get("AUDIT_LOG")) is not None:
             self.audit_log = _as_bool(value, self.audit_log)
         if (value := get("METRICS")) is not None:
@@ -986,6 +995,7 @@ class RavexConfig:
             "enabled",
             "checkpoint_on_exit",
             "resume",
+            "require_resume",
             "delta",
             "keep_base_in_memory",
             "async_save",

@@ -327,6 +327,16 @@ class MoonclipBackend(CheckpointBackend):
                 s3_access_key=storage.access_key,
                 s3_secret_key=storage.secret_key,
                 s3_path_style=storage.path_style,
+                # Every checkpoint goes to the bucket as it is written, in
+                # Moonclip's sync thread. Its default is every hundred saves,
+                # which at one save every few hundred steps means at close and
+                # never before: on 2026-10-08 a node the provider took back
+                # had written checkpoints to step 1500 and the bucket held
+                # none of them, so the resume found nothing and started over.
+                # A sync sends only what the bucket lacks - the files are
+                # immutable, the manifest goes last - so each one costs the
+                # new snapshot or delta and no more.
+                sync_every_n_saves=1,
             )
 
         # `MoonclipManager`, not `CheckpointManager`. The latter is Moonclip's

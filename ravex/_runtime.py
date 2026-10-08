@@ -40,7 +40,7 @@ from ravex._dist.collectives import (
 )
 from ravex._patches import install_all_patches
 from ravex._registry import ObjectRegistry
-from ravex._resume import ResumeManager, ResumeStepMissing
+from ravex._resume import NothingToResume, ResumeManager, ResumeStepMissing
 
 logger = logging.getLogger("ravex")
 
@@ -1636,17 +1636,28 @@ class RavexRuntime:
             resumed = resume_manager.try_resume(
                 defer_rng=defer_rng, per_rank=self._per_rank_active()
             )
+            if not resumed and self.config.require_resume:
+                raise NothingToResume(
+                    "This run must resume (require_resume), and its store %s holds no "
+                    "checkpoint%s. It is stopping instead of training from step 0 under "
+                    "the same name"
+                    % (
+                        self.config.storage.path,
+                        ", here or in its remote" if self.config.storage.is_remote else "",
+                    )
+                )
             if resumed and chosen is not None:
                 self._require_everything_restored()
                 self._keep_hyperparameters(chosen)
                 logger.info("Resumed with this script's hyperparameters, as keep_hyperparameters asks")
             self._restore_extra_state(resume_manager.restored_extra)
-        except ResumeStepMissing:
+        except (ResumeStepMissing, NothingToResume):
             # Not caught here: `resume_step` is a number somebody typed, and
-            # "starting from scratch" is the one outcome they did not ask for.
+            # "starting from scratch" is the one outcome they did not ask for;
+            # nor is it for a run that must resume.
             raise
         except Exception as exc:
-            if self.config.fork_from or self.config.keep_hyperparameters:
+            if self.config.fork_from or self.config.keep_hyperparameters or self.config.require_resume:
                 # Asked for by name: carry on from *that* checkpoint, with
                 # these parameters. When it does not fit - a model of another
                 # shape, most often, because a parameter that changes the

@@ -221,6 +221,16 @@ def _drop_per_rank_randomness(state: Dict[str, Any], old_world: int, world: int)
         )
 
 
+class NothingToResume(Exception):
+    """``require_resume`` is set and the store, local or remote, holds no
+    checkpoint to resume from.
+
+    Raised instead of starting from scratch: a run asked to carry on that
+    trains from step 0 under the same name writes a new history over the old
+    one, and the time it trains is paid for and wasted.
+    """
+
+
 class ResumeStepMissing(Exception):
     """``resume_step`` named a step the store does not hold.
 
