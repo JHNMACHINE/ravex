@@ -518,25 +518,41 @@ def test_emergency_numeric_fields_are_clamped(monkeypatch):
 # ─── multi-rank: real torch.distributed, gloo, spawned processes ───────
 
 
-def _free_port():
-    import socket
+def _store_server():
+    """A rendezvous store for one spawned group, held by the test's own process.
 
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    On port 0, with the port read back from the store. The probe it replaces
+    found a free port, closed it and handed the number to rank 0 to listen on;
+    under `pytest -n` another worker took it in between, and rank 0 died with
+    EADDRINUSE (GPU-191, as GPU-175 found in test_dist_multinode). A server
+    that is already listening has no such window. The caller keeps it alive
+    until its ranks are done.
+    """
+    from ravex._dist.rendezvous import _tcp_store
+
+    return _tcp_store("127.0.0.1", 0, True, 120.0)
+
+
+def _join_gloo(rank, world_size, port):
+    """Join the gloo group whose store `_store_server` opened, as a client."""
+    import torch.distributed as dist
+
+    from ravex._dist.rendezvous import _tcp_store
+
+    store = _tcp_store("127.0.0.1", port, False, 120.0)
+    dist.init_process_group("gloo", store=store, rank=rank, world_size=world_size)
 
 
 def _emergency_worker(rank, world_size, port, local_flag, timeout_seconds, out):
     """One rank running the real detection primitive, start to finish."""
     os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
 
     try:
         import torch.distributed as dist
 
         from ravex._dist.collectives import emergency_group, emergency_signalled
 
-        dist.init_process_group("gloo", rank=rank, world_size=world_size)
+        _join_gloo(rank, world_size, port)
         try:
             usable, group = emergency_group(timeout_seconds)
             signalled = emergency_signalled(local_flag, group) if usable else None
@@ -552,7 +568,8 @@ def _run_emergency_across_two_ranks(flag_by_rank, timeout_seconds=20):
 
     ctx = mp.get_context("spawn")
     out = ctx.Queue()
-    port = _free_port()
+    server = _store_server()
+    port = server.port
     procs = [
         ctx.Process(
             target=_emergency_worker,
@@ -621,14 +638,13 @@ def _emergency_partial_worker(rank, world_size, port, timeout_seconds, out):
     exits right after the group exists, the way a killed spot instance would
     disappear mid-round rather than declining to participate."""
     os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
 
     try:
         import torch.distributed as dist
 
         from ravex._dist.collectives import emergency_group, emergency_signalled
 
-        dist.init_process_group("gloo", rank=rank, world_size=world_size)
+        _join_gloo(rank, world_size, port)
         usable, group = emergency_group(timeout_seconds)
 
         if rank != 0:
@@ -660,7 +676,8 @@ class TestTheIsolatedTimeoutActuallyBounds:
 
         ctx = mp.get_context("spawn")
         out = ctx.Queue()
-        port = _free_port()
+        server = _store_server()
+        port = server.port
         procs = [
             ctx.Process(
                 target=_emergency_partial_worker,
@@ -775,7 +792,6 @@ def _announced_worker(rank, world, port, plan, out):
     from unittest import mock
 
     os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
 
     try:
         import torch.distributed as dist
@@ -785,7 +801,7 @@ def _announced_worker(rank, world, port, plan, out):
         from ravex._config import RavexConfig
         from ravex._runtime import RavexRuntime
 
-        dist.init_process_group("gloo", rank=rank, world_size=world)
+        _join_gloo(rank, world, port)
 
         runtime = RavexRuntime.__new__(RavexRuntime)
         runtime.config = RavexConfig()
@@ -851,7 +867,8 @@ def _run_announced(plan, world=4):
 
     ctx = mp.get_context("spawn")
     out = ctx.Queue()
-    port = _free_port()
+    server = _store_server()
+    port = server.port
     procs = [
         ctx.Process(target=_announced_worker, args=(rank, world, port, plan, out))
         for rank in range(world)
@@ -983,7 +1000,6 @@ def _partition_worker(rank, world, port, plan, out):
     import time
 
     os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
     os.environ["GROUP_RANK"] = str(rank // plan["per_node"])
     os.environ["LOCAL_WORLD_SIZE"] = str(plan["per_node"])
 
@@ -992,7 +1008,7 @@ def _partition_worker(rank, world, port, plan, out):
 
         import ravex._dist.collectives as collectives
 
-        dist.init_process_group("gloo", rank=rank, world_size=world)
+        _join_gloo(rank, world, port)
 
         node = rank // plan["per_node"]
         if plan["sharding"] == "per_node":
@@ -1039,7 +1055,8 @@ def _run_partition(plan, world=4):
 
     ctx = mp.get_context("spawn")
     out = ctx.Queue()
-    port = _free_port()
+    server = _store_server()
+    port = server.port
     procs = [
         ctx.Process(target=_partition_worker, args=(rank, world, port, plan, out))
         for rank in range(world)
