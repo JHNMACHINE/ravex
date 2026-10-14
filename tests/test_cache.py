@@ -8,6 +8,7 @@ than asked of a driver, so each test says which machine it is.
 
 import json
 import os
+import threading
 
 import pytest
 
@@ -271,3 +272,40 @@ def test_a_signing_service_without_a_token_is_refused_by_name(tmp_path, monkeypa
 
     assert code == 1
     assert "RAVEX_CACHE_TOKEN" in capsys.readouterr().err
+
+
+class _Gate:
+    """A store that lets a file through only once four are in flight: a pull
+    or a push that moves one file at a time never gets past the first."""
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.barrier = threading.Barrier(4, timeout=10)
+
+    def get(self, path):
+        if "/files/" in path:
+            self.barrier.wait()
+        return self.inner.get(path)
+
+    def put(self, path, data):
+        if "/files/" in path:
+            self.barrier.wait()
+        self.inner.put(path, data)
+
+    def list(self, prefix):
+        return self.inner.list(prefix)
+
+
+def test_files_move_several_at_a_time(tmp_path):
+    """One at a time, every file waits out the store's round trips: 517
+    kernels took four minutes to pull on a node (GPU-181)."""
+    store = _cache.LocalStore(str(tmp_path / "store"))
+    key = _cache.compute_key("triton", gpus=["sm_86"])
+    first, second = str(tmp_path / "first"), str(tmp_path / "second")
+    _fill(first, {"k%d/kernel.cubin" % n: b"%d" % n for n in range(8)})
+
+    sent = _cache.push(_Gate(store), key, first)
+    got = _cache.pull(_Gate(store), key, second)
+
+    assert (sent.files, got.files) == (8, 8)
+    assert _read(second) == _read(first)

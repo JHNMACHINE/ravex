@@ -72,9 +72,10 @@ import sys
 import tempfile
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from importlib import metadata
-from typing import Dict, Iterable, List, Optional, Protocol, Sequence
+from typing import Callable, Dict, Iterable, List, Optional, Protocol, Sequence, Tuple, TypeVar
 
 #: Characters of the key's hash in the store's path. Only for finding the key:
 #: what decides is the comparison of the whole of it.
@@ -89,7 +90,10 @@ LAYOUT = 1
 
 
 class Store(Protocol):
-    """Where the cache lives: objects addressed by a relative path."""
+    """Where the cache lives: objects addressed by a relative path.
+
+    Called from several threads at once (``TRANSFERS``), one path per call.
+    """
 
     def get(self, path: str) -> Optional[bytes]:
         """The object's bytes, or None when there is none."""
@@ -322,6 +326,29 @@ def _inside(directory: str, relative: str) -> Optional[str]:
     return target if os.path.commonpath([root, target]) == root else None
 
 
+#: How many files a pull or a push moves at once. A kernel cache is hundreds
+#: of files of a few kilobytes each, and one at a time every file waited out
+#: a round trip or two - a signature, then the bucket: 517 files took four
+#: minutes on a node, longer than the compilation they saved (GPU-181). The
+#: stores release the GIL while they wait, so threads are enough.
+TRANSFERS = 16
+
+_T = TypeVar("_T")
+
+
+def _each(work: Callable[[_T], int], items: Sequence[_T]) -> List[int]:
+    """``work`` on every item, ``TRANSFERS`` at a time; the first error is raised.
+
+    Files are independent and each is written whole or not at all, so a
+    transfer cut short by an error leaves nothing a later pull or push would
+    trust: it just finds those names still missing.
+    """
+    if len(items) <= 1:
+        return [work(item) for item in items]
+    with ThreadPoolExecutor(max_workers=min(TRANSFERS, len(items)), thread_name_prefix="ravex-cache") as pool:
+        return list(pool.map(work, items))
+
+
 @dataclass
 class Outcome:
     """What a pull or a push did, for the line the caller prints."""
@@ -354,21 +381,25 @@ def pull(store: Store, key: Key, directory: str) -> Outcome:
         return Outcome(False, 0, 0, "the stored key differs in " + ", ".join(differ))
     have = set(_local_files(directory))
     prefix = base + "/files/"
-    count = size = 0
+    wanted = []
     for path in store.list(prefix):
         relative = path[len(prefix):]
         target = _inside(directory, relative)
         if target is None:
             raise ValueError("the store names a file outside the directory: %r" % relative)
-        if relative in have:
-            continue
+        if relative not in have:
+            wanted.append((path, target))
+
+    def fetch(item: Tuple[str, str]) -> int:
+        path, target = item
         data = store.get(path)
         if data is None:
-            continue
+            return -1
         _write_atomic(target, data)
-        count += 1
-        size += len(data)
-    return Outcome(True, count, size)
+        return len(data)
+
+    sizes = [got for got in _each(fetch, wanted) if got >= 0]
+    return Outcome(True, len(sizes), sum(sizes))
 
 
 def push(store: Store, key: Key, directory: str) -> Outcome:
@@ -391,16 +422,15 @@ def push(store: Store, key: Key, directory: str) -> Outcome:
             raise ValueError("%s holds another key; refusing to write over it" % base)
     prefix = base + "/files/"
     there = {path[len(prefix):] for path in store.list(prefix)}
-    count = size = 0
-    for relative in _local_files(directory):
-        if relative in there:
-            continue
+
+    def send(relative: str) -> int:
         with open(os.path.join(directory, *relative.split("/")), "rb") as handle:
             data = handle.read()
         store.put(prefix + relative, data)
-        count += 1
-        size += len(data)
-    return Outcome(raw is not None, count, size)
+        return len(data)
+
+    sizes = _each(send, [relative for relative in _local_files(directory) if relative not in there])
+    return Outcome(raw is not None, len(sizes), sum(sizes))
 
 
 def open_store(address: str, environ: Optional[Dict[str, str]] = None) -> Store:
