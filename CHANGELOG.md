@@ -9,6 +9,10 @@
   written with credentials a bucket hands out scoped to one bucket or one
   prefix and for a time, which sign nothing without their token. The
   `moonclip` extra now wants Moonclip 0.2.0, the first that takes one.
+- **A put to a signed cache store says its size.** `ravex cache` sends
+  `size` with every `put` it asks a signing service for, so the service can
+  sign the URL with that length - the bucket then takes no more - and
+  refuse a file past what it keeps.
 
 ## 0.7.0 — 2026-10-08
 

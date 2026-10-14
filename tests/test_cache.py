@@ -159,6 +159,8 @@ class SigningService:
         self.token = token
         self.objects = {}
         self.object_auth = []
+        #: The size each put declared, by path: the bucket takes no other.
+        self.declared = {}
         service = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -182,6 +184,10 @@ class SigningService:
                 if op == "list":
                     paths = sorted(p for p in service.objects if p.startswith(path))
                     return self._send(200, json.dumps({"paths": paths}).encode())
+                if op == "put":
+                    if not isinstance(body.get("size"), int):
+                        return self._send(403, b'{"detail": "a put says its size"}')
+                    service.declared[path] = body["size"]
                 url = "%s/objects/%s" % (service.url, urllib.parse.quote(path))
                 return self._send(200, json.dumps({"url": url}).encode())
 
@@ -197,7 +203,11 @@ class SigningService:
 
             def do_PUT(self):
                 path = self._object()
-                service.objects[path] = self.rfile.read(int(self.headers["Content-Length"]))
+                data = self.rfile.read(int(self.headers["Content-Length"]))
+                if len(data) != service.declared.get(path):
+                    # As a URL signed with its length refuses another.
+                    return self._send(403)
+                service.objects[path] = data
                 return self._send(200)
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)

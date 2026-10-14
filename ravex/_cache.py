@@ -54,7 +54,7 @@ bucket, never through the service. The protocol, one ``POST`` to the address
 with ``Authorization: Bearer <RAVEX_CACHE_TOKEN>`` and a JSON body::
 
     {"op": "get",  "path": "<path>"}    ->  {"url": "<presigned GET>"}
-    {"op": "put",  "path": "<path>"}    ->  {"url": "<presigned PUT>"}
+    {"op": "put",  "path": "<path>", "size": <bytes>}  ->  {"url": "<presigned PUT>"}
     {"op": "list", "path": "<prefix>"}  ->  {"paths": ["<path>", ...]}
 
 Paths are this module's, relative to the store's root; where that root is in
@@ -145,8 +145,14 @@ class SignedStore:
         self.address = address
         self.token = token
 
-    def _ask(self, op: str, path: str) -> Dict[str, object]:
-        body = json.dumps({"op": op, "path": path}).encode("utf-8")
+    def _ask(self, op: str, path: str, size: Optional[int] = None) -> Dict[str, object]:
+        asked: Dict[str, object] = {"op": op, "path": path}
+        if size is not None:
+            # A put says how large it is: the service may sign the URL with
+            # that length, so the bucket takes no more, and refuse a file
+            # past what it keeps.
+            asked["size"] = size
+        body = json.dumps(asked).encode("utf-8")
         request = urllib.request.Request(
             self.address,
             data=body,
@@ -169,8 +175,8 @@ class SignedStore:
             raise ValueError("the signing service answered %s %s with %r" % (op, path, answer))
         return answer
 
-    def _url(self, op: str, path: str) -> str:
-        url = self._ask(op, path).get("url")
+    def _url(self, op: str, path: str, size: Optional[int] = None) -> str:
+        url = self._ask(op, path, size).get("url")
         if not isinstance(url, str) or not url.startswith(("https://", "http://")):
             raise ValueError("the signing service gave no URL for %s %s" % (op, path))
         return url
@@ -187,7 +193,7 @@ class SignedStore:
 
     def put(self, path: str, data: bytes) -> None:
         request = urllib.request.Request(
-            self._url("put", path),
+            self._url("put", path, len(data)),
             data=data,
             method="PUT",
             # The presigned URL signs the host alone; a content type is
