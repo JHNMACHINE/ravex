@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.2 — 2026-10-14
+
+### Changed
+
+- **`ravex cache` moves sixteen files at a time.** A kernel cache is
+  hundreds of small files, and one at a time each waited out a signature
+  and a round trip to the bucket: 517 files took four minutes to pull,
+  longer than the compilation they saved.
+
 ## 0.7.1 — 2026-10-14
 
 ### Added
