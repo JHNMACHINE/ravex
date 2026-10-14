@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.7.1 — 2026-10-14
 
 ### Added
 
@@ -8,7 +8,8 @@
   `AWS_SESSION_TOKEN`) goes to Moonclip with the keys, so a store can be
   written with credentials a bucket hands out scoped to one bucket or one
   prefix and for a time, which sign nothing without their token. The
-  `moonclip` extra now wants Moonclip 0.2.0, the first that takes one.
+  `moonclip` extra now wants Moonclip 0.2.1: 0.2.0 takes the token, 0.2.1
+  also lists an R2 bucket with it, which a restore needs.
 - **A put to a signed cache store says its size.** `ravex cache` sends
   `size` with every `put` it asks a signing service for, so the service can
   sign the URL with that length - the bucket then takes no more - and
