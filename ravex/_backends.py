@@ -376,6 +376,11 @@ class MoonclipBackend(CheckpointBackend):
                 ),
             )
 
+        if storage.is_remote and storage.session_token:
+            # Only when there is one: a Moonclip before 0.2.0 takes no such
+            # keyword, and permanent keys need none.
+            kwargs["s3_session_token"] = storage.session_token
+
         # `MoonclipManager`, not `CheckpointManager`. The latter is Moonclip's
         # convenience layer: it reads RANK/WORLD_SIZE from the environment when
         # it is not told, and under torchrun that made it refuse the

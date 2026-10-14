@@ -203,6 +203,10 @@ class StorageConfig:
     region: str = "us-east-1"
     access_key: Optional[str] = None
     secret_key: Optional[str] = None
+    #: The third part of temporary credentials, which a bucket hands out
+    #: scoped to one bucket or one prefix and for a time: with them the keys
+    #: above sign nothing on their own.
+    session_token: Optional[str] = None
     path_style: bool = False
 
     @property
@@ -223,6 +227,10 @@ class StorageConfig:
             self.secret_key = os.environ.get(
                 "RAVEX_S3_SECRET_KEY"
             ) or os.environ.get("AWS_SECRET_ACCESS_KEY")
+        if self.session_token is None:
+            self.session_token = os.environ.get(
+                "RAVEX_S3_SESSION_TOKEN"
+            ) or os.environ.get("AWS_SESSION_TOKEN") or None
 
 
 @dataclass
