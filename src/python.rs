@@ -772,7 +772,7 @@ impl S3Store {
         region: Option<String>,
         path_style: Option<bool>,
         timeout: u64,
-    ) -> Self {
+    ) -> PyResult<Self> {
         // `us-east-1`, as for a run's store (`StorageConfig.region`): R2 takes
         // it as its `auto`, and S3-compatible servers that check the region
         // expect it, where they would refuse `auto`.
@@ -789,7 +789,10 @@ impl S3Store {
             single_put_limit: SINGLE_PUT_LIMIT,
         };
         let config = if path_style.is_none() { config.with_auto_path_style() } else { config };
-        S3Store { inner: S3Storage::new(config) }
+        // An endpoint that is not an address is the caller's mistake, said
+        // as one, not a failed request later.
+        let inner = S3Storage::new(config).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(S3Store { inner })
     }
 
     /// The object's bytes, or None when there is none.

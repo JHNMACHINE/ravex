@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **`ravex cache` signs its S3 requests with `rusty-s3` (GPU-203).** The
+  bucket client in the compiled core carried a copy of Moonclip's
+  hand-written SigV4; it now signs presigned URLs with `rusty-s3`, as
+  Moonclip has since 0.2, and keeps only what is its own: retries, the
+  multipart upload and its abort, the listing. Still no checksum headers, so
+  R2 and GCS take it as before. Building from source now needs Rust 1.85.
+
 ## 0.7.2 — 2026-10-14
 
 ### Changed

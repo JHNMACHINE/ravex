@@ -34,8 +34,8 @@ The layout under the store's root::
     <name>/<id>/files/<path>  one object per file of the directory
 
 The store is a small interface, :class:`Store`: a directory, or a bucket
-through ``_core.S3Store``, the SigV4 client Ravex's compiled core carries
-for this (``src/s3.rs``). A bucket's keys come from the environment, never
+through ``_core.S3Store``, the S3 client Ravex's compiled core carries
+for this (``src/s3.rs``, signed by ``rusty-s3``). A bucket's keys come from the environment, never
 from the command line, where any user of the machine can read them:
 
 ``RAVEX_CACHE_ACCESS_KEY``, ``RAVEX_CACHE_SECRET_KEY``
