@@ -13,16 +13,31 @@ test_dist_elastic_remesh.py - not repeated here.
 """
 
 import multiprocessing as mp
-import socket
 import traceback
 
 import pytest
 
 
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+def _store_server():
+    """A rendezvous store for one spawned group, held by the test's own process.
+
+    On port 0, with the port read back from the store. The probe it replaces
+    found a free port, closed it and handed the number to a rank to listen on;
+    under `pytest -n` another worker can take it in between, and that rank dies
+    with EADDRINUSE (GPU-191, as in test_emergency_checkpoint and
+    test_dist_multinode). A server that is already listening has no such
+    window. The caller keeps it alive until its ranks are done.
+    """
+    from ravex._dist.rendezvous import _tcp_store
+
+    return _tcp_store("127.0.0.1", 0, True, 120.0)
+
+
+def _store_client(port):
+    """The store `_store_server` opened, from inside a rank."""
+    from ravex._dist.rendezvous import _tcp_store
+
+    return _tcp_store("127.0.0.1", port, False, 120.0)
 
 
 # ─── discovery: no process group involved at all ───────────────────────
@@ -51,9 +66,9 @@ def _discovery_worker(is_master, port, ready_evt, announced_evt, out):
         from ravex._dist.elastic import announce_join, pending_join
 
         if is_master:
-            store = dist.TCPStore(
-                "127.0.0.1", port, world_size=None, is_master=True, use_libuv=False
-            )
+            # The test holds the server (`_store_server`); this side is the
+            # one that polls, and says when it is connected.
+            store = _store_client(port)
             ready_evt.set()
 
             # A poll before the candidate announces itself must not block -
@@ -68,11 +83,9 @@ def _discovery_worker(is_master, port, ready_evt, announced_evt, out):
                 out.put(("rank0_after", second_look))
         else:
             if not ready_evt.wait(timeout=SPAWN_GRACE):
-                out.put(("EXC", "rank 0 never opened the store"))
+                out.put(("EXC", "rank 0 never connected to the store"))
                 return
-            store = dist.TCPStore(
-                "127.0.0.1", port, world_size=None, is_master=False, use_libuv=False
-            )
+            store = _store_client(port)
             announce_join(store, candidate_rank=2, address="10.0.0.9:29500")
             announced_evt.set()
             out.put(("candidate", "announced"))
@@ -85,7 +98,8 @@ def test_a_candidate_with_no_process_group_can_still_announce_itself():
     beyond the raw store - no init_process_group anywhere in this test.
     """
     ctx = mp.get_context("spawn")
-    port = _free_port()
+    server = _store_server()
+    port = server.port
     ready_evt = ctx.Event()
     announced_evt = ctx.Event()
     out = ctx.Queue()
@@ -129,14 +143,13 @@ def _decision_worker(rank, world_size, port, local_view, timeout_seconds, out):
     import os
 
     os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
 
     try:
         import torch.distributed as dist
 
         from ravex._dist.elastic import topology_decision
 
-        dist.init_process_group("gloo", rank=rank, world_size=world_size)
+        dist.init_process_group("gloo", store=_store_client(port), rank=rank, world_size=world_size)
         try:
             decision = topology_decision(local_view, timeout_seconds)
         finally:
@@ -149,7 +162,8 @@ def _decision_worker(rank, world_size, port, local_view, timeout_seconds, out):
 def _run_decision_across_two_ranks(views_by_rank, timeout_seconds=20):
     ctx = mp.get_context("spawn")
     out = ctx.Queue()
-    port = _free_port()
+    server = _store_server()
+    port = server.port
     procs = [
         ctx.Process(
             target=_decision_worker,

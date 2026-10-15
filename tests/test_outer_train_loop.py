@@ -13,7 +13,6 @@ they run mentions neither rounds nor deltas nor peers.
 
 import multiprocessing as mp
 import os
-import socket
 import sys
 
 import pytest
@@ -22,10 +21,26 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("moonclip")
 
 
-def free_port():
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        return probe.getsockname()[1]
+def _store_server():
+    """A rendezvous store for one spawned group, held by the test's own process.
+
+    On port 0, with the port read back from the store. The probe it replaces
+    found a free port, closed it and handed the number to a rank to listen on;
+    under `pytest -n` another worker can take it in between, and that rank dies
+    with EADDRINUSE (GPU-191, as in test_emergency_checkpoint and
+    test_dist_multinode). A server that is already listening has no such
+    window. The caller keeps it alive until its ranks are done.
+    """
+    from ravex._dist.rendezvous import _tcp_store
+
+    return _tcp_store("127.0.0.1", 0, True, 120.0)
+
+
+def _store_client(port):
+    """The store `_store_server` opened, from inside a rank."""
+    from ravex._dist.rendezvous import _tcp_store
+
+    return _tcp_store("127.0.0.1", port, False, 120.0)
 
 
 def a_node(rank, world, port, root, rounds, inner, queue, boundary="public", log=False):
@@ -40,7 +55,7 @@ def a_node(rank, world, port, root, rounds, inner, queue, boundary="public", log
             WORLD_SIZE=str(world),
             LOCAL_RANK="0",
         )
-        dist.init_process_group("gloo", rank=rank, world_size=world)
+        dist.init_process_group("gloo", store=_store_client(port), rank=rank, world_size=world)
 
         import logging
 
@@ -136,7 +151,8 @@ def rounds_of(said):
 def run_two(tmp_path, rounds=3, inner=8, boundary="public", log=False):
     context = mp.get_context("spawn")
     queue = context.Queue()
-    port = free_port()
+    server = _store_server()
+    port = server.port
     workers = [
         context.Process(
             target=a_node,

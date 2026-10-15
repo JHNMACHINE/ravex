@@ -79,10 +79,26 @@ import pytest
 import torch
 
 
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+def _store_server():
+    """A rendezvous store for one spawned group, held by the test's own process.
+
+    On port 0, with the port read back from the store. The probe it replaces
+    found a free port, closed it and handed the number to a rank to listen on;
+    under `pytest -n` another worker can take it in between, and that rank dies
+    with EADDRINUSE (GPU-191, as in test_emergency_checkpoint and
+    test_dist_multinode). A server that is already listening has no such
+    window. The caller keeps it alive until its ranks are done.
+    """
+    from ravex._dist.rendezvous import _tcp_store
+
+    return _tcp_store("127.0.0.1", 0, True, 120.0)
+
+
+def _store_client(port):
+    """The store `_store_server` opened, from inside a rank."""
+    from ravex._dist.rendezvous import _tcp_store
+
+    return _tcp_store("127.0.0.1", port, False, 120.0)
 
 
 def _toy_module():
@@ -91,7 +107,7 @@ def _toy_module():
     return nn.Sequential(nn.Linear(12, 8), nn.ReLU(), nn.Linear(8, 4))
 
 
-def _grow_worker(rank, store_port, socket_port, source_dir, dest_dir, out):
+def _grow_worker(rank, store_port, source_dir, dest_dir, out):
     try:
         import torch.distributed as dist
         from torch.distributed.fsdp import fully_shard
@@ -106,18 +122,9 @@ def _grow_worker(rank, store_port, socket_port, source_dir, dest_dir, out):
         )
 
         is_rank0 = rank == 0
-        if is_rank0:
-            base_store = dist.TCPStore(
-                "127.0.0.1", store_port, world_size=None, is_master=True, use_libuv=False
-            )
-        else:
-            # Ranks 1 and 2 both need rank 0's server up first - the test
-            # gives it a moment below rather than a formal barrier, since no
-            # group exists yet for rank 2 to be barriered on.
-            time.sleep(0.5)
-            base_store = dist.TCPStore(
-                "127.0.0.1", store_port, world_size=None, is_master=False, use_libuv=False
-            )
+        # The test holds the server (`_store_server`), so every rank finds it
+        # already listening and none has to wait for another to open it.
+        base_store = _store_client(store_port)
 
         # ─── ranks 0/1: the original training group, generation 0 ──────
         if rank in (0, 1):
@@ -157,10 +164,14 @@ def _grow_worker(rank, store_port, socket_port, source_dir, dest_dir, out):
 
         # ─── rank 2: announce itself while 0/1 are mid-training ─────────
         if rank == 2:
+            # Port 0, and the port the system chose is what is announced: a
+            # number probed beforehand could be taken by another pytest
+            # worker before this bind (GPU-191).
             server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            server.bind(("127.0.0.1", socket_port))
+            server.bind(("127.0.0.1", 0))
             server.listen(1)
-            announce_join(base_store, candidate_rank=2, address="127.0.0.1:%d" % socket_port)
+            address = "127.0.0.1:%d" % server.getsockname()[1]
+            announce_join(base_store, candidate_rank=2, address=address)
 
         # ─── rank 0: discover the candidate ──────────────────────────────
         candidate_address = None
@@ -186,7 +197,8 @@ def _grow_worker(rank, store_port, socket_port, source_dir, dest_dir, out):
         sock = None
         if is_rank0:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.connect(("127.0.0.1", socket_port))
+            host, _, port = candidate_address.rpartition(":")
+            sock.connect((host, int(port)))
             prestage_send(sock, source_dir)
         elif rank == 2:
             conn, _ = server.accept()
@@ -271,13 +283,12 @@ def test_a_candidate_grows_the_group_without_a_process_restart(tmp_path):
     dest_dir = str(tmp_path / "dest_store")
 
     ctx = mp.get_context("spawn")
-    store_port = _free_port()
-    socket_port = _free_port()
+    server = _store_server()
     out = ctx.Queue()
     procs = [
         ctx.Process(
             target=_grow_worker,
-            args=(r, store_port, socket_port, source_dir, dest_dir, out),
+            args=(r, server.port, source_dir, dest_dir, out),
         )
         for r in (0, 1, 2)
     ]

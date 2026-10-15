@@ -32,16 +32,31 @@ machines, where the link has been measured at 12 MB/s and is the whole story
 import datetime
 import multiprocessing as mp
 import os
-import socket
 import traceback
 
 import pytest
 
 
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+def _store_server():
+    """A rendezvous store for one spawned group, held by the test's own process.
+
+    On port 0, with the port read back from the store. The probe it replaces
+    found a free port, closed it and handed the number to a rank to listen on;
+    under `pytest -n` another worker can take it in between, and that rank dies
+    with EADDRINUSE (GPU-191, as in test_emergency_checkpoint and
+    test_dist_multinode). A server that is already listening has no such
+    window. The caller keeps it alive until its ranks are done.
+    """
+    from ravex._dist.rendezvous import _tcp_store
+
+    return _tcp_store("127.0.0.1", 0, True, 120.0)
+
+
+def _store_client(port):
+    """The store `_store_server` opened, from inside a rank."""
+    from ravex._dist.rendezvous import _tcp_store
+
+    return _tcp_store("127.0.0.1", port, False, 120.0)
 
 
 def _write_file(path, content: bytes) -> None:
@@ -95,9 +110,12 @@ def _both_roads_worker(rank, port, root, out):
         from ravex._dist.replication import RingLink, exchange_stores
 
         os.environ["MASTER_ADDR"] = "127.0.0.1"
-        os.environ["MASTER_PORT"] = str(port)
         dist.init_process_group(
-            "gloo", rank=rank, world_size=2, timeout=datetime.timedelta(seconds=60)
+            "gloo",
+            store=_store_client(port),
+            rank=rank,
+            world_size=2,
+            timeout=datetime.timedelta(seconds=60),
         )
 
         source = os.path.join(root, "rank0-store")
@@ -165,9 +183,12 @@ def _backwards_worker(rank, port, root, out):
         from ravex._dist.replication import RingLink, exchange_stores
 
         os.environ["MASTER_ADDR"] = "127.0.0.1"
-        os.environ["MASTER_PORT"] = str(port)
         dist.init_process_group(
-            "gloo", rank=rank, world_size=2, timeout=datetime.timedelta(seconds=60)
+            "gloo",
+            store=_store_client(port),
+            rank=rank,
+            world_size=2,
+            timeout=datetime.timedelta(seconds=60),
         )
 
         held = os.path.join(root, "copy-of-rank0")
@@ -212,7 +233,8 @@ def _backwards_worker(rank, port, root, out):
 def _run(worker, tmp_path):
     ctx = mp.get_context("spawn")
     out = ctx.Queue()
-    port = _free_port()
+    server = _store_server()
+    port = server.port
     procs = [
         ctx.Process(target=worker, args=(rank, port, str(tmp_path), out))
         for rank in (0, 1)

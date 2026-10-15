@@ -40,17 +40,32 @@ the piece that needs real hardware (see the design notes).
 
 import datetime
 import multiprocessing as mp
-import socket
 import traceback
 
 import pytest
 import torch
 
 
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+def _store_server():
+    """A rendezvous store for one spawned group, held by the test's own process.
+
+    On port 0, with the port read back from the store. The probe it replaces
+    found a free port, closed it and handed the number to a rank to listen on;
+    under `pytest -n` another worker can take it in between, and that rank dies
+    with EADDRINUSE (GPU-191, as in test_emergency_checkpoint and
+    test_dist_multinode). A server that is already listening has no such
+    window. The caller keeps it alive until its ranks are done.
+    """
+    from ravex._dist.rendezvous import _tcp_store
+
+    return _tcp_store("127.0.0.1", 0, True, 120.0)
+
+
+def _store_client(port):
+    """The store `_store_server` opened, from inside a rank."""
+    from ravex._dist.rendezvous import _tcp_store
+
+    return _tcp_store("127.0.0.1", port, False, 120.0)
 
 
 def _toy_module():
@@ -123,9 +138,10 @@ def one_rank_group():
 
     if dist.is_initialized():  # pragma: no cover - a leaked group from elsewhere
         dist.destroy_process_group()
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29615")
-    dist.init_process_group("gloo", rank=0, world_size=1)
+    # On a server of its own rather than MASTER_PORT 29615: two pytest
+    # workers in this fixture at once would both listen there (GPU-191).
+    server = _store_server()
+    dist.init_process_group("gloo", store=server, rank=0, world_size=1)
     try:
         yield
     finally:
@@ -148,16 +164,14 @@ def _remesh_worker(rank, is_rank0, port, join_evt, out):
 
         from ravex._dist import elastic
 
+        # The test holds the server (`_store_server`); rank 0 still says when
+        # it is connected, so the others join after it as before.
         if is_rank0:
-            store = dist.TCPStore(
-                "127.0.0.1", port, world_size=None, is_master=True, use_libuv=False
-            )
+            store = _store_client(port)
             join_evt.set()
         else:
             join_evt.wait(timeout=15)
-            store = dist.TCPStore(
-                "127.0.0.1", port, world_size=None, is_master=False, use_libuv=False
-            )
+            store = _store_client(port)
 
         def build():
             """The factory. What `@ravex.train_loop` finally makes available."""
@@ -230,7 +244,8 @@ class TestRegroupingAtANewWorldSize:
 
     def test_a_fresh_module_reloaded_from_full_tensors_survives_a_real_regroup(self):
         ctx = mp.get_context("spawn")
-        port = _free_port()
+        server = _store_server()
+        port = server.port
         join_evt = ctx.Event()
         out = ctx.Queue()
         procs = [

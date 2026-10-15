@@ -40,16 +40,31 @@ socket does not disturb the real training group's own collectives.
 import datetime
 import multiprocessing as mp
 import os
-import socket
 import traceback
 
 import pytest
 
 
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+def _store_server():
+    """A rendezvous store for one spawned group, held by the test's own process.
+
+    On port 0, with the port read back from the store. The probe it replaces
+    found a free port, closed it and handed the number to a rank to listen on;
+    under `pytest -n` another worker can take it in between, and that rank dies
+    with EADDRINUSE (GPU-191, as in test_emergency_checkpoint and
+    test_dist_multinode). A server that is already listening has no such
+    window. The caller keeps it alive until its ranks are done.
+    """
+    from ravex._dist.rendezvous import _tcp_store
+
+    return _tcp_store("127.0.0.1", 0, True, 120.0)
+
+
+def _store_client(port):
+    """The store `_store_server` opened, from inside a rank."""
+    from ravex._dist.rendezvous import _tcp_store
+
+    return _tcp_store("127.0.0.1", port, False, 120.0)
 
 
 def _write_file(path, content: bytes) -> None:
@@ -74,19 +89,14 @@ def _coexistence_worker(rank, main_port, side_port, out):
         import torch.distributed as dist
 
         if rank in (0, 1):
-            os.environ["MASTER_ADDR"] = "127.0.0.1"
-            os.environ["MASTER_PORT"] = str(main_port)
-            dist.init_process_group("gloo", rank=rank, world_size=2)
+            dist.init_process_group("gloo", store=_store_client(main_port), rank=rank, world_size=2)
             before = torch.tensor([1.0])
             dist.all_reduce(before)
             out.put((rank, "default_before", before.item()))
 
         if rank in (0, 2):
             side_rank = 0 if rank == 0 else 1
-            side_store = dist.TCPStore(
-                "127.0.0.1", side_port, world_size=2,
-                is_master=(rank == 0), use_libuv=False,
-            )
+            side_store = _store_client(side_port)
             side_pg = dist.ProcessGroupGloo(
                 side_store, side_rank, 2, datetime.timedelta(seconds=10)
             )
@@ -105,11 +115,12 @@ def _coexistence_worker(rank, main_port, side_port, out):
 
 def test_a_raw_side_group_does_not_disturb_the_live_default_group():
     ctx = mp.get_context("spawn")
-    main_port = _free_port()
-    side_port = _free_port()
+    main_server, side_server = _store_server(), _store_server()
     out = ctx.Queue()
     procs = [
-        ctx.Process(target=_coexistence_worker, args=(r, main_port, side_port, out))
+        ctx.Process(
+            target=_coexistence_worker, args=(r, main_server.port, side_server.port, out)
+        )
         for r in (0, 1, 2)
     ]
     for p in procs:
@@ -142,7 +153,7 @@ def test_a_raw_side_group_does_not_disturb_the_live_default_group():
 # ─── the real pre-staging path: a plain socket, GPU-97's skip on top ────
 
 
-def _prestage_worker(rank, main_port, socket_port, source_dir, dest_dir, out):
+def _prestage_worker(rank, main_port, address_queue, source_dir, dest_dir, out):
     try:
         import socket as socket_module
         import torch
@@ -158,25 +169,25 @@ def _prestage_worker(rank, main_port, socket_port, source_dir, dest_dir, out):
         sent_bytes = {"round1": 0, "round2": 0}
 
         if rank in (0, 1):
-            os.environ["MASTER_ADDR"] = "127.0.0.1"
-            os.environ["MASTER_PORT"] = str(main_port)
-            dist.init_process_group("gloo", rank=rank, world_size=2)
+            dist.init_process_group("gloo", store=_store_client(main_port), rank=rank, world_size=2)
             dist.all_reduce(torch.tensor([1.0]))  # a real training step
 
         sock = None
         if rank == 2:
             # The candidate listens - in a real join this address is exactly
             # what `ravex._dist.elastic.announce_join` would have advertised.
+            # Port 0, and the port the system chose goes to rank 0: a number
+            # probed beforehand could be taken by another pytest worker
+            # before this bind (GPU-191).
             server = socket_module.socket(socket_module.AF_INET, socket_module.SOCK_STREAM)
-            server.bind(("127.0.0.1", socket_port))
+            server.bind(("127.0.0.1", 0))
             server.listen(1)
+            address_queue.put(server.getsockname()[1])
             out.put((rank, "listening", None))
         if rank == 0:
-            # Give rank 2 a moment to bind before connecting.
-            import time
-            time.sleep(1.0)
+            port = address_queue.get(timeout=60)
             sock = socket_module.socket(socket_module.AF_INET, socket_module.SOCK_STREAM)
-            sock.connect(("127.0.0.1", socket_port))
+            sock.connect(("127.0.0.1", port))
 
         if rank == 2:
             conn, _ = server.accept()
@@ -230,13 +241,13 @@ def test_the_second_round_sends_only_what_changed(tmp_path):
     _write_file(os.path.join(source_dir, "b.bin"), b_content_v1)
 
     ctx = mp.get_context("spawn")
-    main_port = _free_port()
-    socket_port = _free_port()
+    server = _store_server()
+    address_queue = ctx.Queue()
     out = ctx.Queue()
     procs = [
         ctx.Process(
             target=_prestage_worker,
-            args=(r, main_port, socket_port, source_dir, dest_dir, out),
+            args=(r, server.port, address_queue, source_dir, dest_dir, out),
         )
         for r in (0, 1, 2)
     ]

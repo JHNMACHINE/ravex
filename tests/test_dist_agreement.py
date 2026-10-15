@@ -20,8 +20,6 @@ processes with a real ``TCPStore`` behind it.
 
 import datetime
 import multiprocessing as mp
-import os
-import socket
 import threading
 import time
 import traceback
@@ -210,10 +208,26 @@ def test_the_store_road_is_skipped_when_the_config_says_collectives(monkeypatch)
 # ─── both roads, two real processes, a real store ───────────────────────────
 
 
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+def _store_server():
+    """A rendezvous store for one spawned group, held by the test's own process.
+
+    On port 0, with the port read back from the store. The probe it replaces
+    found a free port, closed it and handed the number to a rank to listen on;
+    under `pytest -n` another worker can take it in between, and that rank dies
+    with EADDRINUSE (GPU-191, as in test_emergency_checkpoint and
+    test_dist_multinode). A server that is already listening has no such
+    window. The caller keeps it alive until its ranks are done.
+    """
+    from ravex._dist.rendezvous import _tcp_store
+
+    return _tcp_store("127.0.0.1", 0, True, 120.0)
+
+
+def _store_client(port):
+    """The store `_store_server` opened, from inside a rank."""
+    from ravex._dist.rendezvous import _tcp_store
+
+    return _tcp_store("127.0.0.1", port, False, 120.0)
 
 
 def _roads_worker(rank, port, out):
@@ -223,10 +237,12 @@ def _roads_worker(rank, port, out):
         from ravex._dist.collectives import all_ranks_agree
         from ravex._dist.agreement import all_gather_scalar, rendezvous_store
 
-        os.environ["MASTER_ADDR"] = "127.0.0.1"
-        os.environ["MASTER_PORT"] = str(port)
         dist.init_process_group(
-            "gloo", rank=rank, world_size=2, timeout=datetime.timedelta(seconds=60)
+            "gloo",
+            store=_store_client(port),
+            rank=rank,
+            world_size=2,
+            timeout=datetime.timedelta(seconds=60),
         )
 
         store = rendezvous_store()
@@ -256,7 +272,8 @@ def _roads_worker(rank, port, out):
 def test_both_roads_give_the_same_answer():
     ctx = mp.get_context("spawn")
     out = ctx.Queue()
-    port = _free_port()
+    server = _store_server()
+    port = server.port
     procs = [
         ctx.Process(target=_roads_worker, args=(rank, port, out)) for rank in (0, 1)
     ]
