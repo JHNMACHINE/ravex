@@ -928,6 +928,59 @@ def store_config_at(config, *parts: str):
     return replace(config, storage=storage)
 
 
+#: The directory the outer loop's state is kept in, inside the store of the
+#: checkpoints it goes with (GPU-212).
+OUTER_STORE = "outer_loop"
+
+
+def outer_store_config(config):
+    """The config of the store an outer loop keeps its own state in.
+
+    GPU-212. The outer parameters and the momentum change only when a round
+    closes, so they are saved then, once a round, and not with the
+    checkpoint: with Moonclip's deltas a checkpoint is taken at every step,
+    and carrying two fp32 copies of the model in each made every step pay for
+    a state that had not moved. Measured on the rendezvous tests, rounds went
+    from 7 s to 9-13 s and then 40 s, and a node rejoining missed its window.
+
+    Inside the checkpoints' store, so it goes wherever they go: a store
+    restored from the bucket brings it back, a fork finds it beside the
+    parent's. Its own Moonclip store and not files beside the manifest,
+    because it needs what Moonclip gives a store: retention, and deletes
+    mirrored to the bucket - a file per round would be a model's size twice
+    over per round, kept forever.
+
+    Every snapshot a full one, written exactly. A delta against the last
+    round is a chain to keep whole for a save that happens once a round, and
+    a cast from ``save_dtype`` would put the node a quantization away from
+    every peer it is meant to agree with bit for bit. Enough snapshots to
+    cover the steps the checkpoints' own retention keeps - one for each
+    round inside it and the one before - so a fork from any step that is
+    still there finds the round it belongs to. With ``outer_round_seconds``
+    a round may be shorter than ``outer_inner_steps``, and then the oldest
+    of those steps can be past what is kept; a fork from there starts the
+    outer loop from the weights, as one from a checkpoint without the state
+    does, and says so.
+    """
+    from dataclasses import replace
+
+    if config.delta:
+        window = config.checkpoint_every + 1
+    else:
+        window = config.checkpoint_every * max(int(config.keep_last), 1)
+    per_round = max(int(config.outer_inner_steps), 1)
+    rounds = -(-window // per_round) + 1
+    return replace(
+        store_config_at(config, OUTER_STORE),
+        delta=False,
+        save_dtype=None,
+        keep_base_in_memory=False,
+        keep_last=max(rounds, 2),
+        audit_log=False,
+        fork_from=None,
+    )
+
+
 def rank_suffix(rank: int) -> str:
     """The directory one rank's store lives in, under the configured path."""
     return "rank_%d" % rank

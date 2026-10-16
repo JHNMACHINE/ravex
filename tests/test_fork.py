@@ -374,3 +374,49 @@ train()
         manager = moonclip.MoonclipManager(str(parent))
         if hasattr(manager, "pinned_steps"):
             assert 4 in manager.pinned_steps(), "the parent's own writes dropped the fork's pin"
+
+
+class TestOuterLoopState:
+    """GPU-212: a fork's outer loop starts from the state its parent saved
+    for the step forked from, kept beside the parent's checkpoints."""
+
+    def runtime(self, tmp_path):
+        from ravex._config import RavexConfig
+        from ravex._runtime import RavexRuntime
+
+        config = RavexConfig()
+        config.storage.path = str(tmp_path / "fork")
+        config.outer_inner_steps = 8
+        return RavexRuntime(config)
+
+    def test_the_newest_state_at_or_before_the_step_is_taken_and_pinned(self, tmp_path):
+        pytest.importorskip("moonclip")
+        from ravex._backends import get_backend, outer_store_config
+
+        runtime = self.runtime(tmp_path)
+        parent = tmp_path / "parent"
+        config = runtime.config.__class__()
+        config.storage.path = str(parent)
+        store = get_backend(outer_store_config(config))
+        for step, value in ((8, 1.0), (16, 2.0), (24, 3.0)):
+            store.save(step, {"round": step // 8 + 1, "outer": {"w": torch.full((2,), value)}}, {})
+        store.close()
+
+        state, saved = runtime._parent_outer_state(str(parent), 20, pin=True)
+        assert saved == 16, "a round closed at 24 is after the step forked from"
+        assert state["round"] == 3
+        assert torch.equal(state["outer"]["w"], torch.full((2,), 2.0))
+        reopened = get_backend(outer_store_config(config))
+        try:
+            assert reopened._manager.pinned_steps() == [16]
+        finally:
+            reopened.close()
+
+    def test_a_parent_that_trained_on_one_node_has_none_and_is_left_alone(self, tmp_path):
+        from ravex._backends import OUTER_STORE
+
+        runtime = self.runtime(tmp_path)
+        parent = tmp_path / "parent"
+        parent.mkdir()
+        assert runtime._parent_outer_state(str(parent), 20, pin=True) == (None, None)
+        assert not (parent / OUTER_STORE).exists(), "opening a store makes it"

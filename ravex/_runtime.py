@@ -170,6 +170,9 @@ class RavexRuntime:
         self._enabled = self.config.enabled
         self._patches = None
         self._backend = None
+        #: Where the outer loop's state is saved, once a round (GPU-212). See
+        #: `_outer_store_backend`.
+        self._outer_store = None
         self._resume_manager: Optional[ResumeManager] = None
         self._storage_announced = False
         #: Set by the probe: storage is local *and* each machine has its own.
@@ -1127,6 +1130,9 @@ class RavexRuntime:
             # Training rounds start after the seed round, which used number 0;
             # a resumed run carries on from the round its source was in.
             loop.round_number = max(int(loop.round_number), SEED_ROUND + 1)
+        # What every node now holds, saved before the first round closes: a
+        # resume in between would otherwise start the loop from the weights.
+        self._save_outer_state(loop)
         self._outer_peers = self._membership.peers_at(loop.round_number)
         self._say_who_is_unreachable(exchange, self._outer_peers)
         logger.info(
@@ -1143,18 +1149,111 @@ class RavexRuntime:
         )
         return loop
 
-    def _load_resumed_outer(self, loop) -> None:
-        """Put the outer state the resumed checkpoint carried into ``loop``.
+    def _outer_store_backend(self):
+        """The store the outer loop's state is saved in, opened on first use.
 
-        GPU-212. A resume takes the checkpoint's outer hyperparameters, the
-        momentum among them, as it takes the inner optimizer's; a fork, or a
-        run told to keep its script's hyperparameters, keeps the ones it was
-        started with - changing them is what those are for. A checkpoint from
-        before the outer state was saved has none, and the loop starts from
-        the weights as it always did.
+        GPU-212; see :func:`ravex._backends.outer_store_config`. Not opened
+        with the checkpoints' backend: by the time the loop exists the resume
+        has happened, a store restored from the bucket has brought this one
+        down with it, and a run that never builds an outer loop never makes
+        the directory.
+        """
+        if self._outer_store is None:
+            from ravex._backends import _per_rank_config, get_backend, outer_store_config
+
+            self._outer_store = get_backend(
+                outer_store_config(_per_rank_config(self.config, self._per_rank_active()))
+            )
+        return self._outer_store
+
+    def _save_outer_state(self, loop) -> None:
+        """Save ``loop``'s state under this step, for a resume to start from.
+
+        GPU-212. Called where the state changes - the start, a round closing,
+        a rejoin - and nowhere else, which is the whole point of keeping it
+        apart from the checkpoint. Its step is the checkpoints' own: a round
+        closes at a batch boundary before the checkpoint of that boundary is
+        taken, so the checkpoint at step ``k`` already holds the weights the
+        state saved at ``k`` goes with, and so does every one after it until
+        the next round closes. Written by whichever process writes the
+        checkpoints. Copied first: the save returns before the write and the
+        tensors are the live ones.
+        """
+        if not self._enabled or not (self._per_rank_active() or is_main_process()):
+            return
+        step = int(self.registry.step_count)
+        try:
+            from ravex._backends import _cpu_copy
+
+            self._outer_store_backend().save(
+                step,
+                _cpu_copy(loop.state_dict()),
+                {"step": str(step), "round": str(int(loop.round_number))},
+            )
+        except Exception as exc:
+            # The run trains on. What is lost is a resume from here taking
+            # the momentum with it, and the next round tries again.
+            logger.warning(
+                "Could not save the outer loop's state at round %d (%s: %s); a "
+                "resume before the next round starts the loop from the weights",
+                loop.round_number, type(exc).__name__, exc,
+            )
+
+    @staticmethod
+    def _outer_state_at(store, step: int):
+        """The newest outer state ``store`` holds at or before ``step``, and
+        the step it was saved at - ``(None, None)`` if there is none."""
+        if store is None:
+            return None, None
+        earlier = [known for known in store.known_steps() if known <= step]
+        if not earlier:
+            return None, None
+        saved = max(earlier)
+        return store.load_step(saved), saved
+
+    def _load_resumed_outer(self, loop) -> None:
+        """Put the outer state the resumed checkpoint goes with into ``loop``.
+
+        GPU-212. The newest state saved at or before the step the run resumed
+        from: the state changes only when a round closes, so that one is
+        what the loop held at that step. A fork brings its parent's, read by
+        :meth:`_fork` while the parent's store was open. Nothing about where
+        in its round the step was is kept: the seed round puts every node back
+        at its round's start, the furthest node's.
+
+        A resume takes the saved outer hyperparameters, the momentum among
+        them, as it takes the inner optimizer's; a fork, or a run told to keep
+        its script's hyperparameters, keeps the ones it was started with -
+        changing them is what those are for. With no state saved - a run from
+        before this was saved, a parent that trained on one node - the loop
+        starts from the weights as it always did.
         """
         manager = self._resume_manager
-        state = getattr(manager, "restored_outer", None) if manager is not None else None
+        if manager is None:
+            return
+        state = getattr(manager, "restored_outer", None)
+        saved = getattr(manager, "restored_outer_step", None)
+        resumed = getattr(manager, "restored_step", None)
+        if state is None and resumed is not None and self._fork_parent is None:
+            try:
+                store = self._outer_store_backend()
+                if not store.known_steps() and self.config.storage.is_remote:
+                    # The checkpoints came from somewhere this one did not:
+                    # their own store was already here and this one was not.
+                    store.restore_from_remote()
+                state, saved = self._outer_state_at(store, int(resumed))
+            except Exception as exc:
+                logger.warning(
+                    "Could not read the outer loop's saved state (%s: %s); the "
+                    "loop starts from this node's weights, with no momentum",
+                    type(exc).__name__, exc,
+                )
+                return
+            if state is None:
+                logger.info(
+                    "No outer loop state saved at or before step %d; the loop "
+                    "starts from this node's weights, with no momentum.", resumed,
+                )
         if not state:
             return
         chosen = loop.optimizer.state_dict()
@@ -1171,8 +1270,9 @@ class RavexRuntime:
             for name in ("lr", "momentum", "nesterov", "momentum_warmup"):
                 setattr(loop.optimizer, name, chosen[name])
         logger.info(
-            "Outer loop resumed at round %d, %d model step(s), from the checkpoint.",
-            loop.round_number, loop.model_steps,
+            "Outer loop resumed at round %d, %d model step(s), from its state "
+            "saved at step %s.",
+            loop.round_number, loop.model_steps, saved,
         )
 
     def _say_who_is_unreachable(self, exchange, peers) -> None:
@@ -1396,6 +1496,8 @@ class RavexRuntime:
         logger.warning(
             "Rejoined the run as node %d at round %d.", node, self._outer.round_number
         )
+        # The members' state, taken in place of this node's own.
+        self._save_outer_state(self._outer)
 
     def _round_root(self, node: int) -> str:
         """Where node ``node`` stages its round reports. Under the epoch, after
@@ -1510,6 +1612,7 @@ class RavexRuntime:
                 "Joined epoch %d of the run as node %d at round %d.",
                 epoch, node, self._outer.round_number,
             )
+            self._save_outer_state(self._outer)
             return
 
         store.set(_FAILOVER_ROUND_KEY % node, str(mine).encode("utf-8"))
@@ -1539,6 +1642,7 @@ class RavexRuntime:
             "at %s; parameters from node %d.",
             epoch, node, base, self._outer.round_number, where, source,
         )
+        self._save_outer_state(self._outer)
         if mine < furthest:
             self._leave_and_rejoin(RoundSplitError(
                 "this node was at round %d when the rendezvous died and node "
@@ -1810,6 +1914,8 @@ class RavexRuntime:
                 report.get("between_wait_seconds", 0.0),
             )
         self._write_model_series(report, time.monotonic() - started)
+        # The round is applied, and this is the state until the next closes.
+        self._save_outer_state(self._outer)
 
     def _write_model_series(self, report: Dict[str, Any], seconds: float) -> None:
         """Log the round as a point on the model's series (GPU-135).
@@ -2092,6 +2198,9 @@ class RavexRuntime:
                     source,
                     parent_record.get("config", {}).get("backend") or "this",
                 )
+            outer_state, outer_step = self._parent_outer_state(
+                staging or source, step, pin=staging is None
+            )
         finally:
             if staging is not None:
                 # Discarded rather than closed: closing a store with a remote
@@ -2110,6 +2219,8 @@ class RavexRuntime:
             self._require_everything_restored()
             self._keep_hyperparameters(chosen)
             self._fork_parent = {"run": parent_record.get("run_id"), "step": int(step)}
+            manager.restored_outer = outer_state
+            manager.restored_outer_step = outer_step
             logger.info(
                 "Forked from %s at step %d; this run writes to %s",
                 parent_record.get("run_id") or source,
@@ -2200,6 +2311,50 @@ class RavexRuntime:
                 "model(s) %s have no state in that checkpoint: their shape differs from "
                 "the one it was written with" % ", ".join(missing)
             )
+
+    def _parent_outer_state(self, root: str, step: int, pin: bool):
+        """The outer loop's state a parent saved at or before ``step``, and the
+        step it was saved at (GPU-212).
+
+        ``root`` is the parent's store on this machine - its own directory, or
+        the copy a bucket parent was brought down into, which brought this
+        along with it. A parent that trained on one node never saved one, and
+        ``(None, None)`` starts the fork's outer loop from the weights. The
+        directory is looked for before anything is opened: opening a store
+        makes it, and nothing is written into a parent but a pin.
+        """
+        import copy
+
+        from ravex._backends import OUTER_STORE, get_backend, outer_store_config
+
+        if not os.path.isdir(os.path.join(root, OUTER_STORE)):
+            return None, None
+        config = copy.deepcopy(self.config)
+        config.storage.type = "local"
+        config.storage.path = root
+        config.storage.prefix = ""
+        config.fork_from = None
+        store = None
+        try:
+            store = get_backend(outer_store_config(config))
+            state, saved = self._outer_state_at(store, step)
+            if saved is not None and pin and not store.pin(saved):
+                logger.info(
+                    "The outer loop state %s saved at step %d could not be pinned; "
+                    "retention there may take it before this run saves its own",
+                    root, saved,
+                )
+            return state, saved
+        except Exception as exc:
+            logger.warning(
+                "Could not read the outer loop state of %s (%s: %s); the fork's "
+                "outer loop starts from the weights, with no momentum",
+                root, type(exc).__name__, exc,
+            )
+            return None, None
+        finally:
+            if store is not None:
+                store.close()
 
     def _open_parent_store(self, source: str, record: Dict[str, Any]) -> Any:
         """The parent's store, as the backend that wrote it would read it."""
@@ -2453,15 +2608,6 @@ class RavexRuntime:
             extra = self._collect_extra_state()
             if extra is not None:
                 state["extra"] = extra
-
-            # The outer loop's own state (GPU-212): the outer parameters - the
-            # anchor this round's work is measured from, not the weights - the
-            # momentum, the round and the model's steps. Without it a resumed
-            # node rebuilt the loop from its weights mid-round, with no
-            # momentum and round 0, and a run of several nodes went on from
-            # whichever arrived first.
-            if self._outer:
-                state["outer_loop"] = self._outer.state_dict()
 
             # Under `per_rank` there is nothing on rank 0 to write for the
             # other ranks — each holds its own shard and writes it into its own
@@ -3555,6 +3701,13 @@ class RavexRuntime:
                 self._metrics = None
             if self._backend is not None:
                 self._backend.close()
+            if self._outer_store is not None:
+                # Its last write, and with a bucket its last sync.
+                try:
+                    self._outer_store.close()
+                except Exception as exc:
+                    logger.warning("Could not close the outer loop's state store: %s", exc)
+                self._outer_store = None
             if self._shipper is not None:
                 # After the backend closed, so the final checkpoint is in the
                 # list; then whatever is still queued gets a last chance.

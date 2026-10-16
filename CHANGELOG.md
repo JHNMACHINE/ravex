@@ -4,11 +4,15 @@
 
 ### Changed
 
-- **A run on several nodes resumes where it was (GPU-212).** The checkpoint
-  carries the outer loop's state - outer parameters, momentum, round, model
-  steps - which `OuterOptimizer.state_dict()` was written for and nothing
-  saved: a resumed node rebuilt the loop from its weights mid-round, at round
-  0 with no momentum. And the run starts from the node that had got
+- **A run on several nodes resumes where it was (GPU-212).** Each node saves
+  the outer loop's state - outer parameters, momentum, round, model steps -
+  which `OuterOptimizer.state_dict()` was written for and nothing saved: a
+  resumed node rebuilt the loop from its weights mid-round, at round 0 with
+  no momentum. It is saved once a round, in `outer_loop/` inside the
+  checkpoints' store, and not in each checkpoint: with a delta per step that
+  was two copies of the model at every step, and on the rendezvous tests the
+  rounds slowed from 7 s to 40 s. A resume takes the newest at or before its
+  step, a fork its parent's. And the run starts from the node that had got
   furthest, decided once on the store, with its full state; it used to take
   the parameters alone from rank 0, the node that registered first, so
   nodes resumed from checkpoints of different ages could all step back to the

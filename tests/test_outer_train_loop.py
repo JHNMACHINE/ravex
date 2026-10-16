@@ -347,10 +347,22 @@ def test_without_a_rendezvous_the_run_carries_on_locally(tmp_path, monkeypatch):
 
 @pytest.mark.skipif(sys.platform == "darwin", reason="spawn + gloo is slow on macOS")
 def test_a_resumed_run_carries_on_from_the_round_it_stopped_at(tmp_path):
-    """GPU-212: the outer loop's state is in the checkpoint. A run resumed
-    goes on from the round it was in, with the momentum it had, rather than
-    from round 0 with none - and its two nodes still hold one model."""
+    """GPU-212: the outer loop's state is saved beside the checkpoints. A run
+    resumed goes on from the round it was in, with the momentum it had,
+    rather than from round 0 with none - and its two nodes still hold one
+    model."""
+    moonclip = pytest.importorskip("moonclip")
     run_two(tmp_path, rounds=3)
+
+    # Once a round and apart, not in every checkpoint: with a delta per step
+    # that was two copies of the model per step, for a state that moves only
+    # when a round closes, and the rounds slowed until a rejoin missed them.
+    store = tmp_path / "cwd0" / "checkpoints"
+    names = [t["name"] for t in moonclip.MoonclipManager(storage_root=str(store)).describe_latest()["tensors"]]
+    assert not [name for name in names if "outer_loop" in name], names
+    saved = moonclip.MoonclipManager(storage_root=str(store / "outer_loop")).list_snapshots()
+    assert len(saved) == 4, "the start and one per round: %s" % [s["step"] for s in saved]
+
     results = run_two(tmp_path, rounds=1, resume=True)
     # Under one process group only rank 0 writes the checkpoint, so it is the
     # one that resumes; rank 1 starts from nothing and takes rank 0's state.
