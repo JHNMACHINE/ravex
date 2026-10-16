@@ -987,7 +987,8 @@ class RavexRuntime:
         """
         from ravex._dist.agreement import rendezvous_store
         from ravex._dist.collectives import get_rank, get_world_size
-        from ravex._dist.exchange import SEED_ROUND, adopt_outer_state
+        from ravex._dist.exchange import SEED_ROUND, seed_source
+        from ravex._dist.membership import adopt_run_state
         from functools import partial
 
         from ravex._dist import rendezvous as _rendezvous
@@ -1104,15 +1105,28 @@ class RavexRuntime:
                 )
             self._membership.take_in_joined()
         else:
-            if not adopt_outer_state(loop, exchange, 0, rank, deadline):
+            self._load_resumed_outer(loop)
+            # The node that had got furthest gives everyone its state (GPU-212):
+            # resumed from checkpoints of different ages, the run goes on from
+            # the newest, not from whichever node registered first. A run that
+            # starts fresh has every node at round 0, and that is rank 0.
+            # Before saying how far it got: nobody asks for the seed until the
+            # source is decided, and nobody decides before hearing every node.
+            exchange.forget_state(SEED_ROUND)
+            source = seed_source(
+                store, exchange.scope_base or exchange.scope, rank, world,
+                (int(loop.round_number), int(loop.model_steps)), deadline,
+            )
+            if not adopt_run_state(loop, exchange, source, rank, deadline):
                 raise RuntimeError(
-                    "could not take the starting parameters from rank 0 within "
+                    "could not take the run's starting state from node %d within "
                     "%ds. Training on this node's own would put it a fixed "
                     "distance from every peer for the rest of the run"
-                    % self.config.outer_deadline
+                    % (source, self.config.outer_deadline)
                 )
-            # Training rounds start after the seed round, which used number 0.
-            loop.round_number = SEED_ROUND + 1
+            # Training rounds start after the seed round, which used number 0;
+            # a resumed run carries on from the round its source was in.
+            loop.round_number = max(int(loop.round_number), SEED_ROUND + 1)
         self._outer_peers = self._membership.peers_at(loop.round_number)
         self._say_who_is_unreachable(exchange, self._outer_peers)
         logger.info(
@@ -1128,6 +1142,38 @@ class RavexRuntime:
             root,
         )
         return loop
+
+    def _load_resumed_outer(self, loop) -> None:
+        """Put the outer state the resumed checkpoint carried into ``loop``.
+
+        GPU-212. A resume takes the checkpoint's outer hyperparameters, the
+        momentum among them, as it takes the inner optimizer's; a fork, or a
+        run told to keep its script's hyperparameters, keeps the ones it was
+        started with - changing them is what those are for. A checkpoint from
+        before the outer state was saved has none, and the loop starts from
+        the weights as it always did.
+        """
+        manager = self._resume_manager
+        state = getattr(manager, "restored_outer", None) if manager is not None else None
+        if not state:
+            return
+        chosen = loop.optimizer.state_dict()
+        try:
+            loop.load_state_dict(state)
+        except Exception as exc:
+            logger.warning(
+                "The checkpoint's outer loop state could not be loaded (%s: %s); "
+                "the loop starts from this node's weights, with no momentum",
+                type(exc).__name__, exc,
+            )
+            return
+        if self._fork_parent is not None or self.config.keep_hyperparameters:
+            for name in ("lr", "momentum", "nesterov", "momentum_warmup"):
+                setattr(loop.optimizer, name, chosen[name])
+        logger.info(
+            "Outer loop resumed at round %d, %d model step(s), from the checkpoint.",
+            loop.round_number, loop.model_steps,
+        )
 
     def _say_who_is_unreachable(self, exchange, peers) -> None:
         """Warn, at the start, about every peer this node cannot connect to.
@@ -2407,6 +2453,15 @@ class RavexRuntime:
             extra = self._collect_extra_state()
             if extra is not None:
                 state["extra"] = extra
+
+            # The outer loop's own state (GPU-212): the outer parameters - the
+            # anchor this round's work is measured from, not the weights - the
+            # momentum, the round and the model's steps. Without it a resumed
+            # node rebuilt the loop from its weights mid-round, with no
+            # momentum and round 0, and a run of several nodes went on from
+            # whichever arrived first.
+            if self._outer:
+                state["outer_loop"] = self._outer.state_dict()
 
             # Under `per_rank` there is nothing on rank 0 to write for the
             # other ranks — each holds its own shard and writes it into its own

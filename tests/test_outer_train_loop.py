@@ -43,7 +43,7 @@ def _store_client(port):
     return _tcp_store("127.0.0.1", port, False, 120.0)
 
 
-def a_node(rank, world, port, root, rounds, inner, queue, boundary="public", log=False):
+def a_node(rank, world, port, root, rounds, inner, queue, boundary="public", log=False, resume=False):
     """One rank: init the group, then a training loop that knows nothing."""
     try:
         import torch.distributed as dist
@@ -80,9 +80,11 @@ def a_node(rank, world, port, root, rounds, inner, queue, boundary="public", log
             outer_root=os.path.join(root, "rank%d" % rank),
             outer_deadline=60,
             enabled=True,
-            resume=False,
+            # A second run in the same directories resumes the first's
+            # checkpoints, one per rank, written as the first ended (GPU-212).
+            resume=resume,
             checkpoint_every=10**9,
-            checkpoint_on_exit=False,
+            checkpoint_on_exit=True,
         )
         def train():
             logging.getLogger("ravex").addHandler(Collect())
@@ -148,7 +150,7 @@ def rounds_of(said):
     return [line for line in said if "Outer round" in line and "took" in line]
 
 
-def run_two(tmp_path, rounds=3, inner=8, boundary="public", log=False):
+def run_two(tmp_path, rounds=3, inner=8, boundary="public", log=False, resume=False):
     context = mp.get_context("spawn")
     queue = context.Queue()
     server = _store_server()
@@ -156,7 +158,7 @@ def run_two(tmp_path, rounds=3, inner=8, boundary="public", log=False):
     workers = [
         context.Process(
             target=a_node,
-            args=(rank, 2, port, str(tmp_path), rounds, inner, queue, boundary, log),
+            args=(rank, 2, port, str(tmp_path), rounds, inner, queue, boundary, log, resume),
         )
         for rank in range(2)
     ]
@@ -341,3 +343,19 @@ def test_without_a_rendezvous_the_run_carries_on_locally(tmp_path, monkeypatch):
     refusals = [line for line in said if "Could not start the outer loop" in line]
     assert len(refusals) == 1, "the refusal was repeated: %d times" % len(refusals)
     assert "init_process_group" in refusals[0]
+
+
+@pytest.mark.skipif(sys.platform == "darwin", reason="spawn + gloo is slow on macOS")
+def test_a_resumed_run_carries_on_from_the_round_it_stopped_at(tmp_path):
+    """GPU-212: the outer loop's state is in the checkpoint. A run resumed
+    goes on from the round it was in, with the momentum it had, rather than
+    from round 0 with none - and its two nodes still hold one model."""
+    run_two(tmp_path, rounds=3)
+    results = run_two(tmp_path, rounds=1, resume=True)
+    # Under one process group only rank 0 writes the checkpoint, so it is the
+    # one that resumes; rank 1 starts from nothing and takes rank 0's state.
+    assert any("Outer loop resumed at round 4" in line for line in results[0][3]), results[0][3]
+    for rank in (0, 1):
+        said = results[rank][3]
+        assert any("Outer round 4" in line for line in rounds_of(said)), (rank, rounds_of(said))
+    assert results[0][2] == pytest.approx(results[1][2])

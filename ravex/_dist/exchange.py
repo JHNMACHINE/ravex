@@ -278,6 +278,64 @@ def decide_round(store, scope, round_number: int, rank: int, collected,
         ) from exc
 
 
+#: Where a node says how far its outer loop had got when the run started: the
+#: job's digest, then its rank (GPU-212).
+PROGRESS_KEY = "ravex/gpu212/progress/%s/%d"
+
+#: The node the run's starting state comes from, decided once: the job's digest.
+SEED_SOURCE_KEY = "ravex/gpu212/seed-source/%s"
+
+
+def seed_source(store, scope, rank: int, world: int, progress: Tuple[int, int],
+                deadline: float) -> int:
+    """The node every other takes the run's starting state from.
+
+    GPU-212. The one that had got furthest - ``progress`` is ``(round, model
+    steps)`` - and the lowest rank among equals, so a run that starts fresh,
+    every node at ``(0, 0)``, starts from rank 0 as it always has. Nodes
+    resumed from checkpoints of different ages otherwise went on from rank 0's,
+    the node that registered first, and a run could step back to the oldest.
+
+    Decided on the store like a round's set (:func:`decide_round`): each node
+    says its progress, the first to have heard from every node of the run -
+    or to reach ``deadline`` - proposes the furthest with ``compare_set``, and
+    every node takes the proposal that stayed. Two nodes that each decided on
+    what they had heard would start two models.
+    """
+    digest = _job_digest(scope)
+    store.set(PROGRESS_KEY % (digest, int(rank)), json.dumps([int(p) for p in progress]).encode("utf-8"))
+    key = SEED_SOURCE_KEY % digest
+    heard: Dict[int, Tuple[int, int]] = {}
+    while True:
+        for other in range(int(world)):
+            if other in heard:
+                continue
+            try:
+                said = PROGRESS_KEY % (digest, other)
+                if store.check([said]):
+                    heard[other] = tuple(json.loads(store.get(said).decode("utf-8")))
+            except Exception:
+                pass
+        if len(heard) >= int(world) or time.monotonic() >= deadline:
+            break
+        try:
+            if store.check([key]):
+                break
+        except Exception:
+            pass
+        time.sleep(0.05)
+    furthest = max(heard, key=lambda other: (heard[other], -other)) if heard else int(rank)
+    raw = store.compare_set(key, "", json.dumps({"source": furthest, "by": int(rank)}))
+    text = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
+    source = int(json.loads(text)["source"])
+    if heard.get(source, (0, 0)) != (0, 0):
+        logger.info(
+            "The run starts from node %d's state, round %d and %d model step(s): "
+            "the furthest of the nodes that resumed.", source, *heard[source],
+        )
+    return source
+
+
 def close_round(loop, exchange: "DeltaExchange", peers, deadline: float, metrics=None,
                 error_feedback: bool = False):
     """Publish this node's report, collect the peers', take the outer step.
@@ -1971,6 +2029,15 @@ class DeltaExchange:
             _report.round_path(self.state_path, wanted),
             CHUNK,
         )
+
+    def forget_state(self, round_number: int) -> None:
+        """Remove a state this node wrote for ``round_number`` in an earlier
+        life of the run (GPU-212). A state is served without asking whose it
+        is: a run resumed in the same directory served the last run's seed,
+        round 0 and all, to a node that asked before this one rewrote it."""
+        import shutil
+
+        shutil.rmtree(_report.round_path(self.state_path, round_number), ignore_errors=True)
 
     def publish_state(self, payload, round_number: int) -> None:
         """Write what a joining node needs, as of the start of ``round_number``.

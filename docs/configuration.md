@@ -1025,6 +1025,16 @@ running out of it is the answer, not a failure. It bounds a transfer that is
 merely *slow* as well as one that never starts: a fetch cut halfway leaves the
 round closed over fewer nodes and costs a resend on the next one, not the run.
 
+**Resuming a run on several nodes** (GPU-212). The checkpoint carries the
+outer loop's own state - the outer parameters, the momentum, the round and the
+model's steps - so a node that resumes is where it was, not at round 0 with no
+momentum. Each node resumes its own store. Then the nodes agree on the one that
+had got furthest, and every node takes its state, the round's start included:
+what one node trained after the last round closed, the others never saw. A run
+that starts fresh has every node at round 0 and goes on from rank 0, as before.
+A resume keeps the checkpoint's outer `lr` and `momentum`; a fork, or
+`keep_hyperparameters`, keeps the script's.
+
 **What a round costs, measured.** Every round logs where its seconds went —
 network, of which the part spent waiting for a peer to reach the round; the
 delta; the publish, of which the part spent waiting for a peer's fetch; and the

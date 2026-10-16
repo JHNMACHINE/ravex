@@ -677,3 +677,61 @@ def apply_state(loop, payload: Dict[str, object]) -> None:
     loop.outer = outer
     loop.optimizer.buffers = buffers
     loop.write_back()
+
+
+#: The round a run's starting state was taken at, beside :data:`MODEL_STEPS_KEY`
+#: in the seed (GPU-212): a resumed run carries on from its source's round.
+ROUND_KEY = "ravex::round"
+
+
+def seed_payload(loop) -> Dict[str, object]:
+    """:func:`state_payload` and the round: what a run starts from."""
+    import torch
+
+    payload = state_payload(loop)
+    payload[ROUND_KEY] = torch.tensor(int(getattr(loop, "round_number", 0)), dtype=torch.int64)
+    return payload
+
+
+def adopt_run_state(loop, exchange, source: int, rank: int, deadline: float) -> bool:
+    """Make every node start from ``source``'s state: its outer parameters,
+    its momentum, its round and its model's steps (GPU-212).
+
+    What :func:`ravex._dist.exchange.adopt_outer_state` does for the
+    parameters alone, which was enough while every run started from scratch -
+    no momentum, round 0 - and is not once a run can resume: a node resumed
+    with momentum and a node without would apply different updates to the
+    same gradient from the first round. Written exactly, never cast, as for a
+    joiner (:meth:`DeltaExchange.publish_state`), so the source holds what the
+    others read without adopting its own.
+
+    Every node, the source too, then puts the outer parameters into its model:
+    what one node trained after the last round closed the others never saw,
+    and the run goes on from the round's start on all of them. Returns
+    whether this node holds the shared state.
+    """
+    from ravex._dist.exchange import SEED_ROUND
+
+    payload = seed_payload(loop)
+    if rank == source:
+        exchange.publish_state(payload, SEED_ROUND)
+        apply_state(loop, payload)
+        loop.steps_this_round = 0
+        return True
+    # Asked again until it is there: a state is served without waiting - a
+    # joiner reads off the store which round to ask for - and the source may
+    # still be writing it when the others ask, all of them having decided at
+    # the same moment who it is.
+    expected = _expectation(payload)
+    state = None
+    while state is None and time.monotonic() < deadline:
+        state = exchange.fetch_state([source], SEED_ROUND, expected, deadline)
+        if state is None:
+            time.sleep(0.2)
+    if state is None:
+        return False
+    apply_state(loop, state.delta)
+    value = state.delta.get(ROUND_KEY)
+    loop.round_number = int(value.item() if hasattr(value, "item") else value)
+    loop.steps_this_round = 0
+    return True

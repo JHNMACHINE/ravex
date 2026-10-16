@@ -264,6 +264,10 @@ class ResumeManager:
         #: class has no idea which framework is running and should not grow
         #: one. See :meth:`RavexRuntime._restore_extra_state`.
         self.restored_extra: Optional[Dict[str, Any]] = None
+        #: The outer loop's state the checkpoint carried
+        #: (:meth:`ravex._dist.outer.OuterLoop.state_dict`), or None: for the
+        #: runtime to load once it builds the loop (GPU-212).
+        self.restored_outer: Optional[Dict[str, Any]] = None
         #: World size that wrote the stores, once `_reshard_wanted` has looked.
         self._old_world: Optional[int] = None
         #: Set once the ranks have agreed; see :meth:`_settle_run_identity`.
@@ -1041,6 +1045,9 @@ class ResumeManager:
         # non-sharded halves come from one old rank's snapshot, so this arrives
         # on that path too.
         self.restored_extra = state.get("extra")
+        # The outer loop's own state (GPU-212), read for the same reason: the
+        # loop is built at the first step that has a model, after this.
+        self.restored_outer = state.get("outer_loop")
 
         sharded = len(state.get("sharded", {}))
         logger.info(

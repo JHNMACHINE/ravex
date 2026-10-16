@@ -710,3 +710,84 @@ def test_a_deadline_before_the_store_is_given_up_still_ends_the_wait(monkeypatch
     with pytest.raises(RoundSplitError, match="could not read round 3"):
         decide_round(Gone(), b"run", 3, 0, [0, 1], deadline=time.monotonic() + 0.5)
     assert time.monotonic() - started < 15
+
+
+def _seeded(store, tmp_path, loops, progress_of=lambda loop: (loop.round_number, loop.model_steps)):
+    """Run the start of a run on every loop at once: the source decided on the
+    store, then its state adopted. Returns each node's source."""
+    from ravex._dist.exchange import seed_source
+    from ravex._dist.membership import adopt_run_state
+
+    exchanges, sources, errors = [], {}, []
+    for rank in range(len(loops)):
+        exchange = DeltaExchange(
+            rank, store, root=os.path.join(str(tmp_path), "r%d" % rank),
+            node="n%d" % rank, patience=15.0,
+        )
+        assert exchange.start()
+        exchanges.append(exchange)
+
+    def start(rank):
+        try:
+            deadline = time.monotonic() + 30
+            source = seed_source(store, exchanges[rank].scope, rank, len(loops),
+                                 progress_of(loops[rank]), deadline)
+            sources[rank] = source
+            assert adopt_run_state(loops[rank], exchanges[rank], source, rank, deadline)
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=start, args=(rank,), daemon=True) for rank in range(len(loops))]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(60)
+        if errors:
+            raise errors[0]
+    finally:
+        for exchange in exchanges:
+            exchange.close()
+    return sources
+
+
+def test_a_resumed_run_starts_from_the_node_that_got_furthest(tmp_path):
+    """GPU-212: three nodes resume from checkpoints of different ages. They
+    all go on from the newest - its outer parameters, its momentum, its round
+    and its model's steps - and not from rank 0's, which is the oldest."""
+    models = [a_model(seed=3), a_model(seed=11), a_model(seed=19)]
+    loops = [OuterLoop(models[rank], inner_steps=10, node="n%d" % rank) for rank in range(3)]
+    for rank, (round_number, steps) in enumerate([(2, 200), (4, 400), (3, 300)]):
+        loops[rank].round_number = round_number
+        loops[rank].model_steps = steps
+        loops[rank].steps_this_round = 7
+        loops[rank].optimizer.buffers = {
+            name: torch.full_like(value, float(rank + 1)) for name, value in loops[rank].outer.items()
+        }
+    furthest = {name: value.clone() for name, value in loops[1].outer.items()}
+
+    sources = _seeded(FakeStore(), tmp_path, loops)
+
+    assert sources == {0: 1, 1: 1, 2: 1}
+    for rank, loop in enumerate(loops):
+        assert loop.round_number == 4 and loop.model_steps == 400, rank
+        assert loop.steps_this_round == 0, rank
+        for name, value in furthest.items():
+            assert torch.equal(loop.outer[name], value), (rank, name)
+            assert torch.equal(loop.optimizer.buffers[name], torch.full_like(value, 2.0)), (rank, name)
+        # And in the model: what a node trained after the last round closed
+        # is not the run's.
+        for name, parameter in models[rank].named_parameters():
+            assert torch.equal(parameter.detach(), furthest[name]), (rank, name)
+
+
+def test_a_fresh_run_starts_from_rank_0_as_it_always_has(tmp_path):
+    models = [a_model(seed=3), a_model(seed=11)]
+    loops = [OuterLoop(models[rank], inner_steps=10, node="n%d" % rank) for rank in range(2)]
+    first = {name: value.clone() for name, value in loops[0].outer.items()}
+
+    assert _seeded(FakeStore(), tmp_path, loops) == {0: 0, 1: 0}
+    for loop in loops:
+        assert loop.round_number == 0
+        for name, value in first.items():
+            assert torch.equal(loop.outer[name], value), name

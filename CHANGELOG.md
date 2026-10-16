@@ -4,6 +4,15 @@
 
 ### Changed
 
+- **A run on several nodes resumes where it was (GPU-212).** The checkpoint
+  carries the outer loop's state - outer parameters, momentum, round, model
+  steps - which `OuterOptimizer.state_dict()` was written for and nothing
+  saved: a resumed node rebuilt the loop from its weights mid-round, at round
+  0 with no momentum. And the run starts from the node that had got
+  furthest, decided once on the store, with its full state; it used to take
+  the parameters alone from rank 0, the node that registered first, so
+  nodes resumed from checkpoints of different ages could all step back to the
+  oldest. A fresh run still starts from rank 0.
 - **A node that cannot reach one of its own region stops the run (GPU-233).**
   With `outer_region` set, the check at the start (GPU-186) no longer only
   warns about a peer of the same region it cannot connect to: it raises
