@@ -193,6 +193,11 @@ class RoundSplitError(MembershipError):
     """
 
 
+#: How long every call to the store failing with a closed connection is taken
+#: as the server being gone rather than a blip (GPU-229).
+STORE_LOST_AFTER = 10.0
+
+
 def _job_digest(scope: Optional[bytes]) -> str:
     digest = hashlib.sha256()
     digest.update(scope or b"")
@@ -225,11 +230,25 @@ def decide_round(store, scope, round_number: int, rank: int, collected,
     """
     key = ROUND_SET_KEY % (_job_digest(scope), round_number)
     proposal = json.dumps({"by": int(rank), "set": sorted(int(r) for r in collected)})
+    lost_since = None
     while True:
         try:
             raw = store.compare_set(key, "", proposal)
             break
         except Exception as exc:
+            # A server that is gone answers every call at once with a closed
+            # connection, and never comes back: torch's client does not dial
+            # again. Waiting out the deadline for it is only a quarter of an
+            # hour of a stopped run before the failover (GPU-229) can start.
+            if type(exc).__name__ == "DistNetworkError":
+                lost_since = lost_since or time.monotonic()
+                if time.monotonic() - lost_since >= STORE_LOST_AFTER:
+                    raise RoundSplitError(
+                        "the rendezvous store stopped answering while round %d "
+                        "was being decided (%s)" % (round_number, exc)
+                    ) from exc
+            else:
+                lost_since = None
             if time.monotonic() >= deadline:
                 raise RoundSplitError(
                     "could not read round %d's decision off the rendezvous "

@@ -44,6 +44,13 @@ from ravex._resume import NothingToResume, ResumeManager, ResumeStepMissing
 
 logger = logging.getLogger("ravex")
 
+#: On an epoch's store after a failover (GPU-229): how many nodes start it,
+#: proposed by each from the last round it closed and decided by the first.
+_FAILOVER_BASE_KEY = "ravex/gpu229/base"
+
+#: On an epoch's store: the round each node that starts it had reached.
+_FAILOVER_ROUND_KEY = "ravex/gpu229/round/%d"
+
 _LOG_FORMAT = "%(asctime)s [ravex] %(levelname)s %(message)s"
 
 #: How many further optimizer steps a due round may survive before the
@@ -216,6 +223,12 @@ class RavexRuntime:
         #: Kept so the round boundary does not go looking for the store again
         #: on a path that runs once per round.
         self.store_for_joins: Any = None
+        #: Which epoch of the rendezvous this node is on, and where it is
+        #: (GPU-229): 0 and the first address until the run loses its server.
+        self._epoch = 0
+        self._rendezvous_at: Optional[str] = None
+        #: The server this node started when it was elected, if it was.
+        self._hosting: Any = None
         #: Whether this node came in through `membership.join` rather than
         #: starting with the run (GPU-129). A joiner does not serve joins.
         self._outer_joined = False
@@ -1139,7 +1152,7 @@ class RavexRuntime:
         from ravex._dist import rendezvous as _rendezvous
         from ravex._dist.exchange import DeltaExchange
 
-        address = self.config.outer_rendezvous
+        address = self._rendezvous_at
         exchange = DeltaExchange(
             rank,
             store,
@@ -1170,7 +1183,7 @@ class RavexRuntime:
             DeltaExchange, announce_region,
         )
 
-        address = self.config.outer_rendezvous
+        address = self._rendezvous_at
         roles = {
             "region": (REGION_NAMESPACE % region, self.config.outer_save_dtype),
             # The link between regions is the slow one: the aggregates travel
@@ -1225,7 +1238,7 @@ class RavexRuntime:
                 pass
         self._region_exchanges = None
 
-    def _leave_and_rejoin(self, cause: Exception) -> None:
+    def _leave_and_rejoin(self, cause: Exception, linger: bool = True) -> None:
         """This node cannot stay on the run's model: leave it, and come back.
 
         GPU-142. Reached when a round was decided over a set this node cannot
@@ -1252,6 +1265,11 @@ class RavexRuntime:
 
         if not self.config.outer_rendezvous or self.store_for_joins is None:
             raise cause
+        if self._rendezvous_lost():
+            # Not this node off the model: the server is gone, and with it
+            # every number there is to take (GPU-229).
+            self._fail_over(cause)
+            return
         store = self.store_for_joins
         old = self._membership.rank
         base = self._membership.base_world
@@ -1265,23 +1283,25 @@ class RavexRuntime:
         except Exception as exc:
             logger.warning("Could not declare node %d gone: %s", old, exc)
         # Lingering first: a peer may still need a report relayed from here.
+        # Not on an exchange opened by a failover a moment ago, which has
+        # published nothing: there it waited the full minute for peers to take
+        # a round nobody wrote, and the run went on without this node meanwhile.
         try:
             self._exchange.close(
-                linger=min(60, self.config.outer_deadline), expect=self._outer_peers
+                linger=min(60, self.config.outer_deadline) if linger else 0,
+                expect=self._outer_peers,
             )
         except Exception:
             pass
-        self._close_region_exchanges(min(60.0, float(self.config.outer_deadline)))
+        self._close_region_exchanges(
+            min(60.0, float(self.config.outer_deadline)) if linger else 0.0
+        )
 
         node = _rendezvous.register(store)
         membership = Membership(
             store, node, base, ceiling=partial(_rendezvous.registered, store)
         )
-        root = (
-            os.path.join(self.config.outer_root, "node%d" % node)
-            if self.config.outer_root
-            else os.path.join(self.config.storage.path, "rounds", str(node))
-        )
+        root = self._round_root(node)
         exchange = self._open_exchange(node, store, root)
         self._exchange = exchange
         self._region_exchanges = self._open_region_exchanges(node, store, root, exchange)
@@ -1308,6 +1328,206 @@ class RavexRuntime:
             "Rejoined the run as node %d at round %d.", node, self._outer.round_number
         )
 
+    def _round_root(self, node: int) -> str:
+        """Where node ``node`` stages its round reports. Under the epoch, after
+        a failover: numbers start from zero again there, and a directory of
+        the previous epoch's node with the same number is not this one's."""
+        base = self.config.outer_root or os.path.join(self.config.storage.path, "rounds")
+        if self._epoch:
+            base = os.path.join(base, "e%d" % self._epoch)
+        return os.path.join(base, "node%d" % node) if self.config.outer_root else \
+            os.path.join(base, str(node))
+
+    def _rendezvous_lost(self) -> bool:
+        """Whether the run's server is gone, rather than this node off the
+        model. Asked twice, a few seconds apart: one read lost on a busy link
+        is not worth moving the run for. Only a run given somewhere else to
+        go asks at all."""
+        from ravex._dist import rendezvous as _rendezvous
+
+        if len(_rendezvous.candidates(self.config.outer_rendezvous)) < 2:
+            return False
+        store = self.store_for_joins
+        for attempt in range(2):
+            if _rendezvous.alive(store):
+                _rendezvous.restore_timeout(store, float(self.config.outer_deadline))
+                return False
+            if attempt == 0:
+                time.sleep(_rendezvous.PROBE_TIMEOUT)
+        return True
+
+    def _fail_over(self, cause: Exception) -> None:
+        """Carry the run on to a new epoch of the rendezvous (GPU-229).
+
+        The server is gone, so is every key on it, and this node cannot take a
+        number anywhere. What it does instead is what the run did at its
+        start, on a store elected among the candidates: register, wait for
+        the others that start the epoch, and take the outer parameters from
+        one of them in a seed round. See `ravex._dist.rendezvous` for why an
+        epoch and not a copy of the old store.
+
+        **The quorum is what keeps it one model.** An epoch is started by more
+        than half of the nodes of the last round this node closed, and no
+        more: a node that registers after them joins it in progress. Two
+        servers elected at once - candidates that noticed the loss together -
+        cannot both gather more than half of the same nodes, each node
+        registering once, so at most one epoch ever opens. A node left on the
+        other stops, as it would have without a failover.
+
+        **The seed comes from the node that got furthest.** The server may
+        have died while a round was being decided: some nodes took the step,
+        some never learnt the decision. Every base member says which round it
+        is at, and the one at the highest is the seed's source. A node that
+        was behind holds the source's parameters after the seed but not its
+        momentum, so it then leaves and rejoins, which hands it both.
+        """
+        from functools import partial
+
+        from ravex._dist import rendezvous as _rendezvous
+        from ravex._dist.exchange import RoundSplitError, adopt_outer_state
+        from ravex._dist.membership import Membership
+        from ravex._dist.membership import join as join_run
+
+        addresses = _rendezvous.candidates(self.config.outer_rendezvous)
+        job = self.config.outer_job
+        patience = float(self.config.outer_deadline)
+        epoch = self._epoch + 1
+        # The last round's peers are the others; the round was this node's too.
+        size = len(set(self._outer_peers or []) | {self._membership.rank})
+        quorum = size // 2 + 1
+        mine = int(self._outer.round_number)
+        logger.warning(
+            "The rendezvous at %s does not answer (%s). Moving the run to "
+            "epoch %d on one of %s; it goes on once %d of the %d node(s) of "
+            "the last round are there.",
+            self._rendezvous_at, cause, epoch, ", ".join(addresses), quorum, size,
+        )
+        # The old store is gone; nothing of the exchanges is worth lingering
+        # for, since no peer can learn a decision to fetch for.
+        try:
+            self._exchange.close(linger=0)
+        except Exception:
+            pass
+        self._close_region_exchanges(0.0)
+
+        deadline = time.monotonic() + patience
+        store, where, node, base = self._enter_epoch(addresses, job, epoch, quorum, deadline, cause)
+        self._epoch, self._rendezvous_at = epoch, where
+        self.store_for_joins = store
+        membership = Membership(
+            store, node, base, ceiling=partial(_rendezvous.registered, store)
+        )
+        root = self._round_root(node)
+        exchange = self._open_exchange(node, store, root)
+        self._exchange = exchange
+        self._region_exchanges = self._open_region_exchanges(node, store, root, exchange)
+        self._outer.node = str(node)
+
+        if node >= base:
+            # The epoch was started without this node: in through the join,
+            # like any node arriving in a run already going.
+            if not join_run(
+                store, exchange, self._outer, node, base,
+                time.monotonic() + patience, window=membership.span(),
+            ):
+                raise RuntimeError(
+                    "could not join epoch %d of the run within %ds" % (epoch, patience)
+                ) from cause
+            membership.take_in_joined()
+            self._membership = membership
+            self._outer_joined = True
+            self._outer_peers = membership.peers_at(self._outer.round_number)
+            logger.warning(
+                "Joined epoch %d of the run as node %d at round %d.",
+                epoch, node, self._outer.round_number,
+            )
+            return
+
+        store.set(_FAILOVER_ROUND_KEY % node, str(mine).encode("utf-8"))
+        keys = [_FAILOVER_ROUND_KEY % other for other in range(base)]
+        while not store.check(keys):
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "the nodes starting epoch %d did not all say which round "
+                    "they were at within %ds" % (epoch, patience)
+                ) from cause
+            time.sleep(_rendezvous.POLL)
+        rounds = [int(store.get(key)) for key in keys]
+        furthest = max(rounds)
+        source = rounds.index(furthest)
+        if not adopt_outer_state(self._outer, exchange, source, node, deadline):
+            raise RuntimeError(
+                "could not take the outer parameters from node %d of epoch %d "
+                "within %ds" % (source, epoch, patience)
+            ) from cause
+        _rendezvous.opened(where, job, epoch, store)
+        self._outer.round_number = furthest + 1
+        self._membership = membership
+        self._outer_joined = False
+        self._outer_peers = membership.peers_at(self._outer.round_number)
+        logger.warning(
+            "Carried on in epoch %d as node %d of %d, at round %d, rendezvous "
+            "at %s; parameters from node %d.",
+            epoch, node, base, self._outer.round_number, where, source,
+        )
+        if mine < furthest:
+            self._leave_and_rejoin(RoundSplitError(
+                "this node was at round %d when the rendezvous died and node "
+                "%d at round %d: it holds that node's parameters now, not its "
+                "momentum" % (mine, source, furthest)
+            ), linger=False)
+
+    def _enter_epoch(self, addresses, job, epoch, quorum, deadline, cause):
+        """Find or open ``epoch``'s server, take a number on it and, for a node
+        that starts the epoch, wait for the others that do. ``(store, address,
+        node, base)``.
+
+        Done again from the election when the server found goes away before
+        the epoch opens: two candidates that noticed the loss at once may
+        both have opened one, and the one placed later in the list closes
+        its own on finding the other (`rendezvous.elect`). A node already
+        registered on the closed one has a number nobody will count, and
+        looks again rather than waiting out the deadline on it.
+        """
+        from ravex._dist import rendezvous as _rendezvous
+
+        patience = float(self.config.outer_deadline)
+        while True:
+            try:
+                store, where, process = _rendezvous.elect(
+                    addresses, self.config.outer_member, job, epoch, deadline,
+                    timeout=patience,
+                )
+            except TimeoutError as exc:
+                raise RuntimeError(
+                    "the rendezvous died and no other could be reached or opened "
+                    "(%s); this node cannot stay on the run's model" % exc
+                ) from cause
+            if process is not None:
+                self._hosting = process
+            try:
+                node = _rendezvous.register(store)
+                raw = store.compare_set(_FAILOVER_BASE_KEY, "", str(quorum))
+                base = int(raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else raw)
+                if node >= base or _rendezvous.wait_for_base(store, base, deadline):
+                    return store, where, node, base
+                count = _rendezvous.registered(store)
+            except Exception as exc:
+                if type(exc).__name__ != "DistNetworkError" or time.monotonic() >= deadline:
+                    raise
+                logger.warning(
+                    "Epoch %d's rendezvous at %s went away before the epoch "
+                    "opened; looking again.", epoch, where,
+                )
+                continue
+            raise RuntimeError(
+                "only %d of the %d node(s) needed to carry the run on reached "
+                "epoch %d's rendezvous at %s within %ds: fewer than half of the "
+                "last round's nodes may be on this side of the network, and "
+                "going on without them could train a second model"
+                % (count, base, epoch, where, patience)
+            ) from cause
+
     def _join_rendezvous(self, address):
         """Reach a ``ravex rendezvous`` and take a node number there (GPU-129).
 
@@ -1320,9 +1540,27 @@ class RavexRuntime:
 
         job = self.config.outer_job
         base = int(self.config.outer_min_nodes)
-        store = _rendezvous.connect(
-            address, job, timeout=float(self.config.outer_deadline)
-        )
+        addresses = _rendezvous.candidates(address)
+        patience = float(self.config.outer_deadline)
+        if len(addresses) == 1:
+            store = _rendezvous.connect(addresses[0], job, timeout=patience)
+            self._rendezvous_at = address = addresses[0]
+        else:
+            # The run may have moved since it started (GPU-229): the newest
+            # epoch any candidate serves is where it is now.
+            store, epoch, address = _rendezvous.current(
+                addresses, job, time.monotonic() + patience, timeout=patience
+            )
+            self._epoch, self._rendezvous_at = epoch, address
+            if epoch:
+                base = int(store.get(_FAILOVER_BASE_KEY))
+                node = _rendezvous.register(store)
+                logger.info(
+                    "Node %d at the rendezvous %s, epoch %d of job %s: the run "
+                    "is going, so this one joins it in progress.",
+                    node, address, epoch, job,
+                )
+                return store, node, base, True
         node = _rendezvous.register(store)
         if node >= base:
             logger.info(

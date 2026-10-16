@@ -298,8 +298,14 @@ def split_off_next_round(exchange):
     exchange.recover = lambda *args, **kwargs: None
 
 
-def a_node(address, job, min_nodes, root, name, role, queue):
-    """One node, started the way a rented box starts one."""
+def a_node(address, job, min_nodes, root, name, role, queue, control_at=None,
+           member=None, kill=None, deadline=60):
+    """One node, started the way a rented box starts one.
+
+    ``control_at`` is where the test's own keys live when ``address`` may die
+    under the run; ``member`` its place in ``address``'s list; ``kill`` the
+    pid of the run's server, which a node in the role ``server-dies`` kills
+    at round 3 (GPU-229)."""
     try:
         for variable in ("RANK", "WORLD_SIZE", "LOCAL_RANK", "MASTER_ADDR", "MASTER_PORT"):
             os.environ.pop(variable, None)
@@ -318,7 +324,7 @@ def a_node(address, job, min_nodes, root, name, role, queue):
         workdir = os.path.join(root, name)
         os.makedirs(workdir, exist_ok=True)
         os.chdir(workdir)
-        control = rendezvous.connect(address, job + ".control")
+        control = rendezvous.connect(control_at or address, job + ".control")
 
         seed = sum(map(ord, name))
         x = torch.randn(256, 4, generator=torch.Generator().manual_seed(seed))
@@ -329,6 +335,7 @@ def a_node(address, job, min_nodes, root, name, role, queue):
             outer_rendezvous=address,
             outer_job=job,
             outer_min_nodes=min_nodes,
+            outer_member=member,
             # Not 4, and the number is the point. A joiner announces itself
             # `JOIN_MARGIN` rounds ahead, so the whole exchange - the joiner
             # reading which round the run is on, then writing its key, then
@@ -351,7 +358,7 @@ def a_node(address, job, min_nodes, root, name, role, queue):
             # outlasts a store round trip on the slowest box this runs on.
             outer_inner_steps=256,
             outer_root=os.path.join(workdir, "rounds"),
-            outer_deadline=60,
+            outer_deadline=deadline,
             enabled=True,
             resume=False,
             checkpoint_every=10**9,
@@ -401,6 +408,17 @@ def a_node(address, job, min_nodes, root, name, role, queue):
                     # survivor missing a report gets it relayed by the one
                     # that has it, so they still end on one model.
                     die_after_serving_one(runtime._exchange, 3)
+                    armed = True
+                if (
+                    role == "server-dies"
+                    and kill is not None
+                    and outer.round_number == 3
+                    and not armed
+                    and control.add("test/killed", 1) == 1
+                ):
+                    # The server goes the way a machine does: at once, mid
+                    # run, with every node's state on it.
+                    os.kill(kill, 9)
                     armed = True
                 if (
                     role == "splits"
@@ -570,3 +588,156 @@ def test_a_node_that_falls_off_the_model_rejoins_without_a_relaunch(server, tmp_
         if any("Rejoined the run as node" in line for line in said)
     ]
     assert len(rejoined) == 1, results
+
+
+# ─── the rendezvous itself dies (GPU-229) ──────────────────────────────
+
+
+def free_ports(count):
+    """Ports nothing listens on now. Probed and released, which GPU-175 warns
+    can race another worker; a candidate's port has to be known before any
+    server is on it, and that is what is being tested."""
+    import socket as _socket
+
+    held = []
+    try:
+        for _ in range(count):
+            sock = _socket.socket()
+            sock.bind(("127.0.0.1", 0))
+            held.append(sock)
+        return [sock.getsockname()[1] for sock in held]
+    finally:
+        for sock in held:
+            sock.close()
+
+
+def a_server(port):
+    """``ravex rendezvous`` in a process of its own, as smith starts it."""
+    import subprocess
+
+    process = subprocess.Popen(
+        [sys.executable, "-m", "ravex._cli", "rendezvous", "--host", "127.0.0.1",
+         "--port", str(port)],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+    assert b"listening" in process.stdout.readline(), "the server did not start"
+    return process
+
+
+def stop_servers_on(ports):
+    """Kill whatever ``ravex rendezvous`` was started on ``ports``: an elected
+    node starts one that outlives it on purpose, and a test that failed never
+    got to read its pid from the node's log."""
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open("/proc/%s/cmdline" % entry, "rb") as handle:
+                words = handle.read().split(b"\0")
+        except OSError:
+            continue
+        if b"rendezvous" in words and any(
+            str(port).encode() in words for port in ports
+        ):
+            try:
+                os.kill(int(entry), 9)
+            except OSError:
+                pass
+
+
+def hosted_pids(said):
+    import re
+
+    return [
+        int(found.group(1))
+        for line in said
+        for found in [re.search(r"rendezvous from this machine at .*, pid (\d+)", line)]
+        if found
+    ]
+
+
+@pytest.mark.skipif(sys.platform == "darwin", reason="spawn is slow on macOS")
+def test_the_run_elects_a_new_rendezvous_when_its_own_dies(server, tmp_path):
+    """The server is killed at round 3, every node's state on it. The nodes
+    elect one among themselves, start epoch 1 there, and end on one model -
+    and a node started after the failover finds the run where it is now,
+    though the first address it is given is the dead one."""
+    pytest.importorskip("moonclip")
+    context = mp.get_context("spawn")
+    queue = context.Queue()
+    job = "failover"
+    ports = free_ports(4)
+    addresses = ",".join("127.0.0.1:%d" % port for port in ports)
+    dying = a_server(ports[0])
+    control = rendezvous.connect(server, job + ".control")
+    control.set(LAST_KEY, b"14")
+    nodes = [
+        context.Process(
+            target=a_node,
+            args=(addresses, job, 3, str(tmp_path), name, "server-dies", queue),
+            # A node that arrives after the epoch's quorum joins it, and a
+            # join takes a few rounds; on a loaded runner a minute is not
+            # always that.
+            kwargs=dict(control_at=server, member=place, kill=dying.pid, deadline=180),
+        )
+        for place, name in ((1, "a"), (2, "b"), (3, "c"))
+    ]
+    for node in nodes:
+        node.start()
+    joiner = None
+    results = {}
+    try:
+        # The joiner starts once the run is on epoch 1 somewhere.
+        deadline = time.monotonic() + 240
+        while True:
+            assert time.monotonic() < deadline, "the run never moved to epoch 1"
+            try:
+                found, epoch, _ = rendezvous.current(
+                    addresses.split(","), job, time.monotonic() + 1, timeout=10
+                )
+                if epoch >= 1:
+                    break
+            except TimeoutError:
+                pass
+            time.sleep(0.5)
+        joiner = context.Process(
+            target=a_node,
+            args=(addresses, job, 3, str(tmp_path), "d", "joiner", queue),
+            kwargs=dict(control_at=server, deadline=180),
+        )
+        joiner.start()
+        results = collect(queue, 4)
+    finally:
+        for process in nodes + ([joiner] if joiner else []):
+            process.join(60)
+        dying.kill()
+        dying.wait()
+        if sys.platform.startswith("linux"):
+            stop_servers_on(ports)
+
+    digests = {name: digest for name, (digest, _, _) in results.items()}
+    assert len(set(digests.values())) == 1, (
+        "the nodes ended holding different models: %s" % digests
+    )
+    # Two candidates may open a server at once - each counts its turn from
+    # when it noticed the loss, not from a clock they share - and the one
+    # placed later closes its own on finding the other. One is left.
+    hosts = [
+        name for name, (_, _, said) in results.items()
+        if hosted_pids(said) and not any("closing this one" in line for line in said)
+    ]
+    assert len(hosts) == 1, "%d nodes hosted epoch 1: %s" % (len(hosts), hosts)
+    # Each survivor is in epoch 1 either as one of the nodes that started it
+    # or, arriving after its quorum, through the join.
+    for name in ("a", "b", "c"):
+        said = results[name][2]
+        assert any(
+            "Carried on in epoch 1" in line or "Joined epoch 1" in line for line in said
+        ), (name, said)
+    assert sum(
+        any("Carried on in epoch 1" in line for line in results[name][2])
+        for name in ("a", "b", "c")
+    ) >= 2, "epoch 1 opened without its quorum"
+    assert any("Joined the run at round" in line for line in results["d"][2]), results["d"][2]
+    for name, (_, _, said) in results.items():
+        assert rounds_over(said, 4), "node %s never closed a round with the joiner" % name

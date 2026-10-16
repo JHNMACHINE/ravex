@@ -44,6 +44,9 @@ is a new node with a new number, which is the only reading under which
   the token rank 0 leaves on it; the port belongs on a private network.
 * The server is **still a single point** — moved from a rented GPU to a process
   that is cheap to keep alive. If it restarts, the job's state on it is gone.
+  Given several addresses, the nodes elect another and carry the run on in a
+  new epoch (GPU-229, at the end of this module); the state is not recovered,
+  it is started again.
 * A base member that dies **before** the run starts cannot be replaced by
   relaunching it: the relaunch takes the next number and arrives as a joiner,
   into a run that never started.
@@ -432,3 +435,264 @@ def wait_for_base(store, min_nodes: int, deadline: float, poll: float = POLL) ->
             )
             said = True
         time.sleep(poll)
+
+
+# ─── another machine takes over (GPU-229) ───────────────────────────────────
+#
+# Everything above says it plainly: the server is a single point, and if it
+# goes, the job's state on it goes too. With the server on member 0's machine,
+# as the platform runs it, that is every run whose first node dies.
+#
+# What follows does not rebuild the dead server's state, and that is the
+# decision the rest hangs on. Copying keys onto a new store - the counter, the
+# join keys, the round decisions - from whatever the survivors happen to have
+# read is one unread key away from a membership that diverges without a word,
+# which is the failure the whole of `membership` exists to rule out. Instead
+# the survivors start an **epoch**: a fresh store on one of their own
+# machines, where they register again from zero and take the outer parameters
+# from one of them in a seed round, exactly as a run starts. Nothing on the old
+# store is needed, so nothing on it can be missed.
+#
+# Which machine is decided by a list every node is given in the same order -
+# ``outer_rendezvous`` with several addresses, the first the original server -
+# and by a **quorum**: an epoch is used only once more than half of the nodes
+# that closed the last round have registered on it. Two survivors that cannot
+# see each other may each open a server; at most one of them gathers a quorum,
+# and a node registered on the other gives up on it and looks again. So a
+# network cut in two never trains two models; its smaller side waits instead.
+
+#: On an epoch's store: the epoch it serves. Written by its host, which is how
+#: a node that dials a candidate tells a server of this run's next epoch from
+#: one that is still starting, or one of an epoch already over.
+EPOCH_KEY = "ravex/gpu229/epoch"
+
+#: On an epoch's store: set once its quorum has registered. A node arriving
+#: later reads it to tell the epoch the run is on from one that never opened.
+OPEN_KEY = "ravex/gpu229/open"
+
+#: On the job's own keys of a server that hosts a later epoch: which one. What a
+#: node arriving after a failover reads to find where the run is now.
+CURRENT_KEY = "ravex/gpu229/current"
+
+#: How long dialling one candidate may take while looking for a server. Short,
+#: because a candidate that is not answering is the ordinary case here: it is
+#: the dead one, or one whose node has not got this far yet.
+PROBE_TIMEOUT = 5.0
+
+#: How long each place in the list waits, beyond the one before it, before
+#: opening a server of its own. Survivors notice the loss at different moments,
+#: so without a stagger the second and third candidate would both open one at
+#: once; with it, the third finds the second's already there.
+STAGGER = 3.0
+
+
+def candidates(value: str) -> List[str]:
+    """The addresses ``outer_rendezvous`` names, in order: one or several,
+    separated by commas. The first is where the run starts."""
+    found = [part.strip() for part in str(value).split(",") if part.strip()]
+    for address in found:
+        parse_address(address)
+    if not found:
+        raise ValueError("outer_rendezvous names no address")
+    return found
+
+
+def epoch_job(job: str, epoch: int) -> str:
+    """The job's name on an epoch's store. Epoch 0 is the job itself, so a run
+    that never loses its server is keyed exactly as before."""
+    return job if epoch == 0 else "%s.e%d" % (job, int(epoch))
+
+
+def answers(address: str, timeout: float = PROBE_TIMEOUT) -> bool:
+    """Whether something listens at ``address``, without becoming a client of
+    it. With a token, only a ravex gate counts: a port that is open but never
+    says ``GATE_MAGIC`` is not this run's server."""
+    host, port = parse_address(address)
+    try:
+        sock = socket.create_connection((host, port), timeout=timeout)
+    except OSError:
+        return False
+    try:
+        if job_token() is None:
+            return True
+        sock.settimeout(timeout)
+        return _recv(sock, len(GATE_MAGIC)) == GATE_MAGIC
+    except OSError:
+        return False
+    finally:
+        _close(sock)
+
+
+def alive(store, timeout: float = PROBE_TIMEOUT) -> bool:
+    """Whether ``store``'s server still answers a read. Leaves the store with
+    ``timeout`` as its patience: the caller gives it back its own with
+    :func:`restore_timeout`."""
+    try:
+        store.set_timeout(datetime.timedelta(seconds=timeout))
+    except Exception:
+        pass
+    try:
+        store.check([EPOCH_KEY])
+        return True
+    except Exception:
+        return False
+
+
+def serving_epoch(address: str, job: str, epoch: int, timeout: float = PROBE_TIMEOUT):
+    """A client of the server at ``address`` if it serves ``epoch`` of
+    ``job``, else None. One that answers but has not said which epoch it
+    serves yet is given ``timeout`` to say so."""
+    if not answers(address, timeout):
+        return None
+    try:
+        store = connect(address, epoch_job(job, epoch), timeout=timeout)
+    except Exception:
+        return None
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            if store.check([EPOCH_KEY]):
+                if int(store.get(EPOCH_KEY)) == int(epoch):
+                    return store
+                return None
+        except Exception:
+            return None
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(POLL * 4)
+
+
+def host(address: str) -> "subprocess.Popen":
+    """Start ``ravex rendezvous`` on this machine, on ``address``'s port.
+
+    A process of its own, in a session of its own, for the reason GPU-186
+    learnt on real machines: the server has to outlive the training process
+    that started it, which may finish while the others still train. It goes
+    when the machine does. The job token, if any, is inherited.
+    """
+    import subprocess
+    import sys
+
+    _, port = parse_address(address)
+    process = subprocess.Popen(
+        [sys.executable, "-m", "ravex._cli", "rendezvous", "--host", "0.0.0.0",
+         "--port", str(port)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    logger.warning(
+        "Serving the run's rendezvous from this machine at %s, pid %d.",
+        address, process.pid,
+    )
+    return process
+
+
+def elect(addresses: List[str], member: Optional[int], job: str, epoch: int,
+          deadline: float, timeout: float = 300.0):
+    """The store of ``epoch``, found on another candidate or opened here.
+
+    Every candidate is dialled in order for one already serving ``epoch``; the
+    first found is used. If none is, a node that has a place in the list -
+    ``member`` - waits its turn (:data:`STAGGER` per place ahead of it), looks
+    once more, and only then opens one on its own address. A node with no
+    place in the list cannot host and keeps looking until ``deadline``.
+
+    Returns ``(store, address, process)``: ``process`` is the server this call
+    started, or None. Raises ``TimeoutError`` at ``deadline``.
+    """
+    turn = time.monotonic() + (STAGGER * member if member is not None else 0.0)
+    while True:
+        for address in addresses:
+            store = serving_epoch(address, job, epoch)
+            if store is not None:
+                logger.warning(
+                    "Rendezvous for epoch %d found at %s.", epoch, address,
+                )
+                return restore_timeout(store, timeout), address, None
+        now = time.monotonic()
+        if member is not None and 0 <= member < len(addresses) and now >= turn:
+            mine = addresses[member]
+            if answers(mine, timeout=1.0):
+                # Something is already on this port: an earlier epoch's
+                # server this machine still runs, or one that has not said
+                # which epoch it serves. Not ours to replace.
+                pass
+            else:
+                process = host(mine)
+                store = connect(mine, epoch_job(job, epoch), timeout=timeout)
+                store.set(EPOCH_KEY, str(int(epoch)).encode("utf-8"))
+                # A candidate placed before this one may have opened its own
+                # while this one's was starting - a server takes a second or
+                # two to listen, and the probe above saw nothing. The run
+                # settles on the first in the list, so this one gives way.
+                settle = time.monotonic() + STAGGER
+                while time.monotonic() < settle:
+                    for address in addresses[:member]:
+                        lower = serving_epoch(address, job, epoch, timeout=1.0)
+                        if lower is not None:
+                            process.kill()
+                            logger.warning(
+                                "Rendezvous for epoch %d found at %s, opened "
+                                "at the same time as this one; closing this one.",
+                                epoch, address,
+                            )
+                            return restore_timeout(lower, timeout), address, None
+                    time.sleep(POLL * 10)
+                return store, mine, process
+        if now >= deadline:
+            raise TimeoutError(
+                "no rendezvous for epoch %d among %s" % (epoch, ", ".join(addresses))
+            )
+        time.sleep(1.0)
+
+
+def restore_timeout(store, timeout: float):
+    """A store probed with a short patience, given back the run's."""
+    try:
+        store.set_timeout(datetime.timedelta(seconds=timeout))
+    except Exception:
+        pass
+    return store
+
+
+def opened(address: str, job: str, epoch: int, store) -> None:
+    """Say on ``store`` that ``epoch`` has its quorum, and on the server's
+    record of the job that it is the epoch this server is on."""
+    store.set(OPEN_KEY, b"1")
+    if epoch:
+        connect(address, job, timeout=PROBE_TIMEOUT).set(CURRENT_KEY, str(int(epoch)).encode("utf-8"))
+
+
+def current(addresses: List[str], job: str, deadline: float, timeout: float = 300.0):
+    """The store of the newest open epoch among ``addresses``, for a node that
+    arrives in a run already going: after a failover the first address is the
+    dead one. ``(store, epoch, address)``.
+
+    The first address with no epoch recorded is epoch 0, the run's until it
+    dies. A later epoch counts only once opened, so a server a cut-off
+    minority started is never taken for the run's.
+    """
+    while True:
+        best = None
+        for index, address in enumerate(addresses):
+            if not answers(address):
+                continue
+            try:
+                record = connect(address, job, timeout=PROBE_TIMEOUT)
+                if record.check([CURRENT_KEY]):
+                    epoch = int(record.get(CURRENT_KEY))
+                elif index == 0:
+                    epoch = 0
+                else:
+                    continue
+            except Exception:
+                continue
+            if best is None or epoch > best[0]:
+                best = (epoch, address)
+        if best is not None:
+            epoch, address = best
+            return connect(address, epoch_job(job, epoch), timeout=timeout), epoch, address
+        if time.monotonic() >= deadline:
+            raise TimeoutError("no rendezvous answers among %s" % ", ".join(addresses))
+        time.sleep(1.0)

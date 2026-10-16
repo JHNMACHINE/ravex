@@ -22,6 +22,14 @@
   continues it. Off by default; numbers in `docs/configuration.md`.
 - **`bench/outer_momentum.py`**: the outer loop against one node alone on
   GPU-131's teacher, over seeds, H and momentum schedules, on a CPU.
+- **The rendezvous survives its machine (GPU-229).** `outer_rendezvous` takes
+  several addresses and `outer_member` a node's place among them. When the
+  server stops answering, the nodes still training elect one of those places,
+  start `ravex rendezvous` there and carry the run on in a new epoch: they
+  register again and take the outer parameters from the node that got
+  furthest, as at the start of a run. An epoch opens only once more than half
+  of the last round's nodes are on it, so a network cut in two stops its
+  smaller side instead of training a second model.
 
 ### Fixed
 

@@ -1117,7 +1117,29 @@ server have to trust each other; the simple rule is a server per run.
 take a number, write any key, and read the token rank 0 leaves on the store.
 Keep that port on a private network.
 
-Two more limits. The server is a single point,
+**If the server dies, the nodes can elect another** (GPU-229). Give
+`outer_rendezvous` several addresses, the same list in the same order on every
+node, and give each node its place in it:
+
+```yaml
+outer_rendezvous: 10.0.0.5:29400,10.0.0.6:29400,10.0.0.7:29400   # the first is where the run starts
+outer_member: 1                      # or RAVEX_OUTER_MEMBER: this node's address in that list
+```
+
+When the server stops answering, the nodes still training look for one serving
+the run's next *epoch* at those addresses, in order; if none does, the node
+whose place comes first starts `ravex rendezvous` on its own address, in a
+process that outlives its training. Nothing of the dead server's state is
+copied: the nodes register again on the new one and take the outer parameters
+from the node that got furthest, as at the start of a run, and a node that was
+a round behind then rejoins to take the momentum too. The new epoch opens only
+once more than half of the last round's nodes are on it, so a network cut in
+two never trains two models: its smaller side stops instead. So a run on two
+nodes with the server on one of them cannot carry on when that node dies: the
+survivor is one of two, not more than half. A node started later is given the same list and finds the run where
+it is now.
+
+Two more limits. Without that list the server is a single point,
 and restarting it loses the job's state — though a small process is easier to
 keep alive than a spot GPU. And a run that has lost one of its starting nodes
 cannot take a new one yet: a joiner waits for every starting node to

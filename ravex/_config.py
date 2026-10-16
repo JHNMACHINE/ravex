@@ -685,7 +685,17 @@ class RavexConfig:
     #: the store when one of them dies. Unset, it is torchrun as before. Also
     #: ``RAVEX_RENDEZVOUS``. Read `ravex._dist.rendezvous` for what it does not
     #: do — the server has no authentication.
+    #:
+    #: Several addresses, separated by commas, are the places another
+    #: rendezvous may be opened if the first one dies (GPU-229): the nodes
+    #: still training elect one among them and carry on there. Every node is
+    #: given the same list in the same order.
     outer_rendezvous: Optional[str] = None
+
+    #: This node's place in ``outer_rendezvous``: the address it would host
+    #: the rendezvous on, if elected. Unset, the node follows a failover but
+    #: never hosts one. Also ``RAVEX_OUTER_MEMBER``.
+    outer_member: Optional[int] = None
 
     #: The job's name on that server, which keeps several jobs apart on one.
     #: Every node of a run gives the same one. Also ``RAVEX_OUTER_JOB``.
@@ -908,6 +918,8 @@ class RavexConfig:
             self.outer_rendezvous = value
         if (value := get("OUTER_JOB")) is not None:
             self.outer_job = value
+        if (value := get("OUTER_MEMBER")) is not None:
+            self.outer_member = value.strip() or None
         if (value := get("OUTER_MIN_NODES")) is not None:
             self.outer_min_nodes = _as_int(value, self.outer_min_nodes)
         if (value := get("OUTER_REGION")) is not None:
@@ -1248,11 +1260,11 @@ class RavexConfig:
             else:
                 self.outer_save_dtype = name
         if self.outer_rendezvous is not None:
-            from ravex._dist.rendezvous import parse_address
+            from ravex._dist.rendezvous import candidates
 
             text = str(self.outer_rendezvous).strip()
             try:
-                parse_address(text)
+                candidates(text)
                 self.outer_rendezvous = text
             except ValueError as exc:
                 # Recorded rather than raised, like every other option read
@@ -1274,6 +1286,18 @@ class RavexConfig:
             self.outer_job = "default"
         if self.outer_min_nodes < 1:
             self.outer_min_nodes = 1
+        if self.outer_member is not None:
+            member = _as_int(self.outer_member, -1)
+            places = len(str(self.outer_rendezvous or "").split(","))
+            if not 0 <= member < places:
+                self.problems.append(
+                    f"outer_member={self.outer_member!r} is not a place in "
+                    f"outer_rendezvous, which names {places}; this node will "
+                    "not host the rendezvous if the run loses its own"
+                )
+                self.outer_member = None
+            else:
+                self.outer_member = member
         if str(self.compression).strip().lower() in ("none", "off", ""):
             self.compression_level = 0
 
