@@ -692,7 +692,16 @@ def current(addresses: List[str], job: str, deadline: float, timeout: float = 30
                 best = (epoch, address)
         if best is not None:
             epoch, address = best
-            return connect(address, epoch_job(job, epoch), timeout=timeout), epoch, address
+            try:
+                return connect(address, epoch_job(job, epoch), timeout=timeout), epoch, address
+            except Exception as exc:
+                # The server answered the probe and died before the store was
+                # opened on it: the moment a failover begins, which is when a
+                # node arriving late is most likely to ask. Asked again, the
+                # dead address is passed over and the next epoch, once open,
+                # is found - where letting this out failed the arrival, every
+                # time on a machine where a connect is slow (GPU-229).
+                logger.info("The rendezvous at %s stopped answering while being joined: %s", address, exc)
         if time.monotonic() >= deadline:
             raise TimeoutError("no rendezvous answers among %s" % ", ".join(addresses))
         time.sleep(1.0)

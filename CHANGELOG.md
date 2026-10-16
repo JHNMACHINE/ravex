@@ -14,6 +14,13 @@
   again on other machines. A peer in another region, or a node without
   `outer_region`, is still only warned about.
 
+### Fixed
+
+- **A node arriving as the rendezvous dies finds the next one (GPU-229).**
+  `rendezvous.current` probed a server, saw it answer, and failed with its
+  connection error when it died before the store was opened - the moment a
+  failover begins. It asks again now, and finds the elected one.
+
 ## 0.7.4 — 2026-10-16
 
 ### Changed

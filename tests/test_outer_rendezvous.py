@@ -455,6 +455,21 @@ def collect(queue, count):
     return results
 
 
+def end_nodes(processes, patience=60):
+    """Join every node, and kill the ones still going after ``patience``.
+
+    A test that failed leaves nodes training with nobody to stop them, and on
+    Windows a child does not die with its parent: they spun on, thousands of
+    CPU seconds each, and every timed test after the first failure in a run
+    failed too (2026-10-16)."""
+    for process in processes:
+        process.join(patience)
+    for process in processes:
+        if process.is_alive():
+            process.kill()
+            process.join(10)
+
+
 def rounds_over(said, nodes):
     return [line for line in said if "Outer round" in line and "over %d node(s)" % nodes in line]
 
@@ -503,8 +518,7 @@ def join_a_run(server, tmp_path):
     try:
         results = collect(queue, 3)
     finally:
-        for process in members + [joiner]:
-            process.join(60)
+        end_nodes(members + [joiner])
 
     digests = {name: digest for name, (digest, _, _) in results.items()}
     assert len(set(digests.values())) == 1, (
@@ -541,8 +555,7 @@ def test_the_first_node_dying_does_not_take_the_run_with_it(server, tmp_path):
     try:
         results = collect(queue, 2)
     finally:
-        for node in nodes:
-            node.join(60)
+        end_nodes(nodes)
 
     digests = {name: digest for name, (digest, _, _) in results.items()}
     assert len(set(digests.values())) == 1, (
@@ -576,8 +589,7 @@ def test_a_node_that_falls_off_the_model_rejoins_without_a_relaunch(server, tmp_
     try:
         results = collect(queue, 3)
     finally:
-        for node in nodes:
-            node.join(60)
+        end_nodes(nodes)
 
     digests = {name: digest for name, (digest, _, _) in results.items()}
     assert len(set(digests.values())) == 1, (
@@ -656,6 +668,50 @@ def hosted_pids(said):
     ]
 
 
+def test_a_rendezvous_dying_while_it_is_joined_is_passed_over(monkeypatch):
+    """The run's first server answers the probe and dies before its store is
+    opened - the moment a failover starts. Whoever asks then finds epoch 1 on
+    the next address, rather than the dead server's connection error: that
+    error failed the election test every time on a machine where a connect is
+    slow, and would fail a node arriving at that moment the same way."""
+    dead, elected = "127.0.0.1:1", "127.0.0.1:2"
+    alive = {dead: True, elected: True}
+
+    class Record:
+        """The job's record on a server: epoch 1 is recorded on the elected
+        one only once the first server is gone, as a failover does it."""
+
+        def __init__(self, address):
+            self.address = address
+
+        def check(self, keys):
+            return self.address == elected and not alive[dead]
+
+        def get(self, key):
+            return b"1"
+
+    asked = []
+
+    def connect(address, job, timeout):
+        if not alive[address]:
+            raise RuntimeError("The client socket has timed out")
+        asked.append(address)
+        if address == dead and asked.count(dead) == 2:
+            # Its record was read; asked for its store, it is gone.
+            alive[dead] = False
+            raise RuntimeError("The client socket has timed out")
+        if job == "run" and (address != dead or asked.count(dead) == 1):
+            return Record(address)
+        return ("store", address, job)
+
+    monkeypatch.setattr(rendezvous, "answers", lambda address, timeout=0: alive[address])
+    monkeypatch.setattr(rendezvous, "connect", connect)
+    monkeypatch.setattr(rendezvous.time, "sleep", lambda seconds: None)
+    store, epoch, address = rendezvous.current([dead, elected], "run", time.monotonic() + 30, timeout=5)
+    assert (epoch, address) == (1, elected)
+    assert store == ("store", elected, rendezvous.epoch_job("run", 1))
+
+
 @pytest.mark.skipif(sys.platform == "darwin", reason="spawn is slow on macOS")
 def test_the_run_elects_a_new_rendezvous_when_its_own_dies(server, tmp_path):
     """The server is killed at round 3, every node's state on it. The nodes
@@ -708,10 +764,18 @@ def test_the_run_elects_a_new_rendezvous_when_its_own_dies(server, tmp_path):
         joiner.start()
         results = collect(queue, 4)
     finally:
-        for process in nodes + ([joiner] if joiner else []):
-            process.join(60)
+        end_nodes(nodes + ([joiner] if joiner else []))
         dying.kill()
         dying.wait()
+        # The servers the elected nodes started outlive them on purpose. Each
+        # node said its server's pid; /proc finds one whose node never got to
+        # say it, on Linux - elsewhere, said is all there is, and without this
+        # every run left one listening on Windows.
+        for pid in (pid for _, _, said in results.values() for pid in hosted_pids(said)):
+            try:
+                os.kill(pid, 9)
+            except OSError:
+                pass
         if sys.platform.startswith("linux"):
             stop_servers_on(ports)
 
