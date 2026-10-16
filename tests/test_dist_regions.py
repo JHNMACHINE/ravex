@@ -285,3 +285,79 @@ class TestWhoIsUnreachable:
             assert time.monotonic() - began < 3.0
         finally:
             exchange.close()
+
+
+class TestARegionThatCannotMeet:
+    """GPU-233: a node that cannot reach one of its own region stops the run
+    before its first step; one it cannot reach in another region does not."""
+
+    def _nodes(self, store, tmp_path, ranks):
+        made = {}
+        for rank in ranks:
+            exchange = DeltaExchange(rank, store, root=os.path.join(str(tmp_path), "r%d" % rank),
+                                     node=str(rank), patience=5.0)
+            assert exchange.start()
+            announce_region(store, exchange.scope_base or exchange.scope, rank, REGIONS[rank])
+            made[rank] = exchange
+        return made
+
+    def _check(self, exchange, peers, region):
+        from types import SimpleNamespace
+
+        from ravex._runtime import RavexRuntime
+
+        me = SimpleNamespace(config=SimpleNamespace(outer_region=region))
+        RavexRuntime._say_who_is_unreachable(me, exchange, peers)
+
+    def test_a_mate_it_cannot_reach_stops_the_run(self, store, tmp_path):
+        from ravex._dist.exchange import RegionUnreachable
+
+        made = self._nodes(store, tmp_path, [0, 1, 2])
+        try:
+            made[1].close()
+            with pytest.raises(RegionUnreachable) as raised:
+                self._check(made[0], [1, 2], "eu")
+            assert raised.value.region == "eu"
+            assert list(raised.value.peers) == [1]
+            # The name is what a launcher matches on, in the traceback's last line.
+            assert type(raised.value).__name__ == "RegionUnreachable"
+            assert "node 0 cannot connect to node 1 of its own region 'eu'" in str(raised.value)
+        finally:
+            for rank in (0, 2):
+                made[rank].close()
+
+    def test_a_peer_of_another_region_only_warns(self, store, tmp_path, caplog):
+        made = self._nodes(store, tmp_path, [0, 1, 2])
+        try:
+            made[2].close()
+            self._check(made[0], [1, 2], "eu")
+            assert "cannot connect to node 2" in caplog.text
+        finally:
+            for rank in (0, 1):
+                made[rank].close()
+
+    def test_without_regions_nothing_stops(self, store, tmp_path, caplog):
+        made = self._nodes(store, tmp_path, [0, 1])
+        try:
+            made[1].close()
+            self._check(made[0], [1], None)
+            assert "cannot connect to node 1" in caplog.text
+        finally:
+            made[0].close()
+
+    def test_the_runtime_does_not_train_on_alone(self, monkeypatch):
+        # `_outer_loop` turns every other failure into training locally; this
+        # one has to reach the training loop.
+        from ravex._dist.exchange import RegionUnreachable
+        from ravex._runtime import RavexRuntime
+
+        runtime = RavexRuntime.__new__(RavexRuntime)
+        runtime._outer = None
+        runtime.registry = type("Registry", (), {"models": [object()]})()
+
+        def refuse(self):
+            raise RegionUnreachable("eu", 0, {1: "10.0.0.2:1"})
+
+        monkeypatch.setattr(RavexRuntime, "_build_outer_loop", refuse)
+        with pytest.raises(RegionUnreachable):
+            runtime._outer_loop()

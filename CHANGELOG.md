@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **A node that cannot reach one of its own region stops the run (GPU-233).**
+  With `outer_region` set, the check at the start (GPU-186) no longer only
+  warns about a peer of the same region it cannot connect to: it raises
+  `RegionUnreachable` before the first step, naming the nodes. A region's
+  round is closed by its members together, and two that cannot connect train
+  as two models; on rented machines it happened twice in one data centre.
+  The name is the last line of the traceback, for a launcher to start the run
+  again on other machines. A peer in another region, or a node without
+  `outer_region`, is still only warned about.
+
 ## 0.7.4 — 2026-10-16
 
 ### Changed

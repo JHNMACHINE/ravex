@@ -1175,6 +1175,13 @@ cannot serve the result takes it from another region's delegate - over the slow
 link, for that round - and stops and rejoins only if none answers. Every node
 of the run sets a region, or none does; with none the round is the flat one.
 
+A region is one network, so its nodes must reach each other: before the first
+step every node connects to each peer, and one that cannot connect to a node of
+its own region stops with `RegionUnreachable`, naming it (GPU-233) - two halves
+of a region would train two models. Start the run again on other machines. A
+peer in another region that does not answer is only warned about: its round
+closes over whoever answered.
+
 **When it pays, measured - and when it does not.** The round over regions
 cuts what crosses regions and pays for it in time: its three steps run one
 after the other, where the flat round fetches from every peer at once. On

@@ -959,8 +959,15 @@ class RavexRuntime:
             # for a reason that stopped being true immediately after.
             return None
 
+        from ravex._dist.exchange import RegionUnreachable
+
         try:
             self._outer = self._build_outer_loop()
+        except RegionUnreachable:
+            # Not a loop that could not be had but a run that must not go on:
+            # training this node alone is the two halves it exists to prevent
+            # (GPU-233). The exchanges' threads are daemons and go with it.
+            raise
         except Exception as exc:
             logger.warning(
                 "Could not start the outer loop (%s). Training continues "
@@ -1125,16 +1132,32 @@ class RavexRuntime:
     def _say_who_is_unreachable(self, exchange, peers) -> None:
         """Warn, at the start, about every peer this node cannot connect to.
 
-        It changes nothing about the run - a round closes over whoever
-        answered either way - but it says *why* a node will be left out, and
-        says it before the first round rather than as a peer that seemed slow
-        (GPU-186).
+        Across regions it changes nothing about the run - a round closes over
+        whoever answered either way - but it says *why* a node will be left
+        out, and says it before the first round rather than as a peer that
+        seemed slow (GPU-186).
+
+        Within this node's own region it stops the run instead
+        (:class:`RegionUnreachable`, GPU-233): a region's round is closed by
+        its members together, and two that cannot connect would train as two
+        models. A peer that has not said where it listens is only warned
+        about: it may still be starting, and nothing says it is in the region.
         """
         try:
             missing = exchange.unreachable(peers)
         except Exception as exc:
             logger.debug("Could not check which peers are reachable: %s", exc)
             return
+        region = self.config.outer_region
+        dialled = {peer: address for peer, address in missing.items() if address is not None}
+        if region and dialled:
+            from ravex._dist.exchange import RegionUnreachable, regions_of
+
+            scope = exchange.scope_base or exchange.scope
+            theirs = regions_of(exchange.store, scope, dialled, time.monotonic() + 10.0)
+            mates = {peer: address for peer, address in dialled.items() if theirs.get(peer) == region}
+            if mates:
+                raise RegionUnreachable(region, exchange.rank, mates)
         for peer, address in sorted(missing.items()):
             if address is None:
                 logger.warning(

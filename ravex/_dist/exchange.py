@@ -593,6 +593,40 @@ def regions_of(store, scope, ranks, deadline: float) -> Dict[int, str]:
     return found
 
 
+class RegionUnreachable(RuntimeError):
+    """A node of this one's region cannot be reached, found when the run starts.
+
+    GPU-233. A region is the nodes that share one network, and its rounds
+    close among them first; two of them that cannot connect train as two
+    halves that never agree, which is worse than not starting. On rented
+    machines it happened twice on two pods of one data centre: each reached
+    the other continent, neither the other. So the run stops here, before
+    its first step, saying which nodes - and whoever launched it can start it
+    again on other machines. The name is what a launcher matches on: it is
+    the last line of the traceback, and it does not change.
+
+    A peer across regions that cannot be reached is not this: a round closes
+    over whoever answered, as it always has.
+    """
+
+    def __init__(self, region: str, rank: int, peers: Dict[int, str]) -> None:
+        self.region = region
+        self.rank = rank
+        self.peers = dict(peers)
+        super().__init__(
+            "node %d cannot connect to %s of its own region %r (%s): the "
+            "network between them does not carry it, and a region that cannot "
+            "meet cannot close a round. Start the run again on other machines."
+            % (
+                rank,
+                "node %d" % next(iter(peers)) if len(peers) == 1
+                else "nodes " + ", ".join(str(p) for p in sorted(peers)),
+                region,
+                ", ".join("%d at %s" % (p, peers[p]) for p in sorted(peers)),
+            )
+        )
+
+
 def _delegate_of(store, scope, round_number: int, region: str, proposal: Optional[int],
                  deadline: float) -> Optional[int]:
     """The region's delegate for a round, as the store keeps it.
