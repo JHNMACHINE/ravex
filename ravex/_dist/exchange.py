@@ -230,7 +230,6 @@ def decide_round(store, scope, round_number: int, rank: int, collected,
     """
     key = ROUND_SET_KEY % (_job_digest(scope), round_number)
     proposal = json.dumps({"by": int(rank), "set": sorted(int(r) for r in collected)})
-    lost_since = None
     while True:
         try:
             raw = store.compare_set(key, "", proposal)
@@ -241,14 +240,27 @@ def decide_round(store, scope, round_number: int, rank: int, collected,
             # again. Waiting out the deadline for it is only a quarter of an
             # hour of a stopped run before the failover (GPU-229) can start.
             if type(exc).__name__ == "DistNetworkError":
-                lost_since = lost_since or time.monotonic()
-                if time.monotonic() - lost_since >= STORE_LOST_AFTER:
+                # Not asked again: a client that lost its connection fails
+                # every later call at once, even with a new server on the same
+                # port, and each failure is a C++ warning with its whole
+                # backtrace. Asked every 0.2 s, that was some 50 warnings and
+                # 650 lines per node, hiding the four lines of the failover
+                # (2026-10-16). The wait before calling the server gone stays
+                # what it was; only the calls that could not succeed go.
+                # Which of the two ends the wait is decided before it, not by
+                # reading the clock after it: a sleep may wake a little early.
+                given_up = time.monotonic() + STORE_LOST_AFTER
+                time.sleep(max(0.0, min(given_up, deadline) - time.monotonic()))
+                if given_up <= deadline:
                     raise RoundSplitError(
                         "the rendezvous store stopped answering while round %d "
                         "was being decided (%s)" % (round_number, exc)
                     ) from exc
-            else:
-                lost_since = None
+                raise RoundSplitError(
+                    "could not read round %d's decision off the rendezvous "
+                    "store (%s); stopping rather than guessing whether the "
+                    "other nodes took the step" % (round_number, exc)
+                ) from exc
             if time.monotonic() >= deadline:
                 raise RoundSplitError(
                     "could not read round %d's decision off the rendezvous "

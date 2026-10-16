@@ -664,3 +664,49 @@ def test_the_seed_round_leaves_one_model_even_when_the_report_is_cast(tmp_path):
     left = dict(models[0].named_parameters())
     for name, right in models[1].named_parameters():
         assert torch.equal(left[name], right), name
+
+
+def test_a_rendezvous_gone_is_asked_once_not_until_it_is_given_up(monkeypatch):
+    """GPU-229, seen on 2026-10-16: a client that lost its server fails every
+    later call at once, each with a C++ warning and its backtrace. Asked every
+    0.2 s until the server was given up, that was some 650 lines per node
+    around the four that said what happened. One call now, and the same wait
+    before the store is called gone."""
+    from ravex._dist import exchange
+    from ravex._dist.exchange import RoundSplitError, decide_round
+
+    class DistNetworkError(RuntimeError):
+        pass
+
+    class Gone:
+        calls = 0
+
+        def compare_set(self, key, expected, desired):
+            Gone.calls += 1
+            raise DistNetworkError("Broken pipe")
+
+    monkeypatch.setattr(exchange, "STORE_LOST_AFTER", 0.6)
+    started = time.monotonic()
+    with pytest.raises(RoundSplitError, match="stopped answering"):
+        decide_round(Gone(), b"run", 3, 0, [0, 1], deadline=time.monotonic() + 30)
+    assert Gone.calls == 1
+    # Waited for the store to be given up, and not for the round's deadline.
+    assert 0.5 <= time.monotonic() - started < 15
+
+
+def test_a_deadline_before_the_store_is_given_up_still_ends_the_wait(monkeypatch):
+    from ravex._dist import exchange
+    from ravex._dist.exchange import RoundSplitError, decide_round
+
+    class DistNetworkError(RuntimeError):
+        pass
+
+    class Gone:
+        def compare_set(self, key, expected, desired):
+            raise DistNetworkError("Broken pipe")
+
+    monkeypatch.setattr(exchange, "STORE_LOST_AFTER", 30.0)
+    started = time.monotonic()
+    with pytest.raises(RoundSplitError, match="could not read round 3"):
+        decide_round(Gone(), b"run", 3, 0, [0, 1], deadline=time.monotonic() + 0.5)
+    assert time.monotonic() - started < 15
