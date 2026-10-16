@@ -25,6 +25,9 @@
 
 ### Fixed
 
+- **`keep_last` is every snapshot kept with `delta: false`.** Each snapshot
+  is then a full one, and Moonclip's own cap on fulls, five, stayed in place:
+  `keep_last: 10` kept five.
 - **A node arriving as the rendezvous dies finds the next one (GPU-229).**
   `rendezvous.current` probed a server, saw it answer, and failed with its
   connection error when it died before the store was opened - the moment a

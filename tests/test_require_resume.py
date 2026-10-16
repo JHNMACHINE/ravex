@@ -123,3 +123,12 @@ class TestCheckpointsReachTheBucketAsTheyAreWritten:
             "Moonclip's default syncs every hundred saves: a node lost before "
             "then leaves no checkpoint in the bucket"
         )
+
+    def test_with_a_full_per_save_keep_last_is_every_snapshot_kept(
+        self, tmp_path, monkeypatch
+    ):
+        seen, _ = self.manager_arguments(tmp_path, monkeypatch, delta=False, keep_last=12)
+        assert seen.get("max_total_snapshots") == 12
+        assert seen.get("max_full_snapshots") == 12, (
+            "every snapshot is a full one, and Moonclip's own cap on fulls is five"
+        )

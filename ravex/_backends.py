@@ -319,6 +319,10 @@ class MoonclipBackend(CheckpointBackend):
             # No dedicated switch in Moonclip: a full snapshot on every step is
             # exactly "delta disabled".
             kwargs["full_every_steps"] = 1
+            # Every snapshot is a full one, so Moonclip's cap on fulls - 5 by
+            # default - is a cap on all of them, and `keep_last: 10` kept five
+            # without a word. Lifted to say the same as `max_total_snapshots`.
+            kwargs["max_full_snapshots"] = config.keep_last
         else:
             # A delta at every step, a full every `full_every`. Moonclip's
             # own cap on deltas between fulls (10 by default) is lifted to
