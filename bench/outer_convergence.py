@@ -437,6 +437,7 @@ def run(shards, args, inner, dtype=None, feedback=False, own="published",
             inner_steps=locals_[index],
             lr=args.outer_lr,
             momentum=args.outer_momentum,
+            momentum_warmup=args.outer_momentum_warmup,
             node=str(index),
             combine_mode=combine_mode,
         )
@@ -529,7 +530,9 @@ def main():
                              "peers see it; `both` measures the difference")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--outer-lr", type=float, default=0.7)
-    parser.add_argument("--outer-momentum", type=float, default=0.9)
+    parser.add_argument("--outer-momentum", type=float, default=0.7)
+    parser.add_argument("--outer-momentum-warmup", type=int, default=0,
+                        help="rounds over which the momentum ramps in (GPU-192)")
     parser.add_argument("--batch", type=int, default=16)
     parser.add_argument("--block", type=int, default=128)
     parser.add_argument("--dim", type=int, default=128)

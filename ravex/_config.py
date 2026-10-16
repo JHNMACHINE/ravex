@@ -608,11 +608,18 @@ class RavexConfig:
     #: 0 disables it. Whichever of the two comes first closes the round.
     outer_round_seconds: float = 0.0
 
-    #: The outer optimizer. DiLoCo's published values; `outer_lr` is not small
-    #: on purpose — the step is meant to travel most of the way to the average
-    #: of where the nodes went, not to nudge toward it.
+    #: The outer optimizer. `outer_lr` is DiLoCo's and is not small on
+    #: purpose — the step is meant to travel most of the way to the average of
+    #: where the nodes went, not to nudge toward it. `outer_momentum` is 0.7
+    #: rather than DiLoCo's 0.9 (GPU-192): over the tens of rounds a run here
+    #: gets, 0.9 lost to one node training alone wherever a round's delta was
+    #: large, and 0.7 beat it on every arm measured. The argument and the
+    #: numbers are at `ravex._dist.outer.DEFAULT_OUTER_MOMENTUM`.
     outer_lr: float = 0.7
-    outer_momentum: float = 0.9
+    outer_momentum: float = 0.7
+    #: Rounds over which the momentum ramps in from 0 (GPU-192); 0 is none.
+    #: See `ravex._dist.outer.OuterOptimizer` for why the first rounds need it.
+    outer_momentum_warmup: int = 0
 
     #: How contributions are weighted: `mean`, `normalized` or `step_weighted`.
     #: The default is derivable and was then measured — see
@@ -925,6 +932,8 @@ class RavexConfig:
             self.outer_lr = _as_float(value, self.outer_lr)
         if (value := get("OUTER_MOMENTUM")) is not None:
             self.outer_momentum = _as_float(value, self.outer_momentum)
+        if (value := get("OUTER_MOMENTUM_WARMUP")) is not None:
+            self.outer_momentum_warmup = _as_int(value, self.outer_momentum_warmup)
         if (value := get("OUTER_COMBINE")) is not None:
             self.outer_combine = value
         if (value := get("OUTER_DEADLINE")) is not None:
@@ -1201,6 +1210,17 @@ class RavexConfig:
                 f"{', '.join(_OUTER_COMBINE_MODES)}; using 'mean'"
             )
             self.outer_combine = "mean"
+        warmup = _as_int(self.outer_momentum_warmup, -1)
+        if warmup < 0:
+            # A bad value here would surface as a ValueError from the outer
+            # optimizer, inside the `except` that gives up on the outer loop
+            # and carries on training alone - the same trap as the save dtype.
+            self.problems.append(
+                f"outer_momentum_warmup={self.outer_momentum_warmup!r} is not a "
+                "number of rounds; using 0"
+            )
+            warmup = 0
+        self.outer_momentum_warmup = warmup
         if self.outer_save_dtype is not None:
             # Same check `_normalize_save_dtype` makes on the checkpoint one,
             # and for the same reason: Moonclip refuses a bad target when the

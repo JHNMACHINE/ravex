@@ -52,12 +52,23 @@ logger = logging.getLogger("ravex")
 #: The parameters of a model, by name, detached from the graph.
 ParamMap = Dict[str, Any]
 
-#: DiLoCo's published values, and they are a starting point rather than a
-#: finding of ours: Nesterov, momentum 0.9, learning rate 0.7. Worth writing
-#: down that ``lr=0.7`` is *not* small — the outer step is meant to travel most
-#: of the way to the average of where the nodes went, not to nudge toward it.
+#: Nesterov at learning rate 0.7 is DiLoCo's, and worth writing down that
+#: ``lr=0.7`` is *not* small — the outer step is meant to travel most of the
+#: way to the average of where the nodes went, not to nudge toward it.
+#:
+#: **The momentum is 0.7, not DiLoCo's 0.9, and that one is measured**
+#: (GPU-192, ``bench/outer_momentum.py``). DiLoCo amortises a 0.9 buffer over
+#: thousands of rounds; a run here does tens, and 0.9 *lost to one node
+#: training alone* wherever a round's delta was large: on GPU-131's teacher
+#: (0.810 against 0.749 at 500 steps) and on every seed of the noisy-inner arm,
+#: without recovering by 2000 steps. 0.7 beat the lone node on every seed of
+#: every arm measured, as 0.5 did, and by more than 0.5 everywhere but the
+#: noisy arm; it was the best arm on GPU-131's own configuration and within
+#: 0.03 of the best on the transformer of ``bench/outer_convergence.py``. Where
+#: the inner optimizer moves slowly 0.9 is better, by a third — which is what
+#: ``outer_momentum`` is for, and not a default that can lose to one machine.
 DEFAULT_OUTER_LR = 0.7
-DEFAULT_OUTER_MOMENTUM = 0.9
+DEFAULT_OUTER_MOMENTUM = 0.7
 
 #: How contributions are combined. See :func:`combine`, which is where the
 #: argument for the default lives.
@@ -469,6 +480,16 @@ class OuterOptimizer:
     The buffer surviving between rounds is not an implementation detail, it is
     the mechanism: it is what carries a direction several rounds agreed on
     through a round where one node dominated the average.
+
+    **``momentum_warmup`` ramps the momentum in** linearly from 0 to
+    ``momentum`` over that many rounds (GPU-192). At round 0 the buffer *is*
+    the pseudo-gradient, so a full Nesterov momentum steps ``1 + momentum``
+    times it - 1.33 deltas at the defaults, past where the nodes went - and on
+    the rounds that follow it keeps amplifying deltas measured from an
+    initialisation the inner optimizer is still leaving fast. DiLoCo amortises
+    that over thousands of rounds; a run of tens does not. The ramp counts
+    ``rounds``, which the state carries, so a resume continues it rather than
+    starting it again.
     """
 
     def __init__(
@@ -476,19 +497,32 @@ class OuterOptimizer:
         lr: float = DEFAULT_OUTER_LR,
         momentum: float = DEFAULT_OUTER_MOMENTUM,
         nesterov: bool = True,
+        momentum_warmup: int = 0,
     ) -> None:
         if nesterov and momentum <= 0:
             raise ValueError("nesterov needs a momentum above zero, got %r" % momentum)
+        if momentum_warmup < 0:
+            raise ValueError("momentum_warmup is a number of rounds, got %r" % momentum_warmup)
         self.lr = float(lr)
         self.momentum = float(momentum)
         self.nesterov = bool(nesterov)
+        self.momentum_warmup = int(momentum_warmup)
         self.buffers: ParamMap = {}
         self.rounds = 0
+
+    def current_momentum(self) -> float:
+        """The momentum the next step takes, with the warmup applied."""
+        if self.momentum_warmup and self.rounds < self.momentum_warmup:
+            return self.momentum * self.rounds / self.momentum_warmup
+        return self.momentum
 
     def step(self, outer: ParamMap, gradient: ParamMap) -> None:
         """Move ``outer`` in place, by one outer step along ``gradient``."""
         import torch
 
+        # The buffer is kept whenever there is a momentum to reach, even on a
+        # warmup round that weighs it at zero: the rounds after need it.
+        momentum = self.current_momentum()
         with torch.no_grad():
             for name, value in outer.items():
                 grad = gradient[name].to(device=value.device, dtype=value.dtype)
@@ -497,10 +531,10 @@ class OuterOptimizer:
                     if buffer is None:
                         buffer = grad.clone()
                     else:
-                        buffer.mul_(self.momentum).add_(grad)
+                        buffer.mul_(momentum).add_(grad)
                     self.buffers[name] = buffer
                     if self.nesterov:
-                        update = grad.add(buffer, alpha=self.momentum)
+                        update = grad.add(buffer, alpha=momentum)
                     else:
                         update = buffer
                 else:
@@ -520,6 +554,7 @@ class OuterOptimizer:
             "lr": self.lr,
             "momentum": self.momentum,
             "nesterov": self.nesterov,
+            "momentum_warmup": self.momentum_warmup,
             "rounds": self.rounds,
             "buffers": self.buffers,
         }
@@ -528,6 +563,7 @@ class OuterOptimizer:
         self.lr = float(state.get("lr", self.lr))
         self.momentum = float(state.get("momentum", self.momentum))
         self.nesterov = bool(state.get("nesterov", self.nesterov))
+        self.momentum_warmup = int(state.get("momentum_warmup", self.momentum_warmup))
         self.rounds = int(state.get("rounds", 0))
         self.buffers = dict(state.get("buffers") or {})
 
@@ -562,6 +598,7 @@ class OuterLoop:
         lr: float = DEFAULT_OUTER_LR,
         momentum: float = DEFAULT_OUTER_MOMENTUM,
         nesterov: bool = True,
+        momentum_warmup: int = 0,
         combine_mode: str = "mean",
         device=None,
         node: str = "",
@@ -587,7 +624,9 @@ class OuterLoop:
         self.combine_mode = combine_mode
         self.node = node
         self.device = device
-        self.optimizer = OuterOptimizer(lr=lr, momentum=momentum, nesterov=nesterov)
+        self.optimizer = OuterOptimizer(
+            lr=lr, momentum=momentum, nesterov=nesterov, momentum_warmup=momentum_warmup
+        )
         self.steps_this_round = 0
         self.round_number = 0
         #: Every step the model has taken, over all the nodes and all the

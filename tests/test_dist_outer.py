@@ -317,6 +317,40 @@ def test_the_momentum_buffer_survives_a_checkpoint():
     assert kept["w"].item() == pytest.approx(mine["w"].item())
 
 
+def test_a_warmup_round_zero_steps_the_delta_and_nothing_more():
+    """Without it Nesterov steps 1 + momentum deltas at once (GPU-192)."""
+    outer = {"w": torch.zeros(1)}
+    OuterOptimizer(lr=0.7, momentum=0.9, momentum_warmup=10).step(outer, {"w": torch.ones(1)})
+    assert outer["w"].item() == pytest.approx(-0.7)
+
+    outer = {"w": torch.zeros(1)}
+    OuterOptimizer(lr=0.7, momentum=0.9).step(outer, {"w": torch.ones(1)})
+    assert outer["w"].item() == pytest.approx(-0.7 * 1.9)
+
+
+def test_the_warmup_ramps_linearly_and_then_holds():
+    optimizer = OuterOptimizer(momentum=0.9, momentum_warmup=4)
+    seen = []
+    for _ in range(6):
+        seen.append(optimizer.current_momentum())
+        optimizer.step({"w": torch.zeros(1)}, {"w": torch.ones(1)})
+    assert seen == pytest.approx([0.0, 0.225, 0.45, 0.675, 0.9, 0.9])
+
+
+def test_a_resume_continues_the_warmup_instead_of_restarting_it():
+    original = OuterOptimizer(lr=0.7, momentum=0.9, momentum_warmup=10)
+    for _ in range(3):
+        original.step({"w": torch.zeros(1)}, {"w": torch.ones(1)})
+
+    restored = OuterOptimizer(lr=0.7, momentum=0.9)
+    restored.load_state_dict(copy.deepcopy(original.state_dict()))
+    assert restored.current_momentum() == pytest.approx(0.27)
+    kept, mine = {"w": torch.zeros(1)}, {"w": torch.zeros(1)}
+    restored.step(kept, {"w": torch.ones(1)})
+    original.step(mine, {"w": torch.ones(1)})
+    assert kept["w"].item() == pytest.approx(mine["w"].item())
+
+
 # --------------------------------------------------------------------------
 # the loop itself
 

@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **The outer momentum defaults to 0.7, not 0.9 (GPU-192).** DiLoCo's 0.9
+  is calibrated for thousands of rounds; over the tens a run here gets it
+  lost to one node training alone wherever a round's delta was large - on
+  GPU-131's teacher, 0.810 against 0.749 at 500 steps - and on a noisy
+  inner optimizer it never caught up. 0.7 beat one node on every seed of
+  every arm in `bench/outer_momentum.py` and on the transformer of
+  `bench/outer_convergence.py`. A run that wants the old behaviour sets
+  `outer_momentum: 0.9`; a resumed run keeps the momentum its checkpoint
+  carries.
+
+### Added
+
+- **`outer_momentum_warmup`** ramps the outer momentum in linearly from 0
+  over that many rounds, so round 0 steps the delta and not 1.9 times it.
+  The ramp counts rounds the outer state already carries, so a resume
+  continues it. Off by default; numbers in `docs/configuration.md`.
+- **`bench/outer_momentum.py`**: the outer loop against one node alone on
+  GPU-131's teacher, over seeds, H and momentum schedules, on a CPU.
+
 ## 0.7.3 — 2026-10-15
 
 ### Changed

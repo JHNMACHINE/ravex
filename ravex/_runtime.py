@@ -1042,6 +1042,7 @@ class RavexRuntime:
             round_seconds=self.config.outer_round_seconds or None,
             lr=self.config.outer_lr,
             momentum=self.config.outer_momentum,
+            momentum_warmup=self.config.outer_momentum_warmup,
             combine_mode=self.config.outer_combine,
             # **On the host, and it is not a preference** (GPU-124). A round
             # report is a moonclip snapshot and moonclip reads host memory, so

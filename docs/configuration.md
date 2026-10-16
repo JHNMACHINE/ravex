@@ -1004,7 +1004,8 @@ outer_loop: true
 outer_inner_steps: 500
 outer_round_seconds: 0       # or a wall clock, see below
 outer_lr: 0.7
-outer_momentum: 0.9
+outer_momentum: 0.7          # not DiLoCo's 0.9, see below
+outer_momentum_warmup: 0     # rounds to ramp the momentum in from 0
 outer_combine: mean          # mean | normalized | step_weighted
 outer_deadline: 900
 outer_save_dtype: null       # bf16 takes a fifth off a round; fp4_block 7.6x
@@ -1185,6 +1186,29 @@ rounds, not about H**: at equal tokens a larger H is fewer exchanges, and 512
 there was four of them in the whole run. Pick H from the link —
 `bench/round_link_cost.py` reports the H at which the network is a quarter of
 the round — and make sure the run gets more than a handful of rounds at it.
+
+**`outer_momentum` is 0.7, not DiLoCo's 0.9, and that is measured** (GPU-192).
+DiLoCo spreads a 0.9 buffer over thousands of rounds; a run here gets tens, and
+at round 0 a Nesterov step with 0.9 already travels 1.9 times the delta. On the
+two-node teacher of `bench/outer_momentum.py`, five seeds, H=50, the held-out
+loss at 2000 steps against one node training alone (negative is the group
+winning):
+
+| inner optimizer          | 0.9       | 0.7       | 0.5       | warmup to 0.9 |
+| ------------------------ | --------- | --------- | --------- | ------------- |
+| Adam 1e-4, batch 8       | **−0.25** | −0.20     | −0.10     | −0.24         |
+| Adam 1e-3, batch 64      | −0.02     | −0.02     | −0.02     | **−0.04**     |
+| Adam 1e-3, batch 8       | +0.19     | −0.07     | **−0.08** | −0.04         |
+
+and on the transformer of `bench/outer_convergence.py`, three seeds, held-out
+loss against 1.81 for one node: 0.9 gives 1.69 at H=32 and 1.73 at H=64, 0.7
+gives 1.56 and 1.65, the warmup 1.53 and 1.64. 0.9 is the best arm only where
+the inner optimizer moves slowly, and the worst where a round's delta is large
+and noisy, where it loses to one machine on every seed. 0.7 and 0.5 both beat one node on
+every seed of every arm, and 0.7 by more everywhere but the noisy arm. If your rounds are many and
+small, `outer_momentum: 0.9` is worth trying; `outer_momentum_warmup: 10` ramps
+it in over the first ten rounds and is the best arm on the transformer at H=32,
+but at H=25 on the noisy teacher it lost to one node, so it is not the default.
 
 **`outer_save_dtype` is measured now, and still `null`.** Same bench: every
 dtype column within ±0.005 of no cast at every H, with fp8 marginally ahead at
