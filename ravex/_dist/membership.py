@@ -509,6 +509,13 @@ def join(store, exchange, loop, rank: int, base_world: int, deadline: float,
     lost member never acknowledges. Named in :func:`acknowledged`.
     """
     members = [peer for peer in range(base_world) if peer != rank]
+    # What the members wrote for the last node that joined, if one did. They
+    # write it only while somebody wants in, so between joins it stays where
+    # the last join left it, rounds behind the run: announcing from it names a
+    # round the members have already closed, every one of them raises seeing
+    # it late, and the run is over. Found when a second node joined the same
+    # run (GPU-229). So it is not an observation until it has moved.
+    stale = state_round(store)
     want_in(store, rank)
     announced_at: Optional[int] = None
     looked_for_members = 0.0
@@ -528,7 +535,7 @@ def join(store, exchange, loop, rank: int, base_world: int, deadline: float,
                 break
 
         observed = state_round(store)
-        if observed is None:
+        if observed is None or (announced_at is None and observed == stale):
             time.sleep(poll)
             continue
 

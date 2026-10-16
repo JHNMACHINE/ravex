@@ -23,6 +23,14 @@
 - **`bench/outer_momentum.py`**: the outer loop against one node alone on
   GPU-131's teacher, over seeds, H and momentum schedules, on a CPU.
 
+### Fixed
+
+- **A second node joining the same run no longer ends it.** Between joins the
+  members' record of which round they are on stays where the last join left
+  it; a joiner announcing from it named a round already closed, every member
+  raised seeing the announcement late, and the run was over. A joiner now
+  waits for that record to move before announcing.
+
 ## 0.7.3 — 2026-10-15
 
 ### Changed
