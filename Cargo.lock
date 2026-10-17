@@ -505,7 +505,7 @@ dependencies = [
 
 [[package]]
 name = "ravex"
-version = "0.7.4"
+version = "0.7.5"
 dependencies = [
  "jiff",
  "pyo3",
