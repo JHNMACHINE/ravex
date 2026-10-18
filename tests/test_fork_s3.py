@@ -113,6 +113,71 @@ class TestForkFromABucket:
         # The copy of the parent went away with the fork's start.
         assert [n for n in os.listdir(tmp_path / "machine-b") if n.startswith(".fork-parent-")] == []
 
+    def test_a_fork_from_a_step_inside_the_delta_window(self, tmp_path, monkeypatch):
+        """With a delta per step the restore brings down the newest snapshot
+        and its base; a step in between is fetched when the fork loads it
+        (GPU-239)."""
+        pytest.importorskip("moonclip")
+        base = "fork-test-" + uuid.uuid4().hex[:8]
+        parent_dir = tmp_path / "machine-a" / "base"
+        in_bucket(monkeypatch, parent_dir, base + "/base")
+        ravex.train_loop(backend="moonclip", checkpoint_every=4, async_save=False, name="base")(
+            lambda: train_to(10)
+        )()
+        import shutil
+
+        shutil.rmtree(tmp_path / "machine-a")
+
+        child_dir = tmp_path / "machine-b" / "child"
+        in_bucket(monkeypatch, child_dir, base + "/child")
+        seen = {}
+        ravex.train_loop(
+            backend="moonclip",
+            checkpoint_every=4,
+            async_save=False,
+            fork_from="s3://%s/%s/base" % (BUCKET, base),
+            fork_step=8,
+        )(lambda: train_to(12, seen=seen))()
+
+        assert seen["start"] == 8
+
+    def test_a_resume_on_a_new_disk_leaves_the_window_forkable(self, tmp_path, monkeypatch):
+        """A resume that brought down only what it needed, then trained and
+        synced, leaves the bucket naming the steps it never downloaded: a fork
+        from one of them still works (GPU-239)."""
+        pytest.importorskip("moonclip")
+        base = "fork-test-" + uuid.uuid4().hex[:8]
+        import shutil
+
+        first = tmp_path / "machine-a" / "run"
+        in_bucket(monkeypatch, first, base + "/run")
+        ravex.train_loop(backend="moonclip", checkpoint_every=4, async_save=False, name="run")(
+            lambda: train_to(10)
+        )()
+        shutil.rmtree(tmp_path / "machine-a")
+
+        second = tmp_path / "machine-b" / "run"
+        in_bucket(monkeypatch, second, base + "/run")
+        resumed = {}
+        ravex.train_loop(backend="moonclip", checkpoint_every=4, async_save=False, name="run")(
+            lambda: train_to(11, seen=resumed)
+        )()
+        assert resumed["start"] >= 9, resumed
+        shutil.rmtree(tmp_path / "machine-b")
+
+        child_dir = tmp_path / "machine-c" / "child"
+        in_bucket(monkeypatch, child_dir, base + "/child")
+        seen = {}
+        ravex.train_loop(
+            backend="moonclip",
+            checkpoint_every=4,
+            async_save=False,
+            fork_from="s3://%s/%s/run" % (BUCKET, base),
+            fork_step=8,
+        )(lambda: train_to(12, seen=seen))()
+
+        assert seen["start"] == 8
+
     def test_a_prefix_with_nothing_in_it_stops_the_run(self, tmp_path, monkeypatch):
         pytest.importorskip("moonclip")
         base = "fork-test-" + uuid.uuid4().hex[:8]
