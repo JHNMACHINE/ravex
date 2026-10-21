@@ -38,7 +38,7 @@ def _store_client(port):
     return _tcp_store("127.0.0.1", port, False, 120.0)
 
 
-def a_node(rank, world, port, root, rounds, inner, queue, boundary="public", log=False, resume=False):
+def a_node(rank, world, port, root, rounds, inner, queue, boundary="public", log=False, resume=False, barrier=None):
     """One rank: init the group, then a training loop that knows nothing."""
     try:
         import torch.distributed as dist
@@ -110,6 +110,17 @@ def a_node(rank, world, port, root, rounds, inner, queue, boundary="public", log
                     # of the iteration. `boundary="none"` is the same loop
                     # with nobody handing it over — GPU-123.
                     ravex.batch_boundary()
+            if barrier is not None:
+                # Nobody leaves before everybody has trained. A node that
+                # finished its steps and shut down takes the round it serves
+                # with it, and a peer that started late - a spawned
+                # interpreter importing torch on a loaded runner - then
+                # cannot take the run's starting state and trains alone,
+                # which is not the case any of these tests is about. Seen in
+                # CI once the multi-node tests ran on their own workers
+                # (GPU-256). Not the process group's barrier: Ravex uses that
+                # group too, and two collectives meeting out of order hang.
+                barrier.wait(timeout=240)
             return (
                 before,
                 loss_fn(model(x), y).item(),
@@ -148,12 +159,13 @@ def rounds_of(said):
 def run_two(tmp_path, rounds=3, inner=8, boundary="public", log=False, resume=False):
     context = mp.get_context("spawn")
     queue = context.Queue()
+    barrier = context.Barrier(2)
     server = _store_server()
     port = server.port
     workers = [
         context.Process(
             target=a_node,
-            args=(rank, 2, port, str(tmp_path), rounds, inner, queue, boundary, log, resume),
+            args=(rank, 2, port, str(tmp_path), rounds, inner, queue, boundary, log, resume, barrier),
         )
         for rank in range(2)
     ]
