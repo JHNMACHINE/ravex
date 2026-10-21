@@ -94,4 +94,7 @@ jobs:
           # crate and puts `_core` in the source tree, so this is where the
           # build cost lands.
           pip install --quiet -e . pytest
-          pytest tests -q
+          # `tests/unit` (GPU-256): a branch is judged on its logic. The
+          # tests that run several nodes are timing on a shared runner, and
+          # they run on main, in `ci.yml`.
+          pytest tests/unit -q

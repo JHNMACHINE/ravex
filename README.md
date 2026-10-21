@@ -361,14 +361,15 @@ and nothing in `_interop` is imported by anything outside it except `_runtime`.
 
 | Path | |
 |---|---|
-| `tests/` | About 800 unit tests, in-process, no GPU and no container. Named for what they cover: `test_dist_*`, `test_interop_*` |
+| `tests/unit/` | About 1300 tests in one process, no GPU and no container, and a verdict on any OS. Named for what they cover: `test_dist_*`, `test_interop_*` |
+| `tests/distributed/` | About 100 tests that run several nodes or ranks - processes, or threads over real sockets with deadlines. Linux decides them; `*_nodes.py` is the half of a subject whose other half is in `tests/unit/` |
 | `integration/` | What only exists across a real process boundary — a resume from an empty interpreter, `torchrun`, a SIGKILL that runs no `finally`. Linux, in Docker |
 | `integration/scripts/` | The training scripts those tests kill and restart |
 | `integration/multinode/` | One container per rank, for questions `--nproc_per_node` cannot ask ([README](integration/multinode/README.md)) |
 | `integration/two-machines/` | The rented-box harness: two real hosts, real network |
 | `docs/` | [configuration.md](docs/configuration.md), [how-it-works.md](docs/how-it-works.md) |
 | `src/` | The Rust core: `reshard.rs` is the planner, `transport.rs` frames and moves a store, `python.rs` is the only file that knows an interpreter exists |
-| `.github/workflows/` | `checks.yml` on branches; `ci.yml` on main adds the moonclip backend and both integration jobs |
+| `.github/workflows/` | `checks.yml` on branches, `tests/unit` only; `ci.yml` on main adds the moonclip backend - `tests/unit` and `tests/distributed` as separate jobs - and both integration jobs |
 
 That is about 22k lines across 38 Python modules (the two subpackages
 included), plus 2.7k of Rust, against 19k lines of tests.

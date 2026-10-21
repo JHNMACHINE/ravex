@@ -1,7 +1,7 @@
 """What resuming from a cast checkpoint costs the loss.
 
 GPU-58 gave `save_dtype` a target per component — model in fp32, optimizer in
-bf16, and so on — and `tests/test_backends.py` proves the mechanism: the cast
+bf16, and so on — and `tests/unit/test_backends.py` proves the mechanism: the cast
 reaches both the plain and the sharded copy, the components left alone do not
 move a bit, and what moves moves by no more than bf16 rounding. What none of
 that says is **what it costs**, because the tensors are compared where they

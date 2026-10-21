@@ -682,7 +682,7 @@ impl StoreWriter {
 
     /// The parsed header: `(name, size, already_there)` per entry, or None
     /// before it has arrived. Underscored because it is not API — it is what
-    /// `tests/test_dist_replication.py` reads to assert that a skip flag does
+    /// `tests/unit/test_dist_replication.py` reads to assert that a skip flag does
     /// not reorder the transfer.
     #[getter]
     fn _entries(&self) -> Option<Vec<(String, u64, bool)>> {

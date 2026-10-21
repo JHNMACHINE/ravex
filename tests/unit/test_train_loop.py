@@ -1,6 +1,6 @@
 """The decorator, which is now the only way in.
 
-``tests/test_patches.py`` covers what happens *while* Ravex is attached — the
+``tests/unit/test_patches.py`` covers what happens *while* Ravex is attached — the
 registration, the step counting, the cadence. This file covers the thing that
 replaced the autoloader: the boundary itself. When does the runtime exist, when
 does it stop existing, and what happens at each edge.

@@ -1,19 +1,8 @@
-"""GPU-143: a round over regions, the slow link carrying one aggregate per region.
+"""GPU-143: a round over regions, the slow link carrying one aggregate per region - the tests that run several nodes or ranks (GPU-256).
 
-Real sockets on loopback and a store made of a dictionary, as in
-``test_dist_exchange.py`` and for the same reason: the claims are about what
-the network does - who fetches from whom, what happens when a delegate is not
-there - and a stub standing in for the network would be the thing deciding.
-
-What has to hold:
-
-* every node ends the round with the same parameters, **bit for bit**, and
-  those equal the flat round's over the same deltas up to the order of the
-  additions - the one thing a hierarchy changes;
-* only delegates fetch on the delegates' exchange: the slow link carries an
-  aggregate per region, never a node's delta;
-* a region is in or out whole, and a node whose delegate cannot serve the
-  result takes it from another region's.
+They start processes, or play nodes that talk over real sockets with
+deadlines; see tests/distributed/conftest.py. The rest of this subject,
+and the helpers both halves use, are in tests/unit/test_dist_regions.py.
 """
 
 import os
@@ -23,36 +12,27 @@ import time
 import pytest
 
 torch = pytest.importorskip("torch")
+
 pytest.importorskip("moonclip")
 
 import torch.nn as nn  # noqa: E402
 
-from ravex._dist import exchange as _exchange  # noqa: E402
 from ravex._dist.exchange import (  # noqa: E402
     DELEGATES_NAMESPACE, REGION_NAMESPACE, RESULTS_NAMESPACE,
     DeltaExchange, announce_region, close_round_regions,
 )
 from ravex._dist.outer import (  # noqa: E402
-    Contribution, OuterLoop, OuterOptimizer, combine, combine_partials, partial,
+    Contribution, OuterLoop, OuterOptimizer, combine,
 )
 
-from test_dist_exchange import FakeStore  # noqa: E402
-
-REGIONS = {0: "eu", 1: "eu", 2: "us", 3: "us"}
-STEPS = {0: 10, 1: 30, 2: 20, 3: 7}
+from test_dist_regions import REGIONS, STEPS, a_delta  # noqa: E402
+# Fixtures, asked for by parameter: a linter sees them unused, pytest does not.
+from test_dist_regions import store  # noqa: E402, F401, F811
 
 
 def build():
     torch.manual_seed(0)
     return nn.Linear(6, 4)
-
-
-def a_delta(rank):
-    generator = torch.Generator().manual_seed(100 + rank)
-    return {
-        "weight": torch.randn(4, 6, generator=generator),
-        "bias": torch.randn(4, generator=generator),
-    }
 
 
 def a_loop(rank, mode="mean"):
@@ -67,11 +47,6 @@ def a_loop(rank, mode="mean"):
             param.sub_(delta[name])
     loop.steps_this_round = STEPS[rank]
     return loop
-
-
-@pytest.fixture
-def store():
-    return FakeStore()
 
 
 @pytest.fixture
@@ -139,31 +114,6 @@ def flat_outer(ranks, mode="mean"):
     )
     OuterOptimizer().step(outer, gradient)
     return outer
-
-
-class TestTheArithmetic:
-    """No network: a region's partial and the combination of partials are the
-    flat combination, re-associated."""
-
-    @pytest.mark.parametrize("mode", ["mean", "step_weighted", "normalized"])
-    def test_partials_combine_to_the_flat_answer(self, mode):
-        contributions = {r: Contribution(delta=a_delta(r), steps=STEPS[r], node=str(r)) for r in REGIONS}
-        flat = combine(list(contributions.values()), mode=mode)
-        parts = []
-        for region in ("eu", "us"):
-            summed, tally = partial([c for r, c in contributions.items() if REGIONS[r] == region], mode)
-            parts.append((region, summed, tally))
-        hierarchical = combine_partials(parts, mode)
-        for name in flat:
-            assert torch.allclose(flat[name], hierarchical[name], rtol=1e-6, atol=1e-6)
-        # And the order the regions arrive in changes nothing at all.
-        again = combine_partials(list(reversed(parts)), mode)
-        assert all(torch.equal(hierarchical[n], again[n]) for n in hierarchical)
-
-    def test_a_round_nobody_stepped_in_is_refused(self):
-        summed, tally = partial([Contribution(delta=a_delta(0), steps=0)], "step_weighted")
-        with pytest.raises(ValueError, match="weighs zero"):
-            combine_partials([("eu", summed, tally)], "step_weighted")
 
 
 class TestTheRound:
@@ -344,20 +294,3 @@ class TestARegionThatCannotMeet:
             assert "cannot connect to node 1" in caplog.text
         finally:
             made[0].close()
-
-    def test_the_runtime_does_not_train_on_alone(self, monkeypatch):
-        # `_outer_loop` turns every other failure into training locally; this
-        # one has to reach the training loop.
-        from ravex._dist.exchange import RegionUnreachable
-        from ravex._runtime import RavexRuntime
-
-        runtime = RavexRuntime.__new__(RavexRuntime)
-        runtime._outer = None
-        runtime.registry = type("Registry", (), {"models": [object()]})()
-
-        def refuse(self):
-            raise RegionUnreachable("eu", 0, {1: "10.0.0.2:1"})
-
-        monkeypatch.setattr(RavexRuntime, "_build_outer_loop", refuse)
-        with pytest.raises(RegionUnreachable):
-            runtime._outer_loop()

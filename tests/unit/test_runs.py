@@ -171,6 +171,7 @@ class TestReadingThem:
         assert ravex.runs.describe(str(tmp_path / "notes")) is None
         assert ravex.runs.discover(str(tmp_path)) == []
 
+    @pytest.mark.own_interpreter
     def test_the_reader_imports_without_the_rust_core(self):
         """The dashboard runs on Python Workers, which cannot load a compiled module."""
         import subprocess

@@ -11,7 +11,7 @@ and whether the kernel's bytes are the torch path's.
 Timed with a synchronize on each side, the first call excluded (compilation).
 With the kernel present it first checks the kernel's bytes against the torch
 path's on awkward shapes and dtypes, and says CHECK OK or CHECK FAILED - the
-same comparison as ``tests/test_dist_quant_kernel.py``, for a node that has the
+same comparison as ``tests/unit/test_dist_quant_kernel.py``, for a node that has the
 bench but not the tests.
 """
 

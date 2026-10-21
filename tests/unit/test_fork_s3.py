@@ -6,9 +6,9 @@ store is a prefix in the bucket, and a fork on a new machine names it by the
 the step is read from it, and the copy goes away.
 
 The address parsing is tested everywhere; the fork itself needs an S3 endpoint
-and skips without one, with the same setup as ``tests/test_metrics_s3.py``::
+and skips without one, with the same setup as ``tests/unit/test_metrics_s3.py``::
 
-    RAVEX_TEST_S3_ENDPOINT=http://127.0.0.1:9000 pytest tests/test_fork_s3.py
+    RAVEX_TEST_S3_ENDPOINT=http://127.0.0.1:9000 pytest tests/unit/test_fork_s3.py
 """
 
 import os

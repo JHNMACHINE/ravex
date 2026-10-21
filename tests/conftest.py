@@ -1,8 +1,19 @@
 import os
+import sys
 
 import pytest
 
 import ravex
+
+# The suite is in two directories (GPU-256), and a test of one may import the
+# helpers of a test module in the other - the distributed half of a subject
+# takes its fakes from the unit half. Both are put on the path here, once, so
+# that does not depend on which directory pytest happens to collect first.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+for _directory in ("unit", "distributed"):
+    _path = os.path.join(_HERE, _directory)
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 
 
 @pytest.fixture(autouse=True)

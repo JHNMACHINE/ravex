@@ -388,6 +388,7 @@ class TestChunks:
         assert from_bucket["scalars"]["loss"]["step"] == [1, 2, 3, 4, 5, 6, 7, 8]
 
 
+@pytest.mark.own_interpreter
 def test_the_reader_imports_without_the_rust_core():
     """The dashboard runs on Python Workers, which cannot load a compiled module."""
     import subprocess

@@ -27,7 +27,7 @@ What the numbers are divided into is not this store's size. It is the volume
 :func:`ravex._dist.reshard.crossing_bytes` computes for a given reshard, which is
 usually a small fraction of a checkpoint and is sometimes exactly zero. Sizing
 a transport off "a reshard moves everything" would be sizing it off a case
-that mostly does not happen — see ``tests/test_dist_reshard_locality.py``.
+that mostly does not happen — see ``tests/unit/test_dist_reshard_locality.py``.
 """
 
 from __future__ import annotations

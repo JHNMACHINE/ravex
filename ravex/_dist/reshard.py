@@ -14,8 +14,8 @@ of Ravex that live on introspecting live Python objects — ``_patches``,
 
 **What did not change.** Every name below means what it meant, takes what it
 took and raises what it raised, down to the wording of the messages. That was
-the condition of the port rather than a courtesy: ``tests/test_dist_reshard.py``
-and ``tests/test_dist_reshard_locality.py`` were written against the Python
+the condition of the port rather than a courtesy: ``tests/unit/test_dist_reshard.py``
+and ``tests/unit/test_dist_reshard_locality.py`` were written against the Python
 implementation and were not touched for it, so they are the oracle the Rust one
 is held to. A port whose tests had to be edited to pass would have proved
 nothing.

@@ -4,7 +4,7 @@ name = "ravex"
 # builds the wheel from *this* number, and there is no equivalent of
 # setuptools' `dynamic = ["version"]` reading it out of a Python attribute.
 #
-# `tests/test_version_is_single.py` fails if the two drift, which is the only
+# `tests/unit/test_version_is_single.py` fails if the two drift, which is the only
 # reason the duplication is tolerable — a version the CLI reports and a version
 # pip installed disagreeing is precisely the failure the old comment in
 # `__init__.py` existed to prevent.

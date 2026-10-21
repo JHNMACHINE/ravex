@@ -44,7 +44,7 @@ from ravex._dist.membership import RunOver as _RunOver
 
 #: The version, written here and in ``Cargo.toml``, which is what maturin builds
 #: the wheel from. Two places, because maturin has no equivalent of setuptools'
-#: ``dynamic = {attr = ...}``; ``tests/test_version_is_single.py`` fails if they
+#: ``dynamic = {attr = ...}``; ``tests/unit/test_version_is_single.py`` fails if they
 #: ever disagree.
 __version__ = "0.7.5"
 
@@ -119,7 +119,7 @@ def train_loop(
             "and load the state into a freshly built model under the new "
             "mesh, with a joining rank getting the state from the broadcast "
             "rather than out of band. It is covered by "
-            "tests/test_dist_elastic_remesh.py across a real 2 -> 3 change. "
+            "tests/distributed/test_dist_elastic_remesh_nodes.py across a real 2 -> 3 change. "
             "What is missing is re-entry: your loop holds `model` and "
             "`optimizer` in its own locals, and a regroup returns new objects "
             "that ravex cannot assign into your frame. Doing this from the "

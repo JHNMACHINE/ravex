@@ -34,7 +34,7 @@ TIMEOUT = int(os.environ.get("GLOO_TIMEOUT", "1800"))
 
 # The explicit entry since ravex 0.1.0: `ravex.activate()` went with the
 # autoloader, and this line was still calling it (caught by
-# tests/test_integration_kit_names.py, GPU-130).
+# tests/unit/test_integration_kit_names.py, GPU-130).
 @ravex.train_loop()
 def main() -> None:
     dist.init_process_group(

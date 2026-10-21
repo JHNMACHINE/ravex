@@ -52,7 +52,6 @@ import datetime
 import multiprocessing as mp
 import traceback
 
-import pytest
 
 PHASE2_TIMEOUT = datetime.timedelta(seconds=10)
 GET_TIMEOUT = 20
@@ -153,20 +152,6 @@ class TestARankThatNeverExistedCanJoin:
     checkpoints, from ravex entirely: can torch's public distributed API even
     do the rendezvous shape a live, no-restart topology change needs.
     """
-
-    def test_generation_prefixed_store_lets_a_new_rank_join_cleanly(self):
-        messages, killed = _run_three_rank_rejoin()
-
-        assert killed == [], (
-            "a process had to be killed rather than exiting on its own - "
-            "that is a hang, not a clean failure, and it is exactly the "
-            "failure mode the naive version in the module docstring produces"
-        )
-        assert messages[0] == [("phase1", "ok"), ("phase2", 3.0)]
-        assert messages[1] == [("phase1", "ok"), ("phase2", 3.0)]
-        # Rank 2 was never part of phase 1 - it has no phase1 message at all,
-        # and its only result is the phase-2 collective it joined fresh.
-        assert messages[2] == [("phase2", 3.0)]
 
     def test_each_generation_reads_only_its_own_handshake_keys(self):
         """What the ``PrefixStore`` above is for, checked without a race.

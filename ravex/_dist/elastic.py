@@ -32,7 +32,7 @@ candidate, so the old ranks' real training group is never touched while
 bytes move in the background. The independent group itself works fine for a
 collective — ``all_reduce`` on it returns the right answer without
 disturbing the live default group at all, verified in
-``tests/test_dist_elastic_prestage.py``. It does not work for
+``tests/distributed/test_dist_elastic_prestage.py``. It does not work for
 ``exchange_stores``, because that function moves bytes with
 ``dist.isend``/``dist.recv``, and those refuse a group that was never
 registered through ``new_group``: ``RuntimeError: ... is not registered,
@@ -66,7 +66,7 @@ fresh under the new mesh. That is still real: it skips the OS process exit,
 the CUDA context re-init, and re-importing torch/moonclip that a genuine
 restart pays for. It is not a live reshape of a running module, and nothing
 downstream should be built on the assumption that it is. Verified bit-exact
-across an actual world_size change in ``tests/test_dist_elastic_remesh.py``.
+across an actual world_size change in ``tests/distributed/test_dist_elastic_remesh_nodes.py``.
 
 **Ravex performs that rebuild since GPU-110** — see :func:`regroup` at the
 bottom of this module. It could not before, and the reason was written here:
@@ -76,7 +76,7 @@ born inside, which is exactly that factory, and this module no longer stops
 at the group/rendezvous layer.
 
 **Two rules for whoever calls ``full_tensor()`` around a regroup, found the
-hard way in ``tests/test_dist_elastic_grow_end_to_end.py`` while composing all
+hard way in ``tests/distributed/test_dist_elastic_grow_end_to_end.py`` while composing all
 of the above into one scenario** — neither is specific to that test, both
 apply to any real caller:
 
@@ -134,7 +134,7 @@ def generation_store(base_store, generation: int):
     namespace, and that is enough — no platform-specific handling needed on
     top of it.
 
-    ``tests/test_dist_elastic_rendezvous.py`` writes up both failures and
+    ``tests/unit/test_dist_elastic_rendezvous.py`` writes up both failures and
     pins what this relies on: each generation reads only its own keys. The
     failure itself is no longer run there, because it is a race and CI kept
     winning it (GPU-175) - so if a future torch makes the bare store safe to

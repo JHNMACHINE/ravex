@@ -27,7 +27,7 @@
 # With two nodes per region the slow link carries one S per delegate instead
 # of two per node: the gain is in what crosses, and the round pays for it with
 # a hop more on the fast link. Both arms train on noise - the claim here is
-# about the round, and `tests/test_dist_regions.py` is where the arithmetic and
+# about the round, and `tests/unit/test_dist_regions.py` is where the arithmetic and
 # the bit-for-bit agreement are checked.
 #
 # The rendezvous server is node 0's, started by every arm and stopped by `stop`

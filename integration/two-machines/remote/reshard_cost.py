@@ -4,7 +4,7 @@ A bandwidth number on its own does not decide anything here. What decides it is
 that number divided into *the bytes a particular reshard actually moves*, and
 that quantity is far smaller than a checkpoint and is often exactly zero. The
 arithmetic comes from :mod:`ravex._dist.reshard`, tested exhaustively and offline in
-``tests/test_dist_reshard_locality.py``; this file only pairs it with what the link
+``tests/unit/test_dist_reshard_locality.py``; this file only pairs it with what the link
 between two real machines was measured to carry.
 
 One simplification, stated rather than hidden: every tensor is treated as

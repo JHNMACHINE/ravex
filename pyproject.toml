@@ -13,7 +13,7 @@ name = "ravex"
 # look: there is no equivalent of setuptools' `dynamic = {attr = ...}` reading a
 # Python attribute. `ravex/__init__.py` still carries the literal because
 # `ravex status` reports it and importing the package to print a version is what
-# the CLI is trying to avoid; `tests/test_version_is_single.py` fails if the two
+# the CLI is trying to avoid; `tests/unit/test_version_is_single.py` fails if the two
 # ever disagree.
 dynamic = ["version"]
 description = "Transparent checkpoint and resume for PyTorch training, with no changes to your training code"
@@ -158,4 +158,9 @@ exclude = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# `tests/unit` and `tests/distributed` (GPU-256): see their conftest.py.
+markers = [
+    "distributed: several nodes or ranks, as processes or over sockets; the verdict comes from Linux",
+    "own_interpreter: a unit test that starts a fresh Python to check what an import pulls in",
+]
 filterwarnings = ["ignore::DeprecationWarning"]

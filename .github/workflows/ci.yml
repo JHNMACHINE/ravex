@@ -23,9 +23,16 @@ permissions:
 
 jobs:
   # The engine on every interpreter we claim to support. No Moonclip here:
-  # `tests/test_backends.py` skips the Moonclip cases when it is absent, so
+  # `tests/unit/test_backends.py` skips the Moonclip cases when it is absent, so
   # this job covers the runtime, the patches, the sampler and the torch_save
   # backend across the whole matrix.
+  #
+  # `tests/unit` only (GPU-256). The tests that run several nodes or ranks -
+  # processes, or threads over real sockets with deadlines - are in
+  # `tests/distributed` and run once, in `moonclip-backend (distributed)`
+  # below: their verdict is about timing on a loaded runner, and repeating it
+  # on four interpreters bought four chances for a deadline to slip, not four
+  # times the coverage. A red square here now means the logic broke.
   #
   # It no longer avoids a Rust build, though, which is what the line above used
   # to say. Since GPU-105 the reshard planner *is* Rust and there is no Python
@@ -97,7 +104,7 @@ jobs:
           # PEP 440 local version and sorts above the plain one on PyPI.
           pip install --quiet --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple torch
           pip install --quiet -e . pytest
-          pytest tests -v
+          pytest tests/unit -v
 
   # The free-threaded build of 3.14, which release.yml ships a cp314t wheel for
   # (GPU-189). Its own job rather than a fifth matrix entry: the official
@@ -139,7 +146,7 @@ jobs:
           # on at import, with a warning and nothing else: every test below
           # would pass, on what is then an ordinary interpreter.
           python -c "import sys, ravex; assert not sys._is_gil_enabled(), 'importing ravex re-enabled the GIL'"
-          pytest tests -v
+          pytest tests/unit -v
 
   # Moonclip is Ravex's *default* backend, so leaving it to the skip-if-absent
   # path would mean the shipped configuration is the one nothing runs.
@@ -147,8 +154,19 @@ jobs:
   # Built from git rather than installed from an index on purpose: it makes
   # this job independent of whether a Moonclip release happens to be published,
   # and it tests the pairing at the commit both repositories are actually at.
+  #
+  # Two jobs from one definition (GPU-256): `unit` and `distributed`, the two
+  # directories of `tests/`, each with the shipped backend and a bucket. Kept
+  # apart so that a deadline missed by a node in `distributed` - a rendezvous
+  # that falls off, an election - does not turn red the job that says whether
+  # the logic holds. The setup is the same for both, and so is its cost.
   moonclip-backend:
+    name: moonclip-backend (${{ matrix.suite }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [unit, distributed]
     container:
       image: python:3.12-bookworm
     steps:
@@ -200,7 +218,7 @@ jobs:
           cat /tmp/s3.log >&2
           exit 1
 
-      - name: Build Moonclip and run the full suite
+      - name: Build Moonclip and run tests/${{ matrix.suite }}
         env:
           RAVEX_TEST_S3_ENDPOINT: http://127.0.0.1:9000
           RAVEX_TEST_S3_DATA_DIR: /tmp/s3-data
@@ -217,8 +235,8 @@ jobs:
           # the only job where the default write path is exercised at all -
           # and not only the tests that name Moonclip. `get_backend` falls
           # back to `torch.save` when it is absent, so with it installed the
-          # *whole* suite writes by a different road. That is why this job
-          # runs all of it rather than a selection of it.
+          # *whole* suite writes by a different road. That is why these two
+          # jobs run all of it, between them, rather than a selection of it.
           #
           # **On four workers, because it had run out of room.** This job
           # went red on every push from 6bc008c - the commit that added
@@ -246,7 +264,7 @@ jobs:
           # should not move with whatever host the job lands on. `OMP_NUM_THREADS=1` because four workers each taking
           # four threads is how a parallel suite ends up slower than a serial
           # one.
-          OMP_NUM_THREADS=1 pytest tests -v -n 4 --dist loadfile
+          OMP_NUM_THREADS=1 pytest tests/${{ matrix.suite }} -v -n 4 --dist loadfile
 
   # What the unit suite structurally cannot reach: config discovery from the
   # working directory, a resume that starts from a genuinely empty interpreter,

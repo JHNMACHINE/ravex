@@ -25,7 +25,7 @@ from pathlib import Path
 
 import pytest
 
-KIT = Path(__file__).resolve().parent.parent / "integration"
+KIT = Path(__file__).resolve().parents[2] / "integration"
 SOURCES = sorted(p for p in KIT.rglob("*.py") if "__pycache__" not in p.parts)
 
 

@@ -345,7 +345,7 @@ def main():
         # DataLoader - so a training loop over pre-batched tensors has to hand
         # that moment over itself with `ravex.batch_boundary()` (GPU-123), and
         # one that does neither flags rounds nobody ever closes while looking
-        # healthy throughout. `tests/test_outer_train_loop.py` covers both
+        # healthy throughout. `tests/unit/test_outer_train_loop.py` covers both
         # shapes; a phase here that called the boundary by hand would be
         # measuring the one a user reaching for a DataLoader does not have.
         #

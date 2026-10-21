@@ -1,11 +1,11 @@
 """The cache of compiled dependencies in a real bucket (GPU-181).
 
-``tests/test_cache.py`` holds the cache to its rules against a directory;
+``tests/unit/test_cache.py`` holds the cache to its rules against a directory;
 this is the same round trip through ``_core.S3Store`` and an S3 server, which
 is the only proof that the signing in ``src/s3.rs`` is one a service accepts.
-It skips without an endpoint, with the same setup as ``tests/test_fork_s3.py``::
+It skips without an endpoint, with the same setup as ``tests/unit/test_fork_s3.py``::
 
-    RAVEX_TEST_S3_ENDPOINT=http://127.0.0.1:9000 pytest tests/test_cache_s3.py
+    RAVEX_TEST_S3_ENDPOINT=http://127.0.0.1:9000 pytest tests/unit/test_cache_s3.py
 """
 
 import os

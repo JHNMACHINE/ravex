@@ -22,7 +22,7 @@ from pathlib import Path
 from ravex import _core
 from ravex._dist import reshard
 
-PACKAGE = Path(__file__).resolve().parent.parent / "ravex"
+PACKAGE = Path(__file__).resolve().parents[2] / "ravex"
 STUB = PACKAGE / "_core.pyi"
 #: The modules that stand in front of the transport half of the core. Two,
 #: because the framing is `replication`'s and the socket that carries it

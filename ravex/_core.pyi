@@ -5,7 +5,7 @@ The package ships ``py.typed``, so without this file every symbol
 shows up is not a squiggle on the import, it is the *callers* losing the types
 of what they were handed.
 
-Kept by hand and checked by ``tests/test_core_surface.py``, which asserts that
+Kept by hand and checked by ``tests/unit/test_core_surface.py``, which asserts that
 what the extension exports and what is declared here are the same set of names.
 A stub that has drifted is worse than none: it type-checks code against a
 function that is no longer there.

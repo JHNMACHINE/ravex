@@ -583,7 +583,7 @@ class RavexRuntime:
         the world size alone, looks in ``checkpoints/`` instead of in
         ``checkpoints/rank_<n>/``, and reports *No checkpoint found - starting
         from scratch* while the shards sit right there beside it. The reshard
-        planner has always handled ``N -> 1`` — ``tests/test_dist_reshard.py`` calls
+        planner has always handled ``N -> 1`` — ``tests/unit/test_dist_reshard.py`` calls
         it "the shrink taken to its limit" — but the resume path never asked it
         to, because this method answered before the question was reached.
         Reproduced end to end in ``integration/elastic/probe.sh``: at

@@ -100,7 +100,7 @@ jobs:
 
       # Three numbers, not two, since the build moved to maturin. `Cargo.toml`
       # is what the wheel's metadata is built from; `ravex/__init__.py` is what
-      # `ravex status` and `ravex --version` print. `tests/test_version_is_single.py`
+      # `ravex status` and `ravex --version` print. `tests/unit/test_version_is_single.py`
       # keeps them equal on every branch, and this repeats the check at the one
       # moment where being wrong cannot be undone.
       #

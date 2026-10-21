@@ -8,7 +8,7 @@ Moonclip's ``tests/s3_minio.rs``. Locally::
         -e ROOT_ACCESS_KEY=minioadmin -e ROOT_SECRET_KEY=minioadmin \\
         --entrypoint sh versity/versitygw -c "versitygw --port :9000 posix /data"
     RAVEX_TEST_S3_ENDPOINT=http://127.0.0.1:9000 RAVEX_TEST_S3_DATA_DIR="$DATA" \\
-        pytest tests/test_metrics_s3.py
+        pytest tests/unit/test_metrics_s3.py
 
 The image listens on 7070 unless told otherwise, hence ``--port``.
 

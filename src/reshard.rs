@@ -540,7 +540,7 @@ mod tests {
     /// How torch splits `total` rows over `parts` ranks.
     ///
     /// Reproduced here and *only* here, mirroring the helper of the same name
-    /// in `tests/test_dist_reshard.py`: the planner never derives an offset, it
+    /// in `tests/unit/test_dist_reshard.py`: the planner never derives an offset, it
     /// is handed measurements. This exists to manufacture plausible
     /// measurements, including the uneven tails that are the interesting case.
     fn chunked(total: i64, parts: i64) -> Vec<i64> {

@@ -937,7 +937,7 @@ The difference shows up on a job whose nodes are not in lockstep. With
 `outer_loop: true` each node trains on its own between rounds, and a channel
 spanning the nodes puts a collective across them on every step — which makes
 them wait for each other exactly as often as the outer loop exists to stop
-them doing. Measured in `tests/test_emergency_checkpoint.py`: with the channel
+them doing. Measured in `tests/distributed/test_emergency_checkpoint_nodes.py`: with the channel
 confined to a machine, a machine that walks away costs the other one
 milliseconds; on one group over the job, the same walk-away costs it the
 group's whole timeout, per step.
