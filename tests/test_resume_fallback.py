@@ -95,3 +95,40 @@ def test_a_corrupt_newest_pack_resumes_from_the_one_before(tmp_path, monkeypatch
         % (newest_step, previous_step)
     )
 
+
+def test_a_corrupt_base_resumes_from_the_window_before(tmp_path, monkeypatch):
+    """The newest full is what every newer delta is read through. With a full
+    once a window (GPU-241) the one before it is still in the store, so the
+    resume goes back past the broken base instead of starting over."""
+    monkeypatch.setenv("RAVEX_STORAGE_PATH", str(tmp_path / "reference"))
+    ravex._activate(**OPTIONS)
+    reference_model, reference = train()
+    reference_weights = weights(reference_model)
+    ravex.deactivate()
+
+    store = tmp_path / "interrupted"
+    monkeypatch.setenv("RAVEX_STORAGE_PATH", str(store))
+    ravex._activate(checkpoint_on_exit=False, **OPTIONS)
+    train(die_at=CRASH_AT)
+    ravex.deactivate()
+
+    snapshots = _snapshots(store)
+    fulls = [step for step, _, is_delta in snapshots if not is_delta]
+    assert len(fulls) >= 2, "the window should hold the previous base too: %s" % snapshots
+    base_step = fulls[-1]
+    _corrupt(store, next(i for step, i, _ in snapshots if step == base_step))
+
+    ravex._activate(**OPTIONS)
+    resumed_model, second_half = train()
+    ravex.deactivate()
+
+    behind = max(step for step, _, _ in snapshots if step < base_step)
+    assert min(second_half) == behind + 1
+    for step, loss in second_half.items():
+        assert loss == reference[step], f"loss at step {step} differs after the fallback"
+    for key, value in weights(resumed_model).items():
+        assert torch.equal(value, reference_weights[key]), f"{key} differs"
+
+    with open(store / "status.json", encoding="utf-8") as handle:
+        status = json.load(handle)
+    assert "resumed from step %d" % behind in status["notice"]

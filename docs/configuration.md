@@ -22,7 +22,7 @@ ravex status
 |---|---|---|---|
 | `enabled` | `RAVEX_ENABLED` | `true` | Master switch. `RAVEX_ENABLED=0` disables Ravex for one run. |
 | `checkpoint_every` | `RAVEX_CHECKPOINT_EVERY` | `100` | Optimizer steps between checkpoints. Not micro-batches: with gradient accumulation, one accumulation cycle is one step. With Moonclip and `delta` on, a delta is saved at every step and this is how often the store goes to the bucket, and the window the store keeps: the last this many steps and the full they stand on. See [A delta at every step](#a-delta-at-every-step). |
-| `full_every` | `RAVEX_FULL_EVERY` | `1000` | Moonclip with `delta` on: steps between full snapshots. Every delta is taken against the last full. |
+| `full_every` | `RAVEX_FULL_EVERY` | `0` | Moonclip with `delta` on: steps between full snapshots. Every delta is taken against the last full. `0` means `checkpoint_every`, a full once a window. |
 | `checkpoint_on_exit` | `RAVEX_CHECKPOINT_ON_EXIT` | `true` | Take a final checkpoint when the process exits normally or on SIGTERM. |
 | `resume_step` | `RAVEX_RESUME_STEP` | `null` | Come back at this step instead of the newest. A step the store does not hold stops the run and lists the ones it has; see [The run as a document](#the-run-as-a-document). |
 | `resume` | `RAVEX_RESUME` | `true` | Look for an existing checkpoint at startup. Set false to always start clean. |
@@ -369,8 +369,20 @@ places, each on its own thread:
 3. **The bucket.** Every `checkpoint_every` steps Moonclip's sync sends what
    the bucket does not hold yet, the manifest last.
 
-A full is written every `full_every` steps, and every delta is taken against
-the last one: loading any step reads two snapshots, never a chain.
+A full is written every `full_every` steps - by default once a window, every
+`checkpoint_every` - and every delta is taken against the last one: loading
+any step reads two snapshots, never a chain.
+
+Once a window is what keeps a broken full from costing the run (GPU-241).
+Every delta in the window is read through its full, and the window keeps only
+the fulls its deltas need, so a `full_every` far above `checkpoint_every`
+leaves a single full in the store: if it will not read, no step will, and the
+run starts over. With a full once a window the previous one stays until the
+next is written, and a resume that finds the newest unreadable goes back at
+most two windows. Measured with `bench/base_cadence.py` (12.6M parameters,
+Adam, fp32, CPU): fulls more often make the deltas smaller, so the bytes per
+step go *down* (108-115 MiB against 123 with one full), and the host time per
+step goes up by 5-8%.
 
 The store keeps a **window** of the last `checkpoint_every` steps, each one a
 step to resume or fork from, and the full they stand on; the bucket mirrors it.

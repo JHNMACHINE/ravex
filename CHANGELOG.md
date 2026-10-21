@@ -19,6 +19,16 @@
   long as this execution runs. A step named with `resume_step` is never
   swapped for another, and when nothing older reads, the first error is
   raised as before.
+- **A full snapshot once a window by default (GPU-241).** `full_every`
+  defaults to `0`, which means `checkpoint_every`; it was `1000`. Every delta
+  of a window is read through its full and the window keeps only the fulls
+  its deltas need, so with the old default the store held one full and a
+  broken one left no step to resume from. Now the previous full stays until
+  the next is written, and the fallback above goes back at most two windows.
+  With Adam a delta is 77-93% of a full and shrinks as its base gets closer:
+  on `bench/base_cadence.py` (12.6M parameters, CPU) the bytes per step went
+  down, 108-115 MiB against 123, and the host time per step up by 5-8%. A
+  `full_every` set explicitly is kept as it is.
 
 ## 0.7.5 — 2026-10-17
 

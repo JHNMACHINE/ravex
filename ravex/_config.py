@@ -254,7 +254,18 @@ class RavexConfig:
 
     #: Steps between full snapshots, with deltas against the last one in
     #: between. Only meaningful where deltas are: Moonclip with `delta` on.
-    full_every: int = 1000
+    #:
+    #: 0, the default, means `checkpoint_every`: a full once a window
+    #: (GPU-241). Every delta of a window is read through its base, and the
+    #: window keeps only the fulls its deltas need, so with a full every 1000
+    #: steps and a window of 100 there is one full in the store and nothing
+    #: behind it: a base that will not read leaves no step to resume from. A
+    #: full once a window leaves the previous base in the store until the next
+    #: one is written, which bounds that loss at two windows. With Adam it
+    #: costs nothing in bytes - a delta is 77-93% of a full, smaller the closer
+    #: its base - and 5-8% of host time per step on CPU (`bench/base_cadence.py`).
+    #: Read it as :attr:`effective_full_every`.
+    full_every: int = 0
     checkpoint_on_exit: bool = True
     resume: bool = True
 
@@ -1171,8 +1182,8 @@ class RavexConfig:
 
         if self.checkpoint_every < 1:
             self.checkpoint_every = 1
-        if self.full_every < 1:
-            self.full_every = 1
+        if self.full_every < 0:
+            self.full_every = 0
         if self.keep_last < 1:
             self.keep_last = 1
         if self.replicate_every < 0:
@@ -1436,6 +1447,17 @@ class RavexConfig:
             return []
         return [k for k in value if k not in _SAVE_DTYPE_COMPONENTS and k != "*"]
 
+    @property
+    def effective_full_every(self) -> int:
+        """Steps between full snapshots, with the default resolved.
+
+        Resolved here, at the point of use, and not in :meth:`_normalize`:
+        the configuration is normalised once when it is loaded and again after
+        the decorator's overrides, and a `checkpoint_every` set by the second
+        would find `full_every` already fixed to the first.
+        """
+        return self.full_every if self.full_every > 0 else self.checkpoint_every
+
     def describe(self) -> str:
         target = (
             f"{self.storage.type}://{self.storage.bucket}/{self.storage.prefix}"
@@ -1444,7 +1466,7 @@ class RavexConfig:
         )
         return (
             f"backend={self.backend} storage={target} "
-            f"every={self.checkpoint_every} full_every={self.full_every} "
+            f"every={self.checkpoint_every} full_every={self.effective_full_every} "
             f"keep_last={self.keep_last} "
             f"config={self.source or '<defaults>'}"
         )

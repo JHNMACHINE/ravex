@@ -10,7 +10,13 @@ def test_defaults_are_sane():
     assert config.enabled
     assert config.backend == "moonclip"
     assert config.checkpoint_every == 100
-    assert config.full_every == 1000
+    # A full once a window (GPU-241), whatever the window is set to.
+    assert config.full_every == 0
+    assert config.effective_full_every == 100
+    config.checkpoint_every = 25
+    assert config.effective_full_every == 25
+    config.full_every = 400
+    assert config.effective_full_every == 400
     assert config.storage.type == "local"
 
 

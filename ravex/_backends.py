@@ -354,8 +354,8 @@ class MoonclipBackend(CheckpointBackend):
             # 20 of 50). What the window drops is the oldest, already sent.
             window = config.checkpoint_every + 1
             kwargs.update(
-                full_every_steps=config.full_every,
-                max_deltas_per_full=config.full_every,
+                full_every_steps=config.effective_full_every,
+                max_deltas_per_full=config.effective_full_every,
                 max_total_snapshots=window,
                 # Fulls are never the binding cap: dropping the oldest one
                 # takes its deltas with it, and would cut the window short.
