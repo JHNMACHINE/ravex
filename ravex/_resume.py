@@ -10,7 +10,7 @@ at startup on a rented GPU is money on fire.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("ravex")
 
@@ -276,6 +276,12 @@ class ResumeManager:
         self._old_world: Optional[int] = None
         #: Set once the ranks have agreed; see :meth:`_settle_run_identity`.
         self.run_id: Optional[str] = None
+        #: Checkpoints passed over because they would not read, newest first,
+        #: as ``(step, reason)``; and the sentence for the person looking at the
+        #: run, when the resume came back from an older one (GPU-241).
+        self.skipped: List[Tuple[int, str]] = []
+        self.notice: Optional[str] = None
+        self._failed_here: List[int] = []
 
     def try_resume(self, defer_rng: bool = False, per_rank: bool = False) -> bool:
         """Restore a checkpoint into the live objects. The newest, or a named one.
@@ -298,12 +304,130 @@ class ResumeManager:
             logger.info("No checkpoint found - starting from scratch")
             return False
 
-        state: Optional[Dict[str, Any]] = self.backend.load_latest()
+        try:
+            state: Optional[Dict[str, Any]] = self.backend.load_latest()
+        except Exception as exc:
+            state = self._fall_back(exc)
         if not state:
             logger.warning("Checkpoint present but empty - starting from scratch")
             return False
 
         return self._apply(state, defer_rng)
+
+    # ─── an unreadable newest checkpoint (GPU-241) ──────────────────
+
+    def _fall_back(self, error: Exception) -> Optional[Dict[str, Any]]:
+        """The newest checkpoint older than the unreadable one, read.
+
+        A pack cut short by a full disk, or bytes that do not match their hash,
+        used to stop the resume with an error, and somebody had to rerun it with
+        ``resume_step`` set one checkpoint back. The one before is almost always
+        fine, and choosing it is a decision a person makes the same way every
+        time, so it is made here, logged at each step skipped, and said on the
+        run (:attr:`notice`).
+
+        Only for "the newest". A step somebody named (:meth:`_resume_at`) is
+        never swapped for another one: see that method for why.
+
+        If nothing older reads either, the first error is raised again, so the
+        caller treats it as it treated an unreadable checkpoint before.
+        """
+        newest = self.backend.latest_step()
+        if newest is None:
+            raise error
+        self._skip(newest, error)
+        step = self._older_readable_candidate(newest)
+        while step is not None:
+            try:
+                state = self.backend.load_step(step)
+            except Exception as exc:
+                self._skip(step, exc)
+                step = self._older_readable_candidate(step)
+                continue
+            if not state:
+                self._skip(step, "it holds no Ravex state")
+                step = self._older_readable_candidate(step)
+                continue
+            self._said_fallback(step)
+            return state
+        logger.warning(
+            "No checkpoint in this store could be read (%d tried)", len(self.skipped)
+        )
+        raise error
+
+    def _read_step(self, step: int) -> Optional[Dict[str, Any]]:
+        """``load_step``, with a failure logged and turned into None.
+
+        For the per-rank path, where an exception on one rank would leave the
+        others waiting in the agreement that follows for a rank that is gone.
+        """
+        try:
+            state = self.backend.load_step(step)
+        except Exception as exc:
+            self._skip(step, exc)
+            return None
+        if not state:
+            self._skip(step, "this rank's store does not hold it")
+        return state
+
+    def _skip(self, step: int, why: Any, here: bool = True) -> None:
+        """Log one checkpoint passed over, and why. Remembered for the notice.
+
+        ``here`` is False for a step this rank read and another did not: it
+        counts for the notice, and not as evidence against this rank's base.
+        """
+        reason = "%s: %s" % (type(why).__name__, why) if isinstance(why, Exception) else str(why)
+        self.skipped.append((int(step), reason))
+        if here:
+            self._failed_here.append(int(step))
+        logger.warning("The checkpoint at step %d cannot be read (%s); trying an older one", step, reason)
+
+    def _older_readable_candidate(self, below: int) -> Optional[int]:
+        """The next step to try under ``below``, or None when there is none.
+
+        Usually the one just before. After two deltas in a row that will not
+        read, the full snapshot before them: since GPU-209 every delta in a
+        window is written against the same base, so two of them failing points
+        at that base, and the rest of the window would each read it again only
+        to fail the same way - for a 1B model, 2 GB read per step tried.
+        """
+        known = [s for s in getattr(self.backend, "known_steps", lambda: [])() if s < below]
+        if not known:
+            return None
+        deltas = set(getattr(self.backend, "delta_steps", lambda: [])())
+        failed = self._failed_here[-2:]
+        if len(failed) == 2 and all(step in deltas for step in failed):
+            full = [s for s in known if s not in deltas]
+            if not full:
+                return None
+            if full[-1] != known[-1]:
+                logger.warning(
+                    "Two deltas in a row cannot be read, so their shared base is "
+                    "the likely cause; skipping the rest of the window to step %d",
+                    full[-1],
+                )
+            return full[-1]
+        return known[-1]
+
+    def _said_fallback(self, step: int) -> None:
+        """Log the step resumed from and write the sentence for the run."""
+        newest = self.skipped[0][0]
+        if len(self.skipped) == 1:
+            self.notice = (
+                "The latest checkpoint, step %d, could not be read; resumed from "
+                "step %d instead." % (newest, step)
+            )
+        else:
+            # "From N back to K" rather than a count: after a broken base the
+            # steps between are passed over without being tried.
+            self.notice = (
+                "The checkpoints from step %d back to step %d could not be "
+                "read; resumed from step %d, the newest that could."
+                % (newest, self.skipped[-1][0], step)
+            )
+        logger.warning("%s Skipped: %s", self.notice, "; ".join(
+            "step %d (%s)" % (s, why) for s, why in self.skipped
+        ))
 
     def _resume_at(self, step: int, defer_rng: bool, per_rank: bool) -> bool:
         """Come back at the step somebody named, or stop.
@@ -383,15 +507,36 @@ class ResumeManager:
                     local,
                 )
 
-            state = self.backend.load_step(step)
-            if not all_ranks_agree(bool(state)):
-                logger.warning(
-                    "Step %s could not be read on every rank - starting from "
-                    "scratch on all of them",
-                    step,
+            # A step one rank cannot read is a step none of them resumes from
+            # (GPU-241): every rank goes back together, to the newest older
+            # step they all propose. Each turn of this loop is two collectives
+            # taken by every rank, because every exit from it depends only on
+            # agreed values - `all_ranks_agree` and the agreed `older`.
+            while True:
+                state = self._read_step(step)
+                if all_ranks_agree(bool(state)):
+                    break
+                if state:
+                    self._skip(step, "another rank cannot read it", here=False)
+                candidate = self._older_readable_candidate(step)
+                older = agree_on_step(
+                    candidate if candidate is not None else NOTHING_TO_RESUME
                 )
-                return False
+                if older < 0 or older >= step:
+                    # `>= step` is the guard against a loop that never ends:
+                    # the agreement is a minimum, and never moving down means
+                    # some rank has nothing older to offer.
+                    logger.warning(
+                        "Step %s could not be read on every rank, and no older "
+                        "step can be - starting from scratch on all of them",
+                        step,
+                    )
+                    return False
+                step = older
 
+            assert state is not None  # all_ranks_agree said so
+            if self.skipped:
+                self._said_fallback(step)
             resumed = self._apply(state, defer_rng)
             return resumed
         finally:

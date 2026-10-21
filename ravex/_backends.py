@@ -100,6 +100,18 @@ class CheckpointBackend(ABC):
         """
         return []
 
+    def delta_steps(self) -> List[int]:
+        """The steps stored as a delta against an earlier full snapshot.
+
+        For the resume's fallback (GPU-241): since GPU-209 every delta in a
+        window shares one base, so two deltas that both fail to read point at
+        the base, and trying the rest of the window would read that same broken
+        base once per step. Knowing which steps are deltas is what lets the
+        fallback jump to the full snapshot before them. Empty where every
+        checkpoint is whole, which is the ``torch_save`` case.
+        """
+        return []
+
     def pin(self, step: int) -> bool:
         """Keep ``step`` whatever retention decides. False when this cannot.
 
@@ -534,6 +546,19 @@ class MoonclipBackend(CheckpointBackend):
             logger.warning("Could not list snapshots: %s", exc)
             return []
         steps = {int(s["step"]) for s in snapshots if s.get("step") is not None}
+        return sorted(steps)
+
+    def delta_steps(self) -> List[int]:
+        try:
+            snapshots = self._manager.list_snapshots()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Could not list snapshots: %s", exc)
+            return []
+        steps = {
+            int(s["step"])
+            for s in snapshots
+            if s.get("step") is not None and s.get("is_delta")
+        }
         return sorted(steps)
 
     def pin(self, step: int) -> bool:

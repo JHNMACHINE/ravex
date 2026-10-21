@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **A newest checkpoint that will not read is passed over (GPU-241).** A
+  pack cut short or bytes that do not match their hash used to stop the
+  resume with an error, until somebody reran it with `resume_step` one
+  checkpoint back. The resume now tries the one before, and so on to the
+  first that reads, logging each step skipped and why. After two deltas in a
+  row that fail it goes straight to the full snapshot before them: every
+  delta of a window shares one base, and the rest would read that same base
+  only to fail again. On several ranks a step one rank cannot read is passed
+  over by all of them together, where it used to send every rank back to
+  step 0; and a rank whose read raised no longer leaves the others waiting.
+  The sentence for the run - "The latest checkpoint, step N, could not be
+  read; resumed from step M instead." - is `status.json`'s `notice` for as
+  long as this execution runs. A step named with `resume_step` is never
+  swapped for another, and when nothing older reads, the first error is
+  raised as before.
+
 ## 0.7.5 — 2026-10-17
 
 ### Changed

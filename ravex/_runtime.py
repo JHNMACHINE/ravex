@@ -260,6 +260,12 @@ class RavexRuntime:
         #: writes it: one store, one document, and eight ranks racing to create
         #: it would mean eight ids for one run.
         self._run_record: Any = None
+        #: The sentence for whoever looks at the run when this execution
+        #: resumed from an older checkpoint than the newest, because the newest
+        #: would not read (GPU-241). Written into every ``status.json`` of this
+        #: execution, so the platform shows it while the run is the one that
+        #: came back that way, and not after the next clean resume.
+        self._resume_notice: Optional[str] = None
         #: ``{run, step}`` of the run this one forked from, once the fork has
         #: happened; written into ``run.json`` (GPU-149).
         self._fork_parent: Optional[Dict[str, Any]] = None
@@ -796,12 +802,19 @@ class RavexRuntime:
                 state="running",
                 step=self.registry.step_count,
                 run_id=self._run_record.get("run_id"),
+                extra=self._status_extra(),
             )
             self._upload_store_file(STATUS_FILE)
         except Exception as exc:
             # A run that cannot describe itself still trains. The dashboard is
             # the thing that loses, and it says so by having nothing to show.
             logger.warning("Cannot record this run: %s", exc)
+
+    def _status_extra(self) -> Optional[Dict[str, Any]]:
+        """What ``status.json`` says beyond the state and the step."""
+        if self._resume_notice is None:
+            return None
+        return {"notice": self._resume_notice}
 
     def _record_status(self, state: str) -> None:
         """Overwrite `status.json`. Cheap enough for every checkpoint."""
@@ -815,6 +828,7 @@ class RavexRuntime:
                 state=state,
                 step=self.registry.step_count,
                 run_id=self._run_record.get("run_id"),
+                extra=self._status_extra(),
             )
             self._upload_store_file(STATUS_FILE)
         except Exception as exc:
@@ -2084,6 +2098,7 @@ class RavexRuntime:
             resumed = resume_manager.try_resume(
                 defer_rng=defer_rng, per_rank=self._per_rank_active()
             )
+            self._resume_notice = resume_manager.notice
             if not resumed and self.config.require_resume:
                 raise NothingToResume(
                     "This run must resume (require_resume), and its store %s holds no "
