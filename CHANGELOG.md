@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **A node joining a run with short rounds could miss its window and wait
+  out its deadline (GPU-263).** Members wrote the outer parameters down for
+  a joiner during four rounds from the moment they saw it, while the joiner
+  reads the run's round on a clock of its own. With rounds of 16-20 ms the
+  four could be over before it had read one: it announced a round nobody
+  wrote state for, waited for it until its deadline, and every member waited
+  a gather deadline per round for its reports. The joiner now rewrites a
+  heartbeat key while it joins, and members keep writing state while it
+  moves - closing 30 s after it stops - and through the round the joiner
+  announced. A joiner that itself stood still for more than 15 s waits for
+  the run's round to move before announcing from it, as for a previous
+  join's round (GPU-229). Members of this version serve an older joiner for
+  30 s.
+
 ## 0.7.7 — 2026-10-22
 
 ### Added

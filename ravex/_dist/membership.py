@@ -74,6 +74,14 @@ JOIN_KEY = "ravex/gpu121/join/%d"
 #: is written for joiners on a run that has none.
 WANTED_KEY = "ravex/gpu121/wanted/%d"
 
+#: A candidate saying it is *still* there: a counter it rewrites while it joins
+#: (GPU-263). Its own key and not a new value under :data:`WANTED_KEY`, because
+#: that one is deleted when the join ends and a member reads this one with
+#: ``get``, which on a key that has just gone blocks the round boundary until
+#: the store times out. This one is never deleted, so ``check`` then ``get``
+#: cannot race; a candidate that comes back does so under a new number.
+BEAT_KEY = "ravex/gpu263/beat/%d"
+
 #: The round each member last wrote its outer parameters down for. Every member
 #: writes the same number at the same boundary — rounds are in lockstep — so
 #: they overwrite each other with what they already agree on.
@@ -104,6 +112,26 @@ LEFT_KEY = "ravex/gpu142/left/%d"
 #: round for a key already on the store to be noticed. It is not a tuning knob
 #: for throughput — it is the width of the window this module is closing.
 JOIN_MARGIN = 2
+
+#: Seconds between a candidate's heartbeats, and how long members keep writing
+#: the outer parameters down for one they have stopped hearing from (GPU-263).
+#:
+#: The window used to be counted in rounds - :data:`JOIN_MARGIN` + 2 of them
+#: from the moment the members first saw the candidate - while the candidate
+#: lives in wall clock: it polls, sleeps, and on a starved machine waits for a
+#: thread. Nothing ties the two. With rounds of a few milliseconds the four
+#: were over before the candidate had read a single round, it announced one
+#: the members were no longer writing state for, and it waited for that state
+#: until its deadline while every member waited a gather deadline per round
+#: for its reports. Counting the window in the candidate's own heartbeats ends
+#: it when the candidate stops, whatever a round costs.
+#:
+#: The grace is generous because closing too early is the failure being fixed,
+#: and closing late costs only snapshots - bounded, since ``publish_state``
+#: keeps a few. A candidate that died mid-join costs at most this long plus a
+#: round, which on real rounds of seconds to minutes is a round or two.
+JOIN_BEAT = 1.0
+JOIN_GRACE = 30.0
 
 #: How many ranks past the launched world size are looked at for join keys.
 #: Bounded because the scan happens at every round boundary and an unbounded
@@ -180,7 +208,8 @@ class Membership:
 
     def __init__(self, store, rank: int, base_world: int,
                  window: int = JOIN_WINDOW,
-                 ceiling: Optional[Callable[[], int]] = None):
+                 ceiling: Optional[Callable[[], int]] = None,
+                 clock: Callable[[], float] = time.monotonic):
         self.store = store
         self.rank = rank
         self.base_world = base_world
@@ -199,11 +228,18 @@ class Membership:
         #: a number seen here is never asked about again.
         self.departed: set = set()
 
-        #: For each candidate, the last round this node will write its outer
-        #: parameters down for. A candidate that announces itself and then dies
-        #: would otherwise cost every member a full model snapshot per round
-        #: forever, and nothing would ever say why the run got slower.
-        self._state_until: Dict[int, int] = {}
+        #: For each candidate, its last heartbeat seen and when this node saw
+        #: it change, by this node's own clock - so no two machines' clocks are
+        #: ever compared. A candidate that announces itself and then dies would
+        #: otherwise cost every member a full model snapshot per round forever,
+        #: and nothing would ever say why the run got slower.
+        self.clock = clock
+        self._beats: Dict[int, Optional[bytes]] = {}
+        self._heard: Dict[int, float] = {}
+
+        #: Candidates this node is writing state down for right now, so that
+        #: opening and closing the window are each logged once.
+        self._serving: set = set()
 
     def span(self) -> int:
         """How many ranks past the base to look at for join keys.
@@ -244,37 +280,58 @@ class Membership:
     def wants_state(self, round_number: int) -> bool:
         """Whether somebody is waiting for the outer parameters right now.
 
-        The window is opened by a candidate's ``wanted`` key and closes on its
-        own :data:`JOIN_MARGIN` + 2 rounds later — long enough for the round it
-        can legally announce, plus the one it actually takes the state from,
-        plus one. A candidate that vanishes mid-join therefore costs four
-        snapshots and not a run's worth, and the last one is logged.
+        The window is opened by a candidate's ``wanted`` key and stays open
+        while the candidate's heartbeat (:data:`BEAT_KEY`) keeps moving: it
+        closes :data:`JOIN_GRACE` seconds after this node last saw it change.
+        Not a number of rounds, because the candidate does not live in rounds
+        - see :data:`JOIN_BEAT` for the failure that came from counting them.
+
+        It also stays open through the round a candidate has announced, if
+        this node accepted one: that is the round whose state the candidate
+        will ask for, and a candidate merely slow between its announcement and
+        its round would otherwise find nothing there and cost every member a
+        gather deadline for a round it cannot take part in.
         """
         wanted = False
+        now = self.clock()
         for rank in range(self.base_world, self.base_world + self.span()):
             if rank == self.rank:
                 continue
             try:
                 if not self.store.check([WANTED_KEY % rank]):
                     continue
+                beat = None
+                if self.store.check([BEAT_KEY % rank]):
+                    beat = self.store.get(BEAT_KEY % rank)
             except Exception:
                 return False
-            until = self._state_until.get(rank)
-            if until is None:
-                until = round_number + JOIN_MARGIN + 2
-                self._state_until[rank] = until
+            if rank not in self._heard or beat != self._beats.get(rank):
+                # The first sight counts as hearing from it, so a candidate
+                # that never beats - one older than GPU-263 - still gets the
+                # grace.
+                self._beats[rank] = beat
+                self._heard[rank] = now
+            admit = self.accepted.get(rank)
+            open_ = (
+                now - self._heard[rank] <= JOIN_GRACE
+                or (admit is not None and round_number <= admit)
+            )
+            if open_ and rank not in self._serving:
+                self._serving.add(rank)
                 logger.info(
                     "Rank %d wants into the run; writing the outer parameters "
-                    "down at every boundary through round %d.", rank, until,
+                    "down at every boundary while it keeps asking (round %d).",
+                    rank, round_number,
                 )
-            if round_number <= until:
-                wanted = True
-            elif round_number == until + 1:
+            elif not open_ and rank in self._serving:
+                self._serving.discard(rank)
                 logger.warning(
-                    "Rank %d asked to join at round %d and never announced a "
-                    "round to join at. No more outer-state snapshots for it; "
-                    "it can ask again.", rank, until - JOIN_MARGIN - 2,
+                    "Rank %d asked to join and has not been heard from for "
+                    "%.0f s. No more outer-state snapshots for it from round "
+                    "%d; they start again if it does.",
+                    rank, now - self._heard[rank], round_number,
                 )
+            wanted = wanted or open_
         return wanted
 
     def peers_at(self, round_number: int) -> List[int]:
@@ -357,12 +414,18 @@ def want_in(store, rank: int) -> None:
     store.set(WANTED_KEY % rank, b"1")
 
 
+def beat(store, rank: int, count: int) -> None:
+    """A candidate says it is still joining: ``count`` only has to differ
+    from the last one written (GPU-263). Members compare, they never subtract."""
+    store.set(BEAT_KEY % rank, str(int(count)).encode("utf-8"))
+
+
 def gave_up(store, rank: int) -> None:
     """Stop the members writing state down for a candidate that is in, or out.
 
     Best effort, and the members do not depend on it: they stop on their own
-    after :data:`JOIN_MARGIN` + 2 rounds. This only makes the common case cost
-    one round of snapshots instead of four.
+    once its heartbeat has been still for :data:`JOIN_GRACE` seconds. This only
+    makes the common case stop at the next boundary instead.
     """
     try:
         store.delete_key(WANTED_KEY % rank)
@@ -507,6 +570,10 @@ def join(store, exchange, loop, rank: int, base_world: int, deadline: float,
 
     A run that has already lost a member cannot take a new one, because the
     lost member never acknowledges. Named in :func:`acknowledged`.
+
+    Throughout, the candidate beats (:func:`beat`) at least every
+    :data:`JOIN_BEAT` seconds, which is what keeps the members writing the
+    outer parameters down for as long as it is still trying (GPU-263).
     """
     members = [peer for peer in range(base_world) if peer != rank]
     # What the members wrote for the last node that joined, if one did. They
@@ -516,11 +583,32 @@ def join(store, exchange, loop, rank: int, base_world: int, deadline: float,
     # it late, and the run is over. Found when a second node joined the same
     # run (GPU-229). So it is not an observation until it has moved.
     stale = state_round(store)
+    beats = 0
+    beat(store, rank, beats)
+    last_beat = time.monotonic()
     want_in(store, rank)
     announced_at: Optional[int] = None
     looked_for_members = 0.0
 
     while time.monotonic() < deadline:
+        now = time.monotonic()
+        if now - last_beat >= JOIN_BEAT:
+            if now - last_beat > JOIN_GRACE / 2:
+                # This node stood still long enough that the members may have
+                # stopped writing state for it, and then the round on the
+                # store is where they stopped, not where they are: the same
+                # hazard as a previous join's number above, and the same
+                # answer. The beat below reopens the window; the round counts
+                # again once it has moved.
+                stale = state_round(store)
+                logger.warning(
+                    "No heartbeat for %.0f s while joining; waiting for the "
+                    "run's round to move before trusting it.", now - last_beat,
+                )
+            beats += 1
+            beat(store, rank, beats)
+            last_beat = now
+
         # A run every member has left - finished, every one of them - has
         # nobody to take this node in, and waiting would last the whole
         # deadline: on rented machines, fifteen minutes billed for a node
@@ -535,7 +623,7 @@ def join(store, exchange, loop, rank: int, base_world: int, deadline: float,
                 break
 
         observed = state_round(store)
-        if observed is None or (announced_at is None and observed == stale):
+        if observed is None or observed == stale:
             time.sleep(poll)
             continue
 
