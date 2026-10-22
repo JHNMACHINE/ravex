@@ -25,6 +25,10 @@ from test_outer_rendezvous import server  # noqa: E402, F401, F811
 #: round after which every node stops.
 LAST_KEY = "test/last-round"
 
+#: A node's step, in wall time: 256 of them make a round of about 2.6 s, long
+#: enough for a process started mid-run to get in before the run is over.
+STEP_SECONDS = 0.01
+
 #: Where each node writes what Ravex said to it, in its own directory.
 SAID_FILE = "said.log"
 
@@ -226,6 +230,15 @@ def a_node(address, job, min_nodes, root, name, role, queue, control_at=None,
             outer_deadline=deadline,
             enabled=True,
             resume=False,
+            # No checkpoints: these nodes are about the rendezvous. With
+            # `delta` on, the default since 0.7.0, `checkpoint_every` is not
+            # how often a save happens but the window of per-step deltas the
+            # store keeps, so 10**9 asked for a delta at every step and every
+            # one of them kept. Each save waited longer on the writer than
+            # the one before; the failover test, the longest here, went from
+            # 8 s a round to 79 s by round 10 and never reached round 15
+            # (GPU-260). Off, a full every `checkpoint_every` steps is none.
+            delta=False,
             checkpoint_every=10**9,
             checkpoint_on_exit=False,
             outer_overlap=overlap,
@@ -249,6 +262,14 @@ def a_node(address, job, min_nodes, root, name, role, queue, control_at=None,
                 optimizer.zero_grad()
                 loss_fn(model(x[begin : begin + 32]), y[begin : begin + 32]).backward()
                 optimizer.step()
+                # What a step of a real model costs, here on purpose. This
+                # one costs well under a millisecond, and a round of it is a
+                # tenth of a second: after a failover the nodes left in the
+                # epoch closed ten rounds and finished the run before a node
+                # spawned meanwhile had imported torch, and the joiners found
+                # nobody to take them in (GPU-260). Until then a delta saved
+                # at every step was the brake, unasked for and growing.
+                time.sleep(STEP_SECONDS)
                 ravex.batch_boundary()
                 outer = runtime._outer
                 if not outer:
