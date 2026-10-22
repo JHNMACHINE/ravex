@@ -285,13 +285,19 @@ def a_node(address, job, min_nodes, root, name, role, queue, control_at=None,
                 ):
                     split_off_next_round(runtime._exchange)
                     armed = True
-                if (
-                    # A round in flight is changing the outer parameters on
-                    # its own thread (GPU-230); they are read between rounds.
-                    runtime._flight is None
-                    and control.check([LAST_KEY])
-                    and outer.round_number > int(control.get(LAST_KEY))
-                ):
+                if not control.check([LAST_KEY]):
+                    continue
+                last = int(control.get(LAST_KEY))
+                flight = runtime._flight
+                if flight is not None and flight.flight.round_number == last:
+                    # With `overlap` (GPU-230) the round number moves on the
+                    # round's own thread and a round lands at whichever
+                    # boundary finds it back, so nodes reading "the first
+                    # boundary past the last round" read different rounds.
+                    # The last one is landed here, at the boundary right
+                    # after its launch, so every node reads the same.
+                    runtime._land_round(wait=True)
+                if runtime._flight is None and outer.round_number > last:
                     return outer_digest(outer.outer), outer.round_number
             return None, None
 
@@ -383,7 +389,8 @@ def join_a_run(server, tmp_path):
 
     digests = {name: digest for name, (digest, _, _) in results.items()}
     assert len(set(digests.values())) == 1, (
-        "the nodes ended holding different models: %s" % digests
+        "the nodes ended holding different models: %s (at rounds %s)"
+        % (digests, {name: last for name, (_, last, _) in results.items()})
     )
     assert any("Joined the run at round" in line for line in results["c"][2]), results["c"][2]
     for name, (_, _, said) in results.items():
@@ -456,7 +463,8 @@ def test_a_node_that_falls_off_the_model_rejoins_without_a_relaunch(server, tmp_
 
     digests = {name: digest for name, (digest, _, _) in results.items()}
     assert len(set(digests.values())) == 1, (
-        "the nodes ended holding different models: %s" % digests
+        "the nodes ended holding different models: %s (at rounds %s)"
+        % (digests, {name: last for name, (_, last, _) in results.items()})
     )
     rejoined = [
         name for name, (_, _, said) in results.items()
@@ -602,7 +610,8 @@ def test_the_run_elects_a_new_rendezvous_when_its_own_dies(server, tmp_path, ove
 
     digests = {name: digest for name, (digest, _, _) in results.items()}
     assert len(set(digests.values())) == 1, (
-        "the nodes ended holding different models: %s" % digests
+        "the nodes ended holding different models: %s (at rounds %s)"
+        % (digests, {name: last for name, (_, last, _) in results.items()})
     )
     # Two candidates may open a server at once - each counts its turn from
     # when it noticed the loss, not from a clock they share - and the one
