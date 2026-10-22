@@ -1082,9 +1082,14 @@ and an outer update that arrives up to a round late. A checkpoint taken while
 a round is out resumes from the round before it, as one taken mid-round
 always resumes from the round's start: nothing is applied twice. Every landed
 round logs how long the training waited for it, and the model's series has
-`outer/stalled_seconds` - the whole round when blocking. It is off until a
-run on real machines says what the lateness costs; `bench/outer_convergence.py
---overlap 0.25 1` measures it on one box.
+`outer/stalled_seconds` - the whole round when blocking.
+
+**What the lateness costs, measured** (`bench/outer_convergence.py --overlap`,
+two nodes, 0.48M parameters, three seeds). A round that lands a quarter of a
+round late costs under 0.01 of held-out loss, half a round 0.015, a whole
+round 0.05-0.07 - which still leaves the pair 0.11-0.12 ahead of one node
+given the same wall clock. It is off until a run on rented machines puts a
+real network time against those numbers.
 
 **`outer_round_seconds` is what makes nodes of different speeds work.** With a
 step count, every node does the same work and the slowest sets the pace. With a

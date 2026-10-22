@@ -170,6 +170,33 @@ editing the repository changes the corpus — three runs in one afternoon read
 run are comparable because the corpus is loaded once; numbers from different
 runs are not, and every comparison above is within a run. ``--text`` pins a
 corpus if that matters.
+
+**Rounds in flight (GPU-230).** ``--overlap 0.25 0.5 1`` runs each H blocking
+and then with ``outer_overlap``, each round landing that fraction of a round
+into the next one - which is how long the network took, measured in the
+training it overlapped. It measures what the lateness costs the loss at equal
+tokens; what it saves is wall clock and is not in this table: blocking, the
+training waits for the whole network time of every round, overlapped only for
+whatever of it outlasts a round.
+
+**Measured**, 2026-10-22: 2 nodes, contiguous shards, 0.48M parameters, 2048
+local steps per node, the mean of seeds 0, 1 and 2:
+
+===== ========== ============ ========= ============
+H     blocking   1/4 late     1/2 late  a round late
+===== ========== ============ ========= ============
+32    1.3629     1.3657       1.3779    1.4336
+64    1.3964     1.4043       1.4127    1.4466
+===== ========== ============ ========= ============
+
+against 1.5565 for one node with the same steps and 1.3987 for one node with
+the same tokens. A quarter of a round late costs under 0.01 - at H=32 one seed
+of three came out ahead of blocking, so that is at the edge of what this can
+see. Half a round costs 0.015, and a whole round 0.05-0.07: still 0.11-0.12
+better than one node given the same wall clock, which is the comparison a node
+that would otherwise stand idle for the network is making. Small model, small
+corpus, one box: a direction, and the reason `outer_overlap` stays off until a
+run on rented machines puts a real network time in the lateness column.
 """
 
 import argparse
