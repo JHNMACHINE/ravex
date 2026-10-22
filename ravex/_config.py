@@ -682,6 +682,17 @@ class RavexConfig:
     #: is computed in.
     outer_error_feedback: bool = False
 
+    #: Keep training while the round's deltas travel (GPU-230). At the
+    #: boundary the node takes its delta and a copy of its parameters, starts
+    #: the next round at once, and puts the round's result in when it comes
+    #: back, with what it trained meanwhile on top. The training waits only
+    #: for a round the network has not finished by the next boundary. Costs
+    #: one more fp32 copy of the trainable parameters in host memory, and the
+    #: outer update arrives up to a round late. **Off until a bench says what
+    #: that lateness costs the loss**; see `ravex._dist.outer.OuterLoop.land`.
+    #: Also ``RAVEX_OUTER_OVERLAP``.
+    outer_overlap: bool = False
+
     #: Where round reports are staged. Defaults to `rounds/` beside the
     #: checkpoint store. Kept apart from the checkpoints deliberately: these
     #: are in-flight working copies with their own retention, and mixing them
@@ -965,6 +976,8 @@ class RavexConfig:
             self.outer_save_dtype = value or None
         if (value := get("OUTER_ERROR_FEEDBACK")) is not None:
             self.outer_error_feedback = _as_bool(value, self.outer_error_feedback)
+        if (value := get("OUTER_OVERLAP")) is not None:
+            self.outer_overlap = _as_bool(value, self.outer_overlap)
         if (value := get("OUTER_ROOT")) is not None:
             self.outer_root = value or None
         if (value := get("LOG_FILE")) is not None:
@@ -1063,6 +1076,7 @@ class RavexConfig:
             "emergency_coordination",
             "outer_loop",
             "outer_error_feedback",
+            "outer_overlap",
             "fallback_on_error",
             "framework_auto_detect",
             "audit_log",

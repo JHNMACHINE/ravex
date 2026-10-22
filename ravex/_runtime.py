@@ -235,6 +235,10 @@ class RavexRuntime:
         #: Whether this node came in through `membership.join` rather than
         #: starting with the run (GPU-129). A joiner does not serve joins.
         self._outer_joined = False
+        #: The round launched and not landed yet, with `outer_overlap`
+        #: (GPU-230): a `_RoundThread`. None when no round is in flight, which
+        #: is always the case without it.
+        self._flight: Any = None
         self._round_due = False
         #: The step the round came due at, for the warning below. Only
         #: meaningful while `_round_due` is up.
@@ -751,6 +755,11 @@ class RavexRuntime:
         # `ravex.batch_boundary()` has the boundary without having a
         # dataloader, and its checkpoints belong here rather than mid-step.
         self._boundary_delivered = True
+        if self._flight is not None and self._flight.done.is_set():
+            # Back from the network: into the model at the first boundary
+            # after, not at the next round's, so it is as little late as the
+            # link allows (GPU-230).
+            self._land_round()
         if self._round_due:
             self._round_due = False
             self._close_outer_round()
@@ -1816,80 +1825,212 @@ class RavexRuntime:
         (`close_round` then offers nothing and applies the others'), and
         anything that leaves this node off the others' model goes to
         :meth:`_leave_and_rejoin`.
-        """
-        from ravex._dist.exchange import RoundSplitError, close_round, close_round_regions
-        from ravex._dist.membership import MembershipError, serve_joins
 
+        **With `outer_overlap` the round is launched, not closed (GPU-230).**
+        The previous one is landed first - waited for, if the network is not
+        done with it - so at most one round is ever in flight and every round
+        starts from the outer parameters the last one decided. Then the joins
+        are served and the peers asked for exactly as for a blocking round,
+        and the exchange goes to a thread while the training goes on. Its
+        failures come back through :meth:`_land_round` to the same two
+        branches, on this thread.
+        """
         if not self._outer or self._exchange is None:
+            return
+        if self.config.outer_overlap and not self._land_round(wait=True):
+            # The round in flight left this node off the run's model, and it
+            # has rejoined: the training since went with it, and the round it
+            # would have launched was trained on parameters nobody holds.
             return
         started = time.monotonic()
         try:
-            if self._membership is not None:
-                # At the boundary, before the round's own work: writing the
-                # outer parameters down for a candidate and taking in an
-                # announcement both have to happen at the round number every
-                # member agrees on, which is this one.
-                if not self._outer_joined:
-                    # Only a node the run started with serves a join: the
-                    # protocol takes the state and the acknowledgements from
-                    # the base members (`membership.acknowledged`), so a node
-                    # that joined itself would write snapshots nobody asks for.
-                    try:
-                        serve_joins(
-                            self.store_for_joins, self._exchange, self._outer,
-                            self._membership,
-                        )
-                    except MembershipError:
-                        raise
-                    except Exception as exc:
-                        # A joiner waits for every acknowledgement and takes
-                        # state from any member, so one member failing here
-                        # costs it a retry, not a split.
-                        logger.warning("Could not serve joins this round: %s", exc)
-                try:
-                    self._outer_peers = self._membership.peers_at(
-                        self._outer.round_number
-                    )
-                except MembershipError:
-                    raise
-                except Exception as exc:
-                    # Last round's peers. Who is asked no longer decides what
-                    # is averaged; the store does.
-                    logger.warning("Could not refresh the peer set: %s", exc)
+            self._before_round()
             means = self._round_means.take() if self._round_means is not None else None
-            if self._region_exchanges:
-                report = close_round_regions(
-                    self._outer,
-                    str(self.config.outer_region),
-                    self._region_exchanges,
-                    self._outer_peers,
-                    time.monotonic() + self.config.outer_deadline,
-                    metrics=means,
-                    error_feedback=self.config.outer_error_feedback,
+            if self.config.outer_overlap:
+                self._launch_round(means)
+                return
+            report = self._round_work(
+                self._outer, self._exchange, self._region_exchanges,
+                self._outer_peers, means,
+            )
+        except Exception as exc:
+            self._round_failed(exc)
+            return
+        report["stalled_seconds"] = time.monotonic() - started
+        self._round_closed(report, time.monotonic() - started)
+
+    def _before_round(self) -> None:
+        """What a round boundary does before the round's own work: serve the
+        joins and ask who the peers are, at the round number every member
+        agrees on. On the training thread, with no round in flight."""
+        from ravex._dist.membership import MembershipError, serve_joins
+
+        if self._membership is None:
+            return
+        if not self._outer_joined:
+            # Only a node the run started with serves a join: the
+            # protocol takes the state and the acknowledgements from
+            # the base members (`membership.acknowledged`), so a node
+            # that joined itself would write snapshots nobody asks for.
+            try:
+                serve_joins(
+                    self.store_for_joins, self._exchange, self._outer,
+                    self._membership,
                 )
-            else:
-                report = close_round(
-                    self._outer,
-                    self._exchange,
-                    self._outer_peers,
-                    time.monotonic() + self.config.outer_deadline,
-                    metrics=means,
-                    error_feedback=self.config.outer_error_feedback,
-                )
-        except MembershipError as exc:
+            except MembershipError:
+                raise
+            except Exception as exc:
+                # A joiner waits for every acknowledgement and takes
+                # state from any member, so one member failing here
+                # costs it a retry, not a split.
+                logger.warning("Could not serve joins this round: %s", exc)
+        try:
+            self._outer_peers = self._membership.peers_at(self._outer.round_number)
+        except MembershipError:
+            raise
+        except Exception as exc:
+            # Last round's peers. Who is asked no longer decides what
+            # is averaged; the store does.
+            logger.warning("Could not refresh the peer set: %s", exc)
+
+    def _round_work(self, loop, exchange, regions, peers, means) -> Dict[str, Any]:
+        """The round itself: publish, gather, decide, recover, step.
+
+        ``loop`` is the outer loop, or a :class:`RoundInFlight` on the
+        round's own thread; everything else is passed in rather than read off
+        ``self``, so a rejoin on the training thread cannot change what a
+        round already under way is talking to.
+        """
+        from ravex._dist.exchange import close_round, close_round_regions
+
+        if regions:
+            return close_round_regions(
+                loop,
+                str(self.config.outer_region),
+                regions,
+                peers,
+                time.monotonic() + self.config.outer_deadline,
+                metrics=means,
+                error_feedback=self.config.outer_error_feedback,
+            )
+        return close_round(
+            loop,
+            exchange,
+            peers,
+            time.monotonic() + self.config.outer_deadline,
+            metrics=means,
+            error_feedback=self.config.outer_error_feedback,
+        )
+
+    def _round_failed(self, exc: BaseException) -> None:
+        """A round that may have left this node off the others' model."""
+        from ravex._dist.exchange import RoundSplitError
+        from ravex._dist.membership import MembershipError
+
+        if isinstance(exc, MembershipError):
             # `RoundSplitError` among them. Not swallowed and not abandoned:
             # the averages have differed, or would if this node carried on.
             self._leave_and_rejoin(exc)
             return
-        except Exception as exc:
-            # Nothing is expected here any more - `close_round` absorbs what
-            # it can - so whatever this is, it is unknown whether the others
-            # took the step. Same answer.
-            split = RoundSplitError("outer round failed: %s" % exc)
-            split.__cause__ = exc
-            self._leave_and_rejoin(split)
-            return
+        # Nothing is expected here any more - `close_round` absorbs what
+        # it can - so whatever this is, it is unknown whether the others
+        # took the step. Same answer.
+        split = RoundSplitError("outer round failed: %s" % exc)
+        split.__cause__ = exc
+        self._leave_and_rejoin(split)
 
+    def _launch_round(self, means) -> None:
+        """Take the round's delta and photograph, and send it off (GPU-230).
+
+        A daemon thread: one stuck on a peer past every deadline must not keep
+        the process alive after the training has ended, and the deadline it
+        carries is the same `outer_deadline` a blocking round has.
+        """
+        flight = self._outer.launch()
+        holder = _RoundThread(flight)
+        exchange, regions = self._exchange, self._region_exchanges
+        peers = list(self._outer_peers)
+
+        def run() -> None:
+            try:
+                holder.report = self._round_work(flight, exchange, regions, peers, means)
+            except BaseException as exc:  # carried to the training thread
+                holder.error = exc
+            finally:
+                holder.finished = time.monotonic()
+                holder.done.set()
+
+        holder.thread = threading.Thread(
+            target=run, name="ravex-outer-round-%d" % flight.round_number, daemon=True
+        )
+        self._flight = holder
+        holder.thread.start()
+
+    def _land_round(self, wait: bool = False, leaving: bool = False) -> bool:
+        """Put the round in flight into the model, once it is back (GPU-230).
+
+        ``wait`` blocks until it is: the next round's boundary does, so a
+        round never starts from parameters the last decision has not reached,
+        and the seconds spent there are the training's whole cost of the
+        network - `stalled_seconds` in the round's report. Returns False if
+        the round failed, True otherwise, including when there was nothing to
+        land.
+
+        ``leaving`` is the shutdown: a round that failed then is said and not
+        acted on - the node is leaving the run anyway, and rejoining it to
+        leave a moment later would only make the others wait for a join. It
+        waits as long as the exchange lingers and no longer, since a shutdown
+        may be a preemption with seconds to go.
+        """
+        holder = self._flight
+        if holder is None:
+            return True
+        if not holder.done.is_set():
+            if not wait:
+                return True
+            stalled = time.monotonic()
+            holder.done.wait(
+                min(60.0, float(self.config.outer_deadline)) if leaving else None
+            )
+            holder.stalled = time.monotonic() - stalled
+            if not holder.done.is_set():
+                self._flight = None
+                logger.warning(
+                    "Outer round %d was still in flight when the training ended; "
+                    "this node leaves the run without it.",
+                    holder.flight.round_number,
+                )
+                return False
+        if holder.thread is not None:
+            holder.thread.join()
+        self._flight = None
+        if holder.error is not None:
+            if leaving:
+                logger.warning(
+                    "Outer round %d, in flight when the training ended, failed: "
+                    "%s. This node leaves the run without it.",
+                    holder.flight.round_number, holder.error,
+                )
+                return False
+            self._round_failed(holder.error)
+            return False
+        self._outer.land(holder.flight)
+        report = holder.report
+        report["stalled_seconds"] = holder.stalled
+        report["landed_after_steps"] = int(self._outer.steps_this_round)
+        logger.info(
+            "Outer round %d landed %d local step(s) after it was launched; the "
+            "training waited %.1fs of its %.1fs for it.",
+            report["round"],
+            report["landed_after_steps"],
+            holder.stalled,
+            holder.finished - holder.launched,
+        )
+        self._round_closed(report, holder.finished - holder.launched)
+        return True
+
+    def _round_closed(self, report: Dict[str, Any], seconds: float) -> None:
+        """Say where the round's seconds went, chart it, save the state."""
         # The split, not just the total. On loopback this line read "took
         # 0.0s" every time, which is the one number the whole architecture is
         # chosen around and it was never observed - see `close_round` and
@@ -1901,7 +2042,7 @@ class RavexRuntime:
             "%.1fs delta, %.1fs publish (%.1fs waiting on a fetch), "
             "%.1fs deciding, %.1fs recovering, %.1fs outer step.",
             report["round"],
-            time.monotonic() - started,
+            seconds,
             report["nodes"],
             report.get("gather_seconds", 0.0),
             report.get("gather_wait_seconds", 0.0),
@@ -1927,7 +2068,7 @@ class RavexRuntime:
                 report.get("between_seconds", 0.0),
                 report.get("between_wait_seconds", 0.0),
             )
-        self._write_model_series(report, time.monotonic() - started)
+        self._write_model_series(report, seconds)
         # The round is applied, and this is the state until the next closes.
         self._save_outer_state(self._outer)
 
@@ -1970,6 +2111,10 @@ class RavexRuntime:
                 "outer/nodes": report.get("nodes", 0),
                 "outer/steps": round_steps,
                 "outer/seconds": seconds,
+                # What the training waited for the round: all of it when
+                # blocking, only what the network outlasted the next round's
+                # training by with `outer_overlap` (GPU-230).
+                "outer/stalled_seconds": report.get("stalled_seconds", seconds),
             }
             values.update(report.get("model_metrics") or {})
             self._model_writer.put(
@@ -3683,6 +3828,11 @@ class RavexRuntime:
             self._shutdown_done = True
 
         try:
+            if self._flight is not None:
+                # Before the final checkpoint, so the weights it holds have
+                # the last round in them; and before the exchange lingers, so
+                # what it waits on is the peers taking this node's last report.
+                self._land_round(wait=True, leaving=True)
             if (
                 self.config.checkpoint_on_exit
                 and self.registry.step_count > 0
@@ -3763,6 +3913,23 @@ class RavexRuntime:
             logger.info("Ravex shutdown complete at step %d", self.registry.step_count)
         except Exception as exc:
             logger.warning("Shutdown error: %s", exc)
+
+
+class _RoundThread:
+    """A round in flight on its own thread, and what it came back with
+    (GPU-230). Written by that thread until `done` is set, read by the
+    training thread only after."""
+
+    def __init__(self, flight: Any) -> None:
+        self.flight = flight
+        self.thread: Optional[threading.Thread] = None
+        self.done = threading.Event()
+        self.report: Dict[str, Any] = {}
+        self.error: Optional[BaseException] = None
+        self.launched = time.monotonic()
+        self.finished = self.launched
+        #: How long the training waited for it; zero if it was back in time.
+        self.stalled = 0.0
 
 
 # ─── process-wide instance ──────────────────────────────────────────

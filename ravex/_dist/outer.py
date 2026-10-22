@@ -38,6 +38,17 @@ round's local progress, and accumulating those in bf16 — whose mantissa is
 seven bits — rounds a good share of them away entirely, round after round, in a
 way no test on a short run would show. The outer copy is fp32 and the write
 back down to the parameter's own dtype happens once, at the end.
+
+**A round can stay in flight while the next one trains (GPU-230).** Blocking,
+a round stops the node for as long as the network takes. With ``outer_overlap``
+the node takes its delta and a photograph of its parameters at the boundary,
+goes on training, and when the round's result is back puts it into the model
+with the training since the photograph on top: ``outer + (live -
+photograph)``. The outer update then arrives late by however long the network
+took - at the first batch boundary after it is back, at most a round, since
+the next round waits for it - which is the price, and the network leaves the
+round's time. :meth:`OuterLoop.launch`,
+:class:`RoundInFlight` and :meth:`OuterLoop.land` are the three pieces.
 """
 
 from __future__ import annotations
@@ -716,8 +727,21 @@ class OuterLoop:
         combining the same reports. ``steps`` are the local step counts behind
         it, one per node, for the round's record and the model's step axis.
         """
-        self.optimizer.step(self.outer, gradient)
+        report = self._outer_step(gradient, steps)
         self.write_back()
+        self.steps_this_round = 0
+        self._started_at = time.monotonic()
+        return report
+
+    def _outer_step(self, gradient: ParamMap, steps: List[int]) -> Dict[str, Any]:
+        """The outer step on :attr:`outer` and the round's record, and nothing
+        that touches the live model or the round being trained.
+
+        The half of :meth:`apply_combined` a round in flight (GPU-230) can
+        take on another thread: the model belongs to the training loop until
+        :meth:`land` runs at a batch boundary.
+        """
+        self.optimizer.step(self.outer, gradient)
 
         steps = [int(s) for s in steps]
         self.model_steps += sum(max(int(s), 0) for s in steps)
@@ -738,8 +762,6 @@ class OuterLoop:
         )
 
         self.round_number += 1
-        self.steps_this_round = 0
-        self._started_at = time.monotonic()
         return report
 
     def abandon_round(self) -> None:
@@ -757,17 +779,92 @@ class OuterLoop:
         steps, and a round nobody could exchange is a round that happened and
         contributed nothing.
         """
+        self._retire_round(self.steps_this_round)
+        self.steps_this_round = 0
+        self._started_at = time.monotonic()
+
+    def _retire_round(self, steps: int) -> None:
+        """Say the round was abandoned and move the counter on past it."""
         logger.warning(
             "Outer round %d abandoned after %d local step(s); the parameters "
             "this node trained stand, and it moves on to round %d so it stays "
             "in step with its peers.",
             self.round_number,
-            self.steps_this_round,
+            steps,
             self.round_number + 1,
         )
         self.round_number += 1
+
+    # ─── a round in flight, GPU-230 ─────────────────────────────────────
+
+    def launch(self) -> "RoundInFlight":
+        """End the round here and hand the network half to someone else.
+
+        **Why.** A closed round used to stop the node: publish, gather, decide,
+        step, and only then the next batch. Between continents that is minutes
+        of a rented GPU doing nothing (GPU-230). Launched instead, the round's
+        delta is taken now, the next round's training starts now, and the
+        exchange runs on another thread against :class:`RoundInFlight`, which
+        reads nothing of the live model and writes nothing into it.
+
+        **What is taken, and why both.** The delta, ``outer - live``, is the
+        round's report and is the same tensor a blocking round would have
+        sent. The live parameters themselves are kept too - the *photograph*,
+        one fp32 copy on :attr:`device` - because when the round's result
+        comes back the model has moved on from them, and :meth:`land` needs to
+        know by how much.
+
+        The counters start the next round here, not when the result lands:
+        the training after this call is the next round's, and a round on the
+        clock is timed from now.
+        """
+        # A delta that cannot be computed is carried to the thread as the
+        # failure it is, where `close_round` treats it as it always has: this
+        # node offers nothing and still applies what the others decide.
+        try:
+            mine: Any = self.contribution()
+        except Exception as exc:
+            mine = exc
+        flight = RoundInFlight(
+            self, mine, snapshot(self.model, device=self.device), self.steps_this_round
+        )
         self.steps_this_round = 0
         self._started_at = time.monotonic()
+        return flight
+
+    def land(self, flight: "RoundInFlight") -> None:
+        """Put a round that came back into the live model, keeping what the
+        model trained while it was away.
+
+        ``live = outer + (live - photograph)``, per parameter. The outer
+        parameters are the round's result, the same on every node; the
+        difference is this node's training since :meth:`launch`, which belongs
+        to the round now open and goes into *its* delta. That last part needs
+        no bookkeeping: after this the next delta is ``outer - live`` as it
+        always was, and ``outer - live`` is exactly minus the training since
+        the photograph. So a node applies its own work once in the model and
+        once, averaged, in the next round's result, and never twice.
+
+        A round that came back abandoned - decided empty, so nobody took the
+        step - changes nothing: the outer parameters are where they were and
+        the model keeps everything it trained, as :meth:`abandon_round` leaves
+        it. The next delta then carries both rounds' work, as it would have.
+
+        Called on the training loop's thread, at a batch boundary, and only
+        once the round has finished: :attr:`outer` is the flight's until then.
+        """
+        import torch
+
+        if not flight.applied:
+            return
+        with torch.no_grad():
+            for name, p in trainable(self.model):
+                value = self.outer.get(name)
+                taken = flight.photograph.get(name)
+                if value is None or taken is None:
+                    continue
+                moved = p.detach().to(device=taken.device, dtype=taken.dtype) - taken
+                p.data.copy_((value + moved).to(device=p.device, dtype=p.dtype))
 
     def write_back(self) -> None:
         """Put the outer parameters into the live model.
@@ -806,3 +903,67 @@ class OuterLoop:
         if state.get("optimizer"):
             self.optimizer.load_state_dict(state["optimizer"])
         self._started_at = time.monotonic()
+
+
+class RoundInFlight:
+    """A launched round, as the code that closes rounds sees a loop (GPU-230).
+
+    ``close_round`` and ``close_round_regions`` take a loop and ask it for
+    the round number, its contribution, the outer parameters, and to apply or
+    abandon. This answers all of those for one round without going near the
+    live model: the contribution was taken at :meth:`OuterLoop.launch`, and
+    applying is the outer step alone - :meth:`OuterLoop.land` does the model,
+    later, on the training thread.
+
+    It also keeps the exchange code knowing nothing about overlap. A round in
+    flight goes through exactly the publish, gather, decision and recovery a
+    blocking round does, so everything that keeps the nodes on one model
+    (GPU-140) holds for it unchanged: every node applies the set the store
+    decided to the same outer parameters, whatever each trained meanwhile.
+    """
+
+    def __init__(self, loop: OuterLoop, mine: Any, photograph: ParamMap, steps: int) -> None:
+        self.loop = loop
+        #: The round's contribution, or the exception computing it raised.
+        self.mine = mine
+        self.steps = int(steps)
+        #: The live parameters at launch, fp32. See :meth:`OuterLoop.launch`.
+        self.photograph = photograph
+        #: Whether the outer step was taken; :meth:`OuterLoop.land` reads it.
+        self.applied = False
+        self.round_number = loop.round_number
+
+    @property
+    def outer(self) -> ParamMap:
+        return self.loop.outer
+
+    @property
+    def combine_mode(self) -> str:
+        return self.loop.combine_mode
+
+    @property
+    def residual(self) -> Dict[str, Any]:
+        return self.loop.residual
+
+    def contribution(self) -> Contribution:
+        if isinstance(self.mine, Exception):
+            raise self.mine
+        return self.mine
+
+    def with_residual(self, delta: Dict[str, Any]) -> Dict[str, Any]:
+        return self.loop.with_residual(delta)
+
+    def keep_residual(self, sent: Dict[str, Any], published: Dict[str, Any]) -> None:
+        self.loop.keep_residual(sent, published)
+
+    def apply(self, contributions: List[Contribution]) -> Dict[str, Any]:
+        gradient = combine(contributions, mode=self.loop.combine_mode)
+        return self.apply_combined(gradient, [c.steps for c in contributions])
+
+    def apply_combined(self, gradient: ParamMap, steps: List[int]) -> Dict[str, Any]:
+        report = self.loop._outer_step(gradient, steps)
+        self.applied = True
+        return report
+
+    def abandon_round(self) -> None:
+        self.loop._retire_round(self.steps)

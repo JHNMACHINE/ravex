@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`outer_overlap`: the training goes on while a round travels (GPU-230).**
+  A round used to stop the node from its publish to its outer step, which
+  between continents is minutes of a rented GPU waiting. With
+  `outer_overlap: true` (or `RAVEX_OUTER_OVERLAP=1`) the node takes its delta
+  and a copy of its parameters at the boundary, starts the next round at
+  once, and the exchange runs on a thread of its own. When the round is back,
+  at the first batch boundary after, the model becomes the round's result
+  plus what it trained meanwhile; the next round's delta then carries that
+  training, so it is counted once. The next round's boundary waits for a
+  round still out, so at most one is ever in flight. The exchange, the
+  decision on the store, the recovery, the rejoin and the failover of the
+  rendezvous are the ones a blocking round goes through, and a failure in the
+  thread reaches them on the training thread. Costs one more fp32 copy of the
+  trainable parameters in host memory; the outer update arrives up to a
+  round late. Off by default. Each landed round logs how long the training
+  waited for it, and the model's series has `outer/stalled_seconds` - the
+  whole round when blocking.
+
 ## 0.7.6 — 2026-10-21
 
 ### Changed

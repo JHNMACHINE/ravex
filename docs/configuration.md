@@ -1022,6 +1022,7 @@ outer_combine: mean          # mean | normalized | step_weighted
 outer_deadline: 900
 outer_save_dtype: null       # bf16 takes a fifth off a round; fp4_block 7.6x
 outer_error_feedback: false  # carry the quantization residual to the next round
+outer_overlap: false         # train on while the round travels, see below
 outer_root: null             # defaults to <storage.path>/rounds
 ```
 
@@ -1063,6 +1064,27 @@ Extrapolated, a 1B model's bf16 delta is roughly **375 s per round** — set
 `outer_deadline` above that, and `outer_inner_steps` high enough that it is a
 small share of the round. `bench/round_link_cost.py` runs that measurement on
 any machine, with no privileges and no second box.
+
+**`outer_overlap` takes the network out of the round** (GPU-230). Blocking, a
+round stops the node from its publish to its outer step: the GPU waits for
+every byte. With `outer_overlap: true` the node takes its delta and a copy of
+its parameters at the boundary and starts the next round at once; the
+exchange runs on a thread of its own. When the round is back, at the first
+batch boundary after, the model becomes the round's result plus what the node
+trained meanwhile, and that training goes into the next round's delta, so it
+counts once. The next boundary waits for a round still out, so at most one is
+in flight and the training waits only for what the network outlasts a round
+by. The decision on the store, the recovery of a missing report, the rejoin
+and the rendezvous failover are the ones a blocking round goes through.
+
+What it costs: one more fp32 copy of the trainable parameters in host memory,
+and an outer update that arrives up to a round late. A checkpoint taken while
+a round is out resumes from the round before it, as one taken mid-round
+always resumes from the round's start: nothing is applied twice. Every landed
+round logs how long the training waited for it, and the model's series has
+`outer/stalled_seconds` - the whole round when blocking. It is off until a
+run on real machines says what the lateness costs; `bench/outer_convergence.py
+--overlap 0.25 1` measures it on one box.
 
 **`outer_round_seconds` is what makes nodes of different speeds work.** With a
 step count, every node does the same work and the slowest sets the pace. With a

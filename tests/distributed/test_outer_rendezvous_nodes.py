@@ -155,7 +155,7 @@ def split_off_next_round(exchange):
 
 
 def a_node(address, job, min_nodes, root, name, role, queue, control_at=None,
-           member=None, kill=None, deadline=60):
+           member=None, kill=None, deadline=60, overlap=False):
     """One node, started the way a rented box starts one.
 
     ``control_at`` is where the test's own keys live when ``address`` may die
@@ -219,6 +219,7 @@ def a_node(address, job, min_nodes, root, name, role, queue, control_at=None,
             resume=False,
             checkpoint_every=10**9,
             checkpoint_on_exit=False,
+            outer_overlap=overlap,
         )
         def train():
             logging.getLogger("ravex").setLevel(logging.INFO)
@@ -284,8 +285,12 @@ def a_node(address, job, min_nodes, root, name, role, queue, control_at=None,
                 ):
                     split_off_next_round(runtime._exchange)
                     armed = True
-                if control.check([LAST_KEY]) and outer.round_number > int(
-                    control.get(LAST_KEY)
+                if (
+                    # A round in flight is changing the outer parameters on
+                    # its own thread (GPU-230); they are read between rounds.
+                    runtime._flight is None
+                    and control.check([LAST_KEY])
+                    and outer.round_number > int(control.get(LAST_KEY))
                 ):
                     return outer_digest(outer.outer), outer.round_number
             return None, None
@@ -386,7 +391,8 @@ def join_a_run(server, tmp_path):
 
 
 @pytest.mark.skipif(sys.platform == "darwin", reason="spawn is slow on macOS")
-def test_the_first_node_dying_does_not_take_the_run_with_it(server, tmp_path):
+@pytest.mark.parametrize("overlap", [False, True], ids=["blocking", "overlap"])
+def test_the_first_node_dying_does_not_take_the_run_with_it(server, tmp_path, overlap):
     """Under torchrun the store lives with the first node's agent, and the
     exchange reads peer addresses from it on every fetch. Here the store is the
     server's, so node 0 going away costs the run one contributor and nothing
@@ -398,11 +404,12 @@ def test_the_first_node_dying_does_not_take_the_run_with_it(server, tmp_path):
     pytest.importorskip("moonclip")
     context = mp.get_context("spawn")
     queue = context.Queue()
-    job = "dies"
+    job = "dies-overlap" if overlap else "dies"
     rendezvous.connect(server, job + ".control").set(LAST_KEY, b"7")
     nodes = [
         context.Process(
-            target=a_node, args=(server, job, 3, str(tmp_path), name, "first-dies", queue)
+            target=a_node, args=(server, job, 3, str(tmp_path), name, "first-dies", queue),
+            kwargs=dict(overlap=overlap),
         )
         for name in ("a", "b", "c")
     ]
@@ -525,7 +532,8 @@ def hosted_pids(said):
 
 
 @pytest.mark.skipif(sys.platform == "darwin", reason="spawn is slow on macOS")
-def test_the_run_elects_a_new_rendezvous_when_its_own_dies(server, tmp_path):
+@pytest.mark.parametrize("overlap", [False, True], ids=["blocking", "overlap"])
+def test_the_run_elects_a_new_rendezvous_when_its_own_dies(server, tmp_path, overlap):
     """The server is killed at round 3, every node's state on it. The nodes
     elect one among themselves, start epoch 1 there, and end on one model -
     and a node started after the failover finds the run where it is now,
@@ -533,7 +541,7 @@ def test_the_run_elects_a_new_rendezvous_when_its_own_dies(server, tmp_path):
     pytest.importorskip("moonclip")
     context = mp.get_context("spawn")
     queue = context.Queue()
-    job = "failover"
+    job = "failover-overlap" if overlap else "failover"
     ports = free_ports(4)
     addresses = ",".join("127.0.0.1:%d" % port for port in ports)
     dying = a_server(ports[0])
@@ -546,7 +554,8 @@ def test_the_run_elects_a_new_rendezvous_when_its_own_dies(server, tmp_path):
             # A node that arrives after the epoch's quorum joins it, and a
             # join takes a few rounds; on a loaded runner a minute is not
             # always that.
-            kwargs=dict(control_at=server, member=place, kill=dying.pid, deadline=180),
+            kwargs=dict(control_at=server, member=place, kill=dying.pid, deadline=180,
+                        overlap=overlap),
         )
         for place, name in ((1, "a"), (2, "b"), (3, "c"))
     ]
@@ -571,7 +580,7 @@ def test_the_run_elects_a_new_rendezvous_when_its_own_dies(server, tmp_path):
         joiner = context.Process(
             target=a_node,
             args=(addresses, job, 3, str(tmp_path), "d", "joiner", queue),
-            kwargs=dict(control_at=server, deadline=180),
+            kwargs=dict(control_at=server, deadline=180, overlap=overlap),
         )
         joiner.start()
         results = collect(queue, 4)

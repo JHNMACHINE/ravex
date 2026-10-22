@@ -423,8 +423,14 @@ def steps_per_round(inner, speeds, count):
 
 
 def run(shards, args, inner, dtype=None, feedback=False, own="published",
-        speeds=None, combine_mode="mean"):
-    """N nodes on one process, exchanging every ``inner`` steps of the fastest."""
+        speeds=None, combine_mode="mean", lag=None):
+    """N nodes on one process, exchanging every ``inner`` steps of the fastest.
+
+    ``lag`` is ``outer_overlap`` (GPU-230): each round is launched instead of
+    applied, and lands that many local steps into the next one - the network
+    taking that long, in units of the training it overlaps. A lag of a whole
+    round is the worst case the runtime allows, since the next boundary waits.
+    """
     base = model_for(args)
     models = [copy.deepcopy(base) for _ in shards]
     optimizers = [
@@ -450,22 +456,35 @@ def run(shards, args, inner, dtype=None, feedback=False, own="published",
 
     root = tempfile.mkdtemp(prefix="ravex-convergence-")
     wire = Wire(root, len(shards), dtype, feedback)
+    flights = None
     try:
         for round_number in range(max(1, args.steps // inner)):
             mine = []
             for index, shard in enumerate(shards):
-                train(models[index], optimizers[index], shard, locals_[index],
-                      args, generators[index])
+                if flights is None:
+                    train(models[index], optimizers[index], shard, locals_[index],
+                          args, generators[index])
+                else:
+                    before = min(lag, locals_[index])
+                    train(models[index], optimizers[index], shard, before,
+                          args, generators[index])
+                    loops[index].land(flights[index])
+                    train(models[index], optimizers[index], shard,
+                          locals_[index] - before, args, generators[index])
                 for _ in range(locals_[index]):
                     loops[index].record_step()
-                mine.append(loops[index].contribution())
+                if lag is None:
+                    mine.append(loops[index].contribution())
+            if lag is not None:
+                flights = [loop.launch() for loop in loops]
+                mine = [flight.contribution() for flight in flights]
 
             on_the_wire = [
                 wire.send(contribution.delta, index, round_number)
                 for index, contribution in enumerate(mine)
             ]
             for index, loop in enumerate(loops):
-                loop.apply(
+                (flights[index] if flights is not None else loop).apply(
                     [
                         Contribution(
                             # `own="exact"` is the defect: this node averages
@@ -482,6 +501,10 @@ def run(shards, args, inner, dtype=None, feedback=False, own="published",
                         for other in range(len(mine))
                     ]
                 )
+        # The last round lands with nothing trained after it, as at the
+        # runtime's shutdown, so the nodes end on one model either way.
+        for loop, flight in zip(loops, flights or []):
+            loop.land(flight)
     finally:
         shutil.rmtree(root, ignore_errors=True)
     return models
@@ -528,6 +551,11 @@ def main():
                         choices=("published", "exact", "both"),
                         help="whether a node averages its own delta as its "
                              "peers see it; `both` measures the difference")
+    parser.add_argument("--overlap", type=float, nargs="+", default=None,
+                        metavar="FRACTION",
+                        help="outer_overlap arms (GPU-230): each round lands "
+                             "this fraction of a round into the next one. "
+                             "Run beside the blocking arm of every H")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--outer-lr", type=float, default=0.7)
     parser.add_argument("--outer-momentum", type=float, default=0.7)
@@ -597,6 +625,21 @@ def main():
                 models = run(shards, args, inner, dtype=cast,
                              feedback=feedback, own=own)
                 report(label, models[0], models, time.perf_counter() - started)
+
+    if args.overlap:
+        print()
+        print("rounds in flight (outer_overlap), landing a fraction of a round late")
+        for inner in args.h:
+            started = time.perf_counter()
+            models = run(shards, args, inner)
+            report("H=%-5d blocking" % inner, models[0], models,
+                   time.perf_counter() - started)
+            for fraction in args.overlap:
+                lag = max(0, min(inner, int(round(inner * fraction))))
+                started = time.perf_counter()
+                models = run(shards, args, inner, lag=lag)
+                report("H=%-5d overlap, %d late" % (inner, lag),
+                       models[0], models, time.perf_counter() - started)
 
     if args.speeds:
         if len(args.speeds) != args.nodes:

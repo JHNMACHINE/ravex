@@ -38,7 +38,8 @@ def _store_client(port):
     return _tcp_store("127.0.0.1", port, False, 120.0)
 
 
-def a_node(rank, world, port, root, rounds, inner, queue, boundary="public", log=False, resume=False, barrier=None):
+def a_node(rank, world, port, root, rounds, inner, queue, boundary="public", log=False, resume=False, barrier=None,
+           overlap=False):
     """One rank: init the group, then a training loop that knows nothing."""
     try:
         import torch.distributed as dist
@@ -80,6 +81,7 @@ def a_node(rank, world, port, root, rounds, inner, queue, boundary="public", log
             resume=resume,
             checkpoint_every=10**9,
             checkpoint_on_exit=True,
+            outer_overlap=overlap,
         )
         def train():
             logging.getLogger("ravex").addHandler(Collect())
@@ -121,13 +123,14 @@ def a_node(rank, world, port, root, rounds, inner, queue, boundary="public", log
                 # (GPU-256). Not the process group's barrier: Ravex uses that
                 # group too, and two collectives meeting out of order hang.
                 barrier.wait(timeout=240)
-            return (
-                before,
-                loss_fn(model(x), y).item(),
-                [float(p.detach().sum()) for p in model.parameters()],
-            )
+            return before, model, loss_fn
 
-        before, after, sums = train()
+        # Measured once the run has ended rather than inside it: with
+        # `overlap` the last round lands at the shutdown (GPU-230), and a
+        # blocking run's model is the same either side of it.
+        before, model, loss_fn = train()
+        after = loss_fn(model(x), y).item()
+        sums = [float(p.detach().sum()) for p in model.parameters()]
         queue.put(
             (
                 rank,
@@ -156,7 +159,7 @@ def rounds_of(said):
     return [line for line in said if "Outer round" in line and "took" in line]
 
 
-def run_two(tmp_path, rounds=3, inner=8, boundary="public", log=False, resume=False):
+def run_two(tmp_path, rounds=3, inner=8, boundary="public", log=False, resume=False, overlap=False):
     context = mp.get_context("spawn")
     queue = context.Queue()
     barrier = context.Barrier(2)
@@ -165,7 +168,8 @@ def run_two(tmp_path, rounds=3, inner=8, boundary="public", log=False, resume=Fa
     workers = [
         context.Process(
             target=a_node,
-            args=(rank, 2, port, str(tmp_path), rounds, inner, queue, boundary, log, resume, barrier),
+            args=(rank, 2, port, str(tmp_path), rounds, inner, queue, boundary, log, resume, barrier,
+                  overlap),
         )
         for rank in range(2)
     ]
@@ -205,6 +209,26 @@ def test_a_training_loop_that_knows_nothing_trains_with_a_peer(tmp_path):
     assert left == pytest.approx(right, abs=1e-4), (
         "the two ranks ended with different models, so the rounds did not "
         "reach them: %s against %s\nrank0 rounds: %s\nrank1 rounds: %s"
+        % (left, right, rounds_of(results[0][3]), rounds_of(results[1][3]))
+    )
+
+
+@pytest.mark.skipif(sys.platform == "darwin", reason="spawn + gloo is slow on macOS")
+def test_rounds_in_flight_still_leave_the_ranks_on_one_model(tmp_path):
+    """GPU-230: with `outer_overlap` each round is launched and the next one
+    trains while it travels. Every round still lands on both ranks - the
+    last at the shutdown, with nothing trained after it - so they end on the
+    same model, and the log says each landed rather than blocked."""
+    results = run_two(tmp_path, rounds=4, overlap=True)
+
+    for rank, (before, after, _, said) in results.items():
+        assert after < before / 2, "rank %d did not train: %.4f -> %.4f" % (rank, before, after)
+        landed = [line for line in said if "landed" in line]
+        assert len(landed) == 4, "rank %d: %s" % (rank, said)
+
+    left, right = results[0][2], results[1][2]
+    assert left == pytest.approx(right, abs=1e-4), (
+        "the two ranks ended with different models: %s against %s\nrank0: %s\nrank1: %s"
         % (left, right, rounds_of(results[0][3]), rounds_of(results[1][3]))
     )
 
