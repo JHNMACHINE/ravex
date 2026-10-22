@@ -291,6 +291,13 @@ def main():
         outer_region=(args.region or None),
         enabled=True,
         resume=False,
+        # No checkpoints, and `delta` off is what says so: with it on,
+        # `checkpoint_every` is the window of per-step deltas the store keeps,
+        # so 10 ** 9 meant a delta at every step and every one kept. The
+        # manifest grows by a snapshot per step and is rewritten whole at each
+        # save, so the cost of a step grew for the length of the run, and that
+        # would have been measured as the network's (GPU-261).
+        delta=False,
         checkpoint_every=10 ** 9,
         checkpoint_on_exit=False,
     )
