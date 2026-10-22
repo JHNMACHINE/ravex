@@ -656,7 +656,12 @@ def join(store, exchange, loop, rank: int, base_world: int, deadline: float,
                 announced_at,
                 ", ".join(str(member) for member in missing),
             )
-            announced_at = observed  # forces a fresh, later announcement
+            # A fresh, later announcement - once the round has moved, which is
+            # what `stale` waits for. Without it this branch came straight
+            # back here: 65,711 copies of the warning above in a few seconds
+            # of `test_a_joiner_publishes_nothing_until_every_member_acknowledged`,
+            # spinning on the GIL the members' threads needed (GPU-263).
+            announced_at = stale = observed
             continue
 
         state = exchange.fetch_state(
@@ -667,7 +672,7 @@ def join(store, exchange, loop, rank: int, base_world: int, deadline: float,
                 "No member served the outer parameters for round %d. Asking "
                 "again for a later round.", announced_at,
             )
-            announced_at = observed
+            announced_at = stale = observed
             continue
 
         apply_state(loop, state.delta)
