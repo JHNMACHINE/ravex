@@ -25,6 +25,9 @@ from test_outer_rendezvous import server  # noqa: E402, F401, F811
 #: round after which every node stops.
 LAST_KEY = "test/last-round"
 
+#: Where each node writes what Ravex said to it, in its own directory.
+SAID_FILE = "said.log"
+
 
 @pytest.fixture
 def gated_server(monkeypatch):
@@ -172,13 +175,19 @@ def a_node(address, job, min_nodes, root, name, role, queue, control_at=None,
         from ravex._runtime import get_runtime
 
         said = []
+        workdir = os.path.join(root, name)
+        os.makedirs(workdir, exist_ok=True)
+        # Also on disk, line by line: a node that never finishes never puts
+        # `said` on the queue, and its INFO lines are the only account of
+        # where it stopped (GPU-260). `collect` prints them.
+        said_file = open(os.path.join(workdir, SAID_FILE), "a", buffering=1)
 
         class Collect(logging.Handler):
             def emit(self, record):
-                said.append(record.getMessage())
+                message = record.getMessage()
+                said.append(message)
+                said_file.write("%.3f %s\n" % (time.monotonic(), message))
 
-        workdir = os.path.join(root, name)
-        os.makedirs(workdir, exist_ok=True)
         os.chdir(workdir)
         control = rendezvous.connect(control_at or address, job + ".control")
 
@@ -310,16 +319,47 @@ def a_node(address, job, min_nodes, root, name, role, queue, control_at=None,
         queue.put((name, None, None, traceback.format_exc(), None))
 
 
-def collect(queue, count):
+def collect(queue, count, root=None, names=()):
+    """Every node's result, or a failure that says where the missing ones were.
+
+    Given ``root`` and ``names``, a timeout ends with the last lines each
+    node that did not answer wrote to its file: until GPU-260 it ended in a
+    bare ``_queue.Empty``, and the INFO lines that tell a joiner that never
+    got in from rounds gone slow were lost with the process."""
+    import queue as _queue
+
     results = {}
     for _ in range(count):
-        name, digest, last, said, grouped = queue.get(timeout=300)
+        try:
+            name, digest, last, said, grouped = queue.get(timeout=300)
+        except _queue.Empty:
+            missing = [name for name in names if name not in results]
+            pytest.fail(
+                "no result in 300 s from %s\n%s"
+                % (missing or "some node", "\n".join(
+                    tail_of(root, name) for name in missing
+                ))
+            )
         if digest is None:
             detail = said if isinstance(said, str) else "\n".join(said)
+            if root is not None:
+                detail += "\n" + tail_of(root, name)
             pytest.fail("node %s did not finish:\n%s" % (name, detail))
         assert not grouped, "node %s built a torch process group" % name
         results[name] = (digest, last, said)
     return results
+
+
+def tail_of(root, name, lines=40):
+    path = os.path.join(root, name, SAID_FILE)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            said = handle.read().splitlines()
+    except OSError:
+        return "--- %s: nothing written" % name
+    return "--- %s, last %d of %d lines:\n%s" % (
+        name, min(lines, len(said)), len(said), "\n".join(said[-lines:])
+    )
 
 
 def end_nodes(processes, patience=60):
@@ -383,7 +423,7 @@ def join_a_run(server, tmp_path):
     joiner.start()
 
     try:
-        results = collect(queue, 3)
+        results = collect(queue, 3, str(tmp_path), "abc")
     finally:
         end_nodes(members + [joiner])
 
@@ -423,7 +463,7 @@ def test_the_first_node_dying_does_not_take_the_run_with_it(server, tmp_path, ov
     for node in nodes:
         node.start()
     try:
-        results = collect(queue, 2)
+        results = collect(queue, 2, str(tmp_path), "abc")
     finally:
         end_nodes(nodes)
 
@@ -457,7 +497,7 @@ def test_a_node_that_falls_off_the_model_rejoins_without_a_relaunch(server, tmp_
     for node in nodes:
         node.start()
     try:
-        results = collect(queue, 3)
+        results = collect(queue, 3, str(tmp_path), "abc")
     finally:
         end_nodes(nodes)
 
@@ -591,7 +631,7 @@ def test_the_run_elects_a_new_rendezvous_when_its_own_dies(server, tmp_path, ove
             kwargs=dict(control_at=server, deadline=180, overlap=overlap),
         )
         joiner.start()
-        results = collect(queue, 4)
+        results = collect(queue, 4, str(tmp_path), "abcd")
     finally:
         end_nodes(nodes + ([joiner] if joiner else []))
         dying.kill()
