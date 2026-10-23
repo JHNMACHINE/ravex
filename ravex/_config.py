@@ -752,7 +752,7 @@ class RavexConfig:
     metrics_every: int = 10
 
     #: Ravex's own reading of the training, from the parameters the optimizer
-    #: steps: ``ravex/grad_norm`` every ``metrics_every`` steps and the
+    #: steps: ``train/grad_norm`` every ``metrics_every`` steps and the
     #: histograms of ``histograms_every``, so that a script with nothing but
     #: the decorator still shows how the model is doing (GPU-274). The loss is
     #: not among them: Ravex does not see it without wrapping ``backward()``.

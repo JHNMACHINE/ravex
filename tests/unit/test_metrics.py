@@ -155,10 +155,10 @@ class TestAutomatic:
 
         train()
         scalars = ravex.metrics.read(str(storage))["scalars"]
-        assert scalars["ravex/lr"]["step"] == [2, 4, 6]
-        assert scalars["ravex/lr"]["value"] == [0.1, 0.1, 0.1]
-        assert scalars["ravex/step_seconds"]["step"] == [2, 4, 6]
-        assert all(value >= 0 for value in scalars["ravex/step_seconds"]["value"])
+        assert scalars["train/lr"]["step"] == [2, 4, 6]
+        assert scalars["train/lr"]["value"] == [0.1, 0.1, 0.1]
+        assert scalars["train/step_seconds"]["step"] == [2, 4, 6]
+        assert all(value >= 0 for value in scalars["train/step_seconds"]["value"])
 
     def test_gradient_norm_with_nothing_in_the_script(self, storage):
         """GPU-274: the norm of the gradients the step used, on the metrics' cadence."""
@@ -168,9 +168,30 @@ class TestAutomatic:
             loop(6, lambda _s, _m: None)
 
         train()
-        series = ravex.metrics.read(str(storage))["scalars"]["ravex/grad_norm"]
+        series = ravex.metrics.read(str(storage))["scalars"]["train/grad_norm"]
         assert series["step"] == [2, 4, 6]
         assert all(value > 0 for value in series["value"])
+
+    def test_a_clipped_run_charts_the_norm_before_the_clip(self, storage):
+        """What `clip_grad_norm_` returned, not the clipped gradients' norm,
+        which would read `max_norm` on every step."""
+        returned = []
+
+        @ravex.train_loop(backend="torch_save", checkpoint_every=10_000, metrics_every=1)
+        def train():
+            model = torch.nn.Linear(4, 2)
+            optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+            for step in range(3):
+                ravex.batch_boundary()
+                model(torch.randn(8, 4) * 100).pow(2).mean().backward()
+                returned.append(float(torch.nn.utils.clip_grad_norm_(model.parameters(), 1e-3)))
+                optimizer.step()
+                optimizer.zero_grad()
+
+        train()
+        series = ravex.metrics.read(str(storage))["scalars"]["train/grad_norm"]
+        assert series["value"] == pytest.approx(returned)
+        assert all(value > 1e-3 for value in series["value"])
 
     def test_the_gradient_norm_is_the_global_one(self):
         model = torch.nn.Sequential(torch.nn.Linear(4, 3), torch.nn.Linear(3, 2))
@@ -189,8 +210,8 @@ class TestAutomatic:
         train()
         histograms = ravex.metrics.read(str(storage))["histograms"]
         # Linear(4, 2): the weight and the bias, named after the model.
-        assert sorted(histograms) == ["grads/bias", "grads/weight", "weights/bias", "weights/weight"]
-        assert [entry["step"] for entry in histograms["weights/weight"]] == [3, 6]
+        assert sorted(histograms) == ["train/grads/bias", "train/grads/weight", "train/weights/bias", "train/weights/weight"]
+        assert [entry["step"] for entry in histograms["train/weights/weight"]] == [3, 6]
 
     def test_training_metrics_false_leaves_only_the_step_metrics(self, storage):
         @ravex.train_loop(
@@ -202,8 +223,8 @@ class TestAutomatic:
 
         train()
         history = ravex.metrics.read(str(storage))
-        assert "ravex/grad_norm" not in history["scalars"]
-        assert "ravex/lr" in history["scalars"]
+        assert "train/grad_norm" not in history["scalars"]
+        assert "train/lr" in history["scalars"]
         assert history["histograms"] == {}
 
     def test_checkpoint_duration(self, storage):
@@ -212,7 +233,7 @@ class TestAutomatic:
             loop(4, lambda _s, _m: None)
 
         train()
-        seconds = ravex.metrics.read(str(storage))["scalars"]["ravex/checkpoint_seconds"]
+        seconds = ravex.metrics.read(str(storage))["scalars"]["train/checkpoint_seconds"]
         assert seconds["step"] == [2, 4]
 
     def test_a_run_shorter_than_the_interval_still_samples_once(self, storage, monkeypatch):

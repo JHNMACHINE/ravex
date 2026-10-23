@@ -204,8 +204,24 @@ def grad_norm(optimizer: Any) -> Any:
     )
 
 
+def combined_norm(norms: List[Any]) -> Any:
+    """One L2 norm out of several, as for disjoint sets of gradients.
+
+    What ``clip_grad_norm_`` returned in one step: one value when the script
+    clips once, several when it clips each part of the model on its own.
+    """
+    import torch
+
+    if len(norms) == 1:
+        return torch.as_tensor(norms[0]).detach()
+    device = torch.as_tensor(norms[0]).device
+    return torch.linalg.vector_norm(
+        torch.stack([torch.as_tensor(n).detach().to(device=device, dtype=torch.float32) for n in norms])
+    )
+
+
 def parameter_histograms(models: List[Any], optimizer: Any) -> Dict[str, Any]:
-    """``weights/<name>`` and ``grads/<name>`` of the largest stepped parameters.
+    """``train/weights/<name>`` and ``train/grads/<name>`` of the largest stepped parameters.
 
     Named after the models Ravex tracks, so a chart says ``embed.weight``
     rather than a position; a parameter no tracked model owns is ``param<N>``.
@@ -233,10 +249,10 @@ def parameter_histograms(models: List[Any], optimizer: Any) -> Dict[str, Any]:
         if param.numel() < 2:
             continue
         name = names.get(id(param), "param%d" % position)
-        out["weights/" + name] = _histogram(param)
+        out["train/weights/" + name] = _histogram(param)
         grad = getattr(param, "grad", None)
         if grad is not None and not grad.is_sparse:
-            out["grads/" + name] = _histogram(grad)
+            out["train/grads/" + name] = _histogram(grad)
     return out
 
 

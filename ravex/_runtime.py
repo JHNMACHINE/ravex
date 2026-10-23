@@ -287,6 +287,9 @@ class RavexRuntime:
         #: histograms: settled at the first step they are due, once the
         #: process group is up and the models are known (GPU-274).
         self._training_metrics_apply: Optional[bool] = None
+        #: The norms `clip_grad_norm_` returned since the last step: the
+        #: gradients before clipping, already computed (GPU-274).
+        self._noted_grad_norms: List[Any] = []
         #: In a multi-node run, where the script's metrics wait for the end of
         #: the round (GPU-135): they are the model's, one value per name over
         #: every node, and not this node's. None otherwise.
@@ -973,21 +976,31 @@ class RavexRuntime:
         self._metrics_mark = (step, now)
         values: Dict[str, Any] = {}
         if step > mark_step:
-            values["ravex/step_seconds"] = prepare(
-                "ravex/step_seconds", (now - mark_time) / (step - mark_step)
+            values["train/step_seconds"] = prepare(
+                "train/step_seconds", (now - mark_time) / (step - mark_step)
             )
         groups = getattr(optimizer, "param_groups", None) or []
         for index, group in enumerate(groups):
             lr = group.get("lr") if isinstance(group, dict) else None
             if lr is None:
                 continue
-            name = "ravex/lr" if len(groups) == 1 else "ravex/lr/group%d" % index
+            name = "train/lr" if len(groups) == 1 else "train/lr/group%d" % index
             try:
                 values[name] = prepare(name, lr)
             except (TypeError, ValueError):
                 continue
         if values:
             self.log_metrics(values, step)
+
+    def note_grad_norm(self, norm: Any) -> None:
+        """Keep what ``clip_grad_norm_`` returned, for this step's chart (GPU-274).
+
+        A device tensor, kept as it is: reading it here would wait for the GPU
+        inside the script's own call. Bounded, for a script that clips on every
+        micro-batch of a long accumulation.
+        """
+        if self._enabled and self.config.training_metrics and len(self._noted_grad_norms) < 64:
+            self._noted_grad_norms.append(norm)
 
     def _log_training_metrics(self, optimizer: Any) -> None:
         """The gradient norm and the largest parameters' histograms (GPU-274).
@@ -1003,7 +1016,13 @@ class RavexRuntime:
         norm or a histogram of it would be a fraction of the model presented
         as the whole, and gathering the rest is a collective that this
         rank-0-only path cannot start.
+
+        The norm is the one ``clip_grad_norm_`` returned in this step when the
+        script clipped: taken before the clip, it says how large the gradients
+        were, where one measured here would read ``max_norm`` on every step
+        that clipped. Measured on the gradients when the script did not clip.
         """
+        noted, self._noted_grad_norms = self._noted_grad_norms, []
         if not self.config.training_metrics:
             return
         step = self.registry.step_count
@@ -1024,14 +1043,14 @@ class RavexRuntime:
             self._training_metrics_apply = get_rank() == 0 and not sharded
         if not self._training_metrics_apply:
             return
-        from ravex._metrics import grad_norm, parameter_histograms, prepare
+        from ravex._metrics import combined_norm, grad_norm, parameter_histograms, prepare
 
         values: Dict[str, Any] = {}
         try:
             if norm_due:
-                norm = grad_norm(optimizer)
+                norm = combined_norm(noted) if noted else grad_norm(optimizer)
                 if norm is not None:
-                    values["ravex/grad_norm"] = prepare("ravex/grad_norm", norm)
+                    values["train/grad_norm"] = prepare("train/grad_norm", norm)
             if histograms_due:
                 values.update(parameter_histograms(self.registry.models, optimizer))
         except Exception as exc:
@@ -2194,14 +2213,14 @@ class RavexRuntime:
                     self._metrics_uploader,
                 )
             values: Dict[str, Any] = {
-                "outer/round": report.get("round", 0),
-                "outer/nodes": report.get("nodes", 0),
-                "outer/steps": round_steps,
-                "outer/seconds": seconds,
+                "train/outer/round": report.get("round", 0),
+                "train/outer/nodes": report.get("nodes", 0),
+                "train/outer/steps": round_steps,
+                "train/outer/seconds": seconds,
                 # What the training waited for the round: all of it when
                 # blocking, only what the network outlasted the next round's
                 # training by with `outer_overlap` (GPU-230).
-                "outer/stalled_seconds": report.get("stalled_seconds", seconds),
+                "train/outer/stalled_seconds": report.get("stalled_seconds", seconds),
             }
             values.update(report.get("model_metrics") or {})
             prepared: Dict[str, Any] = {name: Scalar(float(value)) for name, value in values.items()}
@@ -2986,7 +3005,7 @@ class RavexRuntime:
         if self._metrics is not None:
             from ravex._metrics import Scalar
 
-            self.log_metrics({"ravex/checkpoint_seconds": Scalar(finished - started)}, step)
+            self.log_metrics({"train/checkpoint_seconds": Scalar(finished - started)}, step)
         return True
 
     def _record_audit(self, backend: Any, step: int, metadata: dict) -> None:

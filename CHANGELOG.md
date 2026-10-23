@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **A loop with no dataloader resumes before its first step (GPU-275).** The
+  resume used to happen in the hook after the first `optimizer.step()`: that
+  step's forward and backward ran on the fresh weights, the restored state
+  overwrote its update, and it was counted anyway - one batch short per
+  resume, and the loss at the first resumed step was the loss at step 1. It
+  now happens at the first `ravex.batch_boundary()` or `ravex.step()` once an
+  optimizer exists, so `ravex.step()` says the resumed step before the first
+  one, and a run split in two ends on the weights of the same run in one go.
+
+### Changed
+
+- **Every automatic metric is under `train/` (GPU-274).** `ravex/lr`,
+  `ravex/step_seconds` and `ravex/checkpoint_seconds` are now `train/lr`,
+  `train/step_seconds` and `train/checkpoint_seconds`; a multi-node run's
+  `outer/*` is `train/outer/*`. `sys/*` stays as it is.
+
+### Added
+
+- **Metrics with nothing but the decorator (GPU-274).** `train/grad_norm`
+  every `metrics_every` steps - the norm `clip_grad_norm_` returned, before
+  the clip, when the script clips - and every `histograms_every` steps (200)
+  `train/weights/<name>` and `train/grads/<name>` of the four largest
+  parameters. `training_metrics: false` turns them off. In a multi-node run
+  histograms are no longer dropped: the round's writer logs its own.
+
 ## 0.8.0 — 2026-10-23
 
 ### Changed

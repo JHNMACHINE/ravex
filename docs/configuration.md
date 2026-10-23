@@ -776,20 +776,23 @@ histogram of a million elements.
 `if rank == 0` around them. System metrics are per machine, taken by the first
 process on each.
 
-**Automatic metrics**, with nothing in the script: `ravex/lr` (or
-`ravex/lr/group<N>` with several param groups), `ravex/step_seconds` and
-`ravex/grad_norm` every `metrics_every` steps, `ravex/checkpoint_seconds` at
+**Automatic metrics**, with nothing in the script: `train/lr` (or
+`train/lr/group<N>` with several param groups), `train/step_seconds` and
+`train/grad_norm` every `metrics_every` steps, `train/checkpoint_seconds` at
 every checkpoint, and every `system_metrics_every` seconds `sys/gpu<N>/…`,
 `sys/cpu_percent`, `sys/ram_percent` and `sys/process_rss_mb`. GPU utilisation
 needs `nvidia-ml-py`; without it only this process's GPU memory is reported.
 CPU and RAM need `psutil`.
 
 Every `histograms_every` steps come the histograms of the four largest
-parameters the optimizer steps, `weights/<name>` and `grads/<name>`, named
-after the tracked model (`weights/embed.weight`). The gradient norm and the
+parameters the optimizer steps, `train/weights/<name>` and `train/grads/<name>`, named
+after the tracked model (`train/weights/embed.weight`). The gradient norm and the
 histograms are taken right after `optimizer.step()`, from the gradients the
-step used - unscaled already under a `GradScaler` - and like anything logged
-they are queued on the device, never read back on the training thread. With
+step used - unscaled already under a `GradScaler`. A script that clips with
+`torch.nn.utils.clip_grad_norm_` gets the norm that call returned, the one
+before the clip, rather than the clipped gradients' `max_norm`; it costs
+nothing, torch has already computed it. Like anything logged they are
+queued on the device, never read back on the training thread. With
 several optimizers they come from the one that drives the step count. A sharded
 model (FSDP) gets neither: rank 0 holds one shard, and gathering the rest would
 be a collective. The loss is not among them, because Ravex does not see it
@@ -805,8 +808,8 @@ round, the same answer on every node - writes one point per name: the mean over
 the nodes, weighted by the steps behind each. The step of that point is the
 model's, every step taken by every node in every round applied, so a run on four
 nodes and one on a single node are on the same axis. With it come
-`outer/round`, `outer/nodes`, `outer/steps` (the round's total) and
-`outer/seconds`. The `step=` argument does not apply, and system metrics stay
+`train/outer/round`, `train/outer/nodes`, `train/outer/steps` (the round's total) and
+`train/outer/seconds`. The `step=` argument does not apply, and system metrics stay
 per machine. Histograms are not averaged: each node keeps its latest one per
 name, and the writer logs its own on the model's series.
 The model's series is its own segment, under rank `-1`, cut only by segments of
@@ -1101,7 +1104,7 @@ and an outer update that arrives up to a round late. A checkpoint taken while
 a round is out resumes from the round before it, as one taken mid-round
 always resumes from the round's start: nothing is applied twice. Every landed
 round logs how long the training waited for it, and the model's series has
-`outer/stalled_seconds` - the whole round when blocking.
+`train/outer/stalled_seconds` - the whole round when blocking.
 
 **What the lateness costs, measured** (`bench/outer_convergence.py --overlap`,
 two nodes, 0.48M parameters, three seeds). A round that lands a quarter of a

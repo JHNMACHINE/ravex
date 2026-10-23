@@ -22,6 +22,14 @@ What gets patched, and why that specific hook:
     would miss ``Adam``, ``SGD`` and friends entirely, since each one overrides
     ``step`` and never calls ``super().step()``.
 
+``nn.utils.clip_grad_norm_``
+    Returns the norm of the gradients before it clips them, which is the
+    gradient norm a chart should show and which torch has just computed. Ravex
+    keeps it for ``train/grad_norm`` instead of measuring the clipped gradients
+    again after the step, where every value would read ``max_norm`` (GPU-274).
+    A script that imported the function by name before the run started holds
+    the original, and gets the norm measured after the step instead.
+
 ``DataLoader.__init__`` / ``DataLoader.__iter__``
     ``__init__`` swaps in the position-tracking sampler; ``__iter__`` is where
     resume is triggered, because it is the last moment before the first batch
@@ -94,6 +102,7 @@ def install_all_patches(registry, runtime) -> PatchSet:
     _patch_optimizer(patches, registry, runtime, torch)
     _patch_scheduler(patches, registry, torch)
     _patch_scaler(patches, registry, torch)
+    _patch_clip_grad_norm(patches, runtime, torch)
     if runtime.config.track_dataloaders:
         _patch_dataloader(patches, registry, runtime, torch)
 
@@ -174,6 +183,24 @@ def _attach_step_hook(optimizer, runtime) -> None:
 
     optimizer.step = step
     optimizer._ravex_hooked = True
+
+
+def _patch_clip_grad_norm(patches: PatchSet, runtime, torch) -> None:
+    original = torch.nn.utils.clip_grad_norm_
+
+    @functools.wraps(original)
+    def clip_grad_norm_(parameters, max_norm, norm_type=2.0, *args, **kwargs):
+        total = original(parameters, max_norm, norm_type, *args, **kwargs)
+        try:
+            # The L2 norm only: another `norm_type` is not what the chart is
+            # called, and the step hook measures the L2 one itself.
+            if float(norm_type) == 2.0:
+                runtime.note_grad_norm(total)
+        except Exception as exc:
+            logger.debug("Could not keep the clipped gradient norm: %s", exc)
+        return total
+
+    patches.apply(torch.nn.utils, "clip_grad_norm_", clip_grad_norm_)
 
 
 def _patch_scheduler(patches: PatchSet, registry, torch) -> None:

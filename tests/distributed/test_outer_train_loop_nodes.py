@@ -253,19 +253,19 @@ def test_a_multi_node_run_logs_one_series_for_the_model(tmp_path):
     loss = writer["train/loss"]
     assert loss["step"] == [16, 32, 48]
     assert loss["value"] == pytest.approx([2.0, 2.0, 2.0])
-    assert writer["outer/nodes"]["value"] == [2.0, 2.0, 2.0]
-    assert writer["outer/steps"]["value"] == [16.0, 16.0, 16.0]
+    assert writer["train/outer/nodes"]["value"] == [2.0, 2.0, 2.0]
+    assert writer["train/outer/steps"]["value"] == [16.0, 16.0, 16.0]
 
     other = ravex.metrics.read(str(tmp_path / "cwd1" / "checkpoints"))["scalars"]
-    assert "train/loss" not in other and "outer/round" not in other
+    assert "train/loss" not in other and "train/outer/round" not in other
 
     # GPU-274: what Ravex takes on its own goes the same way - the gradient
     # norm averaged over the nodes, and the writer's own histograms on the
     # model's axis instead of being dropped.
-    assert writer["ravex/grad_norm"]["step"] == [16, 32, 48]
+    assert writer["train/grad_norm"]["step"] == [16, 32, 48]
     histograms = ravex.metrics.read(str(tmp_path / "cwd0" / "checkpoints"))["histograms"]
-    assert [entry["step"] for entry in histograms["weights/0.weight"]] == [16, 32, 48]
-    assert "grads/0.weight" in histograms
+    assert [entry["step"] for entry in histograms["train/weights/0.weight"]] == [16, 32, 48]
+    assert "train/grads/0.weight" in histograms
 
 
 @pytest.mark.skipif(sys.platform == "darwin", reason="spawn + gloo is slow on macOS")
