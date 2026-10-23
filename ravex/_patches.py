@@ -20,7 +20,9 @@ What gets patched, and why that specific hook:
     The single choke point every optimizer subclass goes through. The step hook
     is attached here, per instance: patching ``Optimizer.step`` on the class
     would miss ``Adam``, ``SGD`` and friends entirely, since each one overrides
-    ``step`` and never calls ``super().step()``.
+    ``step`` and never calls ``super().step()``. The forward pre-hook that
+    takes the top of each iteration goes on the models it trains, here too:
+    see ``RavexRuntime.watch_iterations`` (GPU-276).
 
 ``nn.utils.clip_grad_norm_``
     Returns the norm of the gradients before it clips them, which is the
@@ -144,6 +146,9 @@ def _patch_optimizer(patches: PatchSet, registry, runtime, torch) -> None:
     def on_init(optimizer, _result):
         registry.register_optimizer(optimizer)
         _attach_step_hook(optimizer, runtime)
+        # The models it trains exist by now - it was built from their
+        # parameters - and their forwards are where the iterations start.
+        runtime.watch_iterations(optimizer)
 
     patches.apply(
         torch.optim.Optimizer,

@@ -149,6 +149,18 @@ rather than through the stale-LR fallback.
 And when nobody calls it, the runtime says which call is missing — once, naming
 the consequence — instead of leaving a run that looks healthy and is not.
 
+Since GPU-276 the call is rarely needed, because a loop with no dataloader has
+another moment that is the same one: the first forward of the trained model
+after a step. Ravex puts a forward pre-hook on the models each optimizer was
+built from, first in line - ahead of FSDP's own, which unshards the parameters
+a checkpoint or a round may touch - and it acts only when a step has happened
+since the last boundary. Gradient accumulation does not move it, since the
+micro-batches after the first have no step before them, and the first forward
+of a run is where it resumes. The hook runs outside `torch.compile`'s graphs
+and comes off when the run ends. What still needs the call is a loop whose
+iterations Ravex cannot see start: one calling `model.forward` directly, which
+runs no module hooks.
+
 ### Where the dataset was
 
 `TrackedSampler` wraps the loader's `batch_sampler` (or its `sampler` when

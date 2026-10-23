@@ -290,7 +290,7 @@ class TestTheBoundaryHandedOverByHand:
     def test_the_checkpoint_lands_after_the_scheduler_rather_than_inside_the_step(
         self, storage
     ):
-        """The cost of the mid-step fallback, and that handing over removes it.
+        """The cost of the mid-step fallback, and what removes it.
 
         A checkpoint taken inside the `optimizer.step()` hook is one
         `scheduler.step()` short of the state the loop is actually in, so a
@@ -298,10 +298,15 @@ class TestTheBoundaryHandedOverByHand:
         every step after it is wrong by a little. With an LR that halves every
         step that is not a rounding difference — it is the whole schedule off
         by one.
+
+        Handing the boundary over removes it, and since GPU-276 so does the
+        loop's own next forward of the model. The fallback is left for a loop
+        that gives neither, here one calling `model.forward` directly, which
+        runs no module hooks.
         """
         LR, GAMMA = 0.1, 0.5
 
-        def saved_learning_rate(hand_over):
+        def saved_learning_rate(how):
             @ravex.train_loop(
                 backend="torch_save",
                 checkpoint_every=2,
@@ -318,9 +323,10 @@ class TestTheBoundaryHandedOverByHand:
                 # Three, not four: a fourth step makes a second checkpoint
                 # due and `load_latest` would answer about that one instead.
                 for _ in range(3):
-                    if hand_over:
+                    if how == "by hand":
                         ravex.batch_boundary()
-                    model(torch.randn(2, 4)).sum().backward()
+                    forward = model.forward if how == "unseen" else model
+                    forward(torch.randn(2, 4)).sum().backward()
                     optimizer.step()
                     optimizer.zero_grad()
                     scheduler.step()
@@ -335,11 +341,15 @@ class TestTheBoundaryHandedOverByHand:
 
             return train()
 
-        assert saved_learning_rate(hand_over=True) == pytest.approx(LR * GAMMA**2), (
+        assert saved_learning_rate("by hand") == pytest.approx(LR * GAMMA**2), (
             "the boundary was handed over and the checkpoint still landed "
             "inside optimizer.step(), one scheduler step stale"
         )
-        assert saved_learning_rate(hand_over=False) == pytest.approx(LR * GAMMA), (
+        assert saved_learning_rate("forward") == pytest.approx(LR * GAMMA**2), (
+            "nothing was handed over, and the next forward of the model did "
+            "not stand in for it (GPU-276)"
+        )
+        assert saved_learning_rate("unseen") == pytest.approx(LR * GAMMA), (
             "the mid-step fallback no longer costs a stale learning rate, so "
             "the reason for handing the boundary over is gone and this test "
             "is measuring nothing"

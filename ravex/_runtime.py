@@ -247,6 +247,13 @@ class RavexRuntime:
         #: Whether anything is handing us the top of the iteration — the
         #: dataloader wrapper, or `ravex.batch_boundary()` called by hand.
         self._boundary_delivered = False
+        #: Up from the start and after every counted step, down at the batch
+        #: boundary: the first forward of a watched model while it is up is
+        #: the top of an iteration (GPU-276).
+        self._iteration_armed = True
+        #: The forward pre-hooks of `watch_iterations`, by model, so that each
+        #: model gets one and all of them come off when the run ends.
+        self._iteration_hooks: Dict[int, Any] = {}
         self._shutdown_done = False
         self._lock = threading.RLock()
         self._framework = "unknown"
@@ -689,6 +696,9 @@ class RavexRuntime:
             return
 
         self.registry.step_count += 1
+        # The next forward of a watched model is the top of the next
+        # iteration; see `watch_iterations` (GPU-276).
+        self._iteration_armed = True
         if self._metrics is not None:
             self._log_step_metrics(optimizer)
             self._log_training_metrics(optimizer)
@@ -752,6 +762,65 @@ class RavexRuntime:
         """Whether ``step`` is a checkpoint, and not one of the deltas between."""
         return step % self.config.checkpoint_every == 0
 
+    def watch_iterations(self, optimizer: Any) -> None:
+        """Take the top of each iteration from the models ``optimizer`` trains (GPU-276).
+
+        The batch boundary is the moment between one ``optimizer.step()`` and
+        the next batch: the LR scheduler has stepped, no gradient is in
+        flight. A dataloader hands it over at each ``next()``; a loop over
+        tensors it already holds used to have to call ``ravex.batch_boundary()``
+        or get checkpoints taken mid-step and, on several nodes, rounds that
+        never close. Every loop has another moment that is the same one: the
+        first forward of the model after a step. Gradient accumulation does not
+        move it - the micro-batches after the first have no step before them -
+        and an evaluation between steps is still between steps.
+
+        So each root model whose parameters ``optimizer`` holds gets a forward
+        pre-hook, first in line - ahead of FSDP's own, which unshards the
+        parameters this boundary may checkpoint or replace. It does nothing
+        unless a step has happened since the last boundary, and the very first
+        forward of a run counts as one, which is where a run with no
+        dataloader resumes. The hooks come off when the run ends.
+        """
+        try:
+            models = [
+                model for model in self.registry.models
+                if id(model) not in self._iteration_hooks
+                and self.registry._optimizer_owns(optimizer, model)
+            ]
+        except Exception as exc:
+            logger.debug("Could not find the models of an optimizer: %s", exc)
+            return
+        if not models:
+            return
+        hook: Any = self._forward_boundary
+        try:
+            import torch._dynamo
+
+            # Run as Python, not traced into a compiled graph: a checkpoint is
+            # file I/O, and a round is network.
+            hook = torch._dynamo.disable(hook)
+        except Exception:
+            pass
+        for model in models:
+            try:
+                self._iteration_hooks[id(model)] = model.register_forward_pre_hook(hook, prepend=True)
+            except TypeError:
+                # torch before 2.0 has no `prepend`.
+                self._iteration_hooks[id(model)] = model.register_forward_pre_hook(hook)
+
+    def _forward_boundary(self, _module: Any, _args: Any) -> None:
+        if self._iteration_armed and self._enabled and not self._shutdown_done:
+            self.on_batch_boundary()
+
+    def unwatch_iterations(self) -> None:
+        for handle in self._iteration_hooks.values():
+            try:
+                handle.remove()
+            except Exception:  # pragma: no cover - defensive
+                pass
+        self._iteration_hooks.clear()
+
     def resume_if_ready(self) -> None:
         """Resume now if it has not happened and the run can be restored.
 
@@ -783,6 +852,10 @@ class RavexRuntime:
         # state overwrote that update, the step was counted anyway, and the
         # batch it should have trained on never was (GPU-275).
         self.resume_if_ready()
+        # Whoever delivered it - a dataloader, the script, a forward - the
+        # iteration's top has been taken, and the forward hook stands down
+        # until the next step.
+        self._iteration_armed = False
         # Remembered because the *checkpoint* hatch in `on_step` reads "no
         # dataloader" as "no boundary". A loop that calls
         # `ravex.batch_boundary()` has the boundary without having a
@@ -1885,8 +1958,9 @@ class RavexRuntime:
         """Say it when a round is due and nothing ever closes it.
 
         `_round_due` goes up inside `optimizer.step()` and comes down at the
-        next batch boundary. A loop with no DataLoader is handed no boundary
-        for free, so unless it calls `ravex.batch_boundary()` the flag stays
+        next batch boundary. A loop with no DataLoader, and whose trained
+        model's forward Ravex does not see (GPU-276), is handed no boundary,
+        so unless it calls `ravex.batch_boundary()` the flag stays
         up for the rest of the run: no round closes, no delta is exchanged,
         and every node trains its own model to the end while the log says
         nothing at all. The silence is the defect worth fixing here — more
@@ -1906,10 +1980,11 @@ class RavexRuntime:
         logger.warning(
             "Outer round %d has been ready to close for %d optimizer steps "
             "and nothing has closed it. Ravex takes the batch boundary from "
-            "the DataLoader iterator, and this loop has no DataLoader "
-            "registered, so that moment never arrives: no round will close, "
-            "no delta will be exchanged with the peers, and this node will "
-            "train alone for the rest of the run. Call ravex.batch_boundary() "
+            "the DataLoader iterator or from the first forward of the trained "
+            "model after each step, and this loop gives it neither, so that "
+            "moment never arrives: no round will close before the run ends, "
+            "no delta will be exchanged with the peers until then, and this "
+            "node will train alone in the meantime. Call ravex.batch_boundary() "
             "at the top of each training iteration.",
             outer.round_number,
             waited,
@@ -3933,6 +4008,16 @@ class RavexRuntime:
             self._shutdown_done = True
 
         try:
+            if self._round_due and self.exit_state == "finished":
+                # The last step made a round due, and no iteration followed
+                # for its forward to close it (GPU-276): the function returning
+                # is that iteration's top - the scheduler has stepped, nothing
+                # is in flight. Every node that finished got here with the same
+                # round due, so they close it together; left open, the run's
+                # nodes would end on different models. Not on a failure, which
+                # is no moment to spend minutes of network for peers.
+                self._round_due = False
+                self._close_outer_round()
             if self._flight is not None:
                 # Before the final checkpoint, so the weights it holds have
                 # the last round in them; and before the exchange lingers, so
@@ -4058,6 +4143,9 @@ def reset_runtime() -> None:
     global _runtime
     with _runtime_lock:
         if _runtime is not None:
+            # A model that outlives the run, evaluated after it, must not call
+            # into a runtime that is gone.
+            _runtime.unwatch_iterations()
             if _runtime._patches is not None:
                 _runtime._patches.uninstall()
             try:

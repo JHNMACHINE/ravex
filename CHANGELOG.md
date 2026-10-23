@@ -22,6 +22,17 @@
 
 ### Added
 
+- **No more `ravex.batch_boundary()` in a loop without a DataLoader
+  (GPU-276).** Ravex takes the top of each iteration from the first forward,
+  after each step, of the models the optimizer trains: a forward pre-hook,
+  first in line, that comes off when the run ends. Checkpoints land after the
+  LR scheduler instead of mid-step, rounds of a multi-node run close, and the
+  run resumes at its first forward. A round the last step made due, which no
+  forward follows, closes as the decorated function returns, so the nodes end
+  on one model. The call still works, and is still needed
+  where Ravex sees neither a dataloader nor the forward - `model.forward`
+  called directly.
+
 - **Metrics with nothing but the decorator (GPU-274).** `train/grad_norm`
   every `metrics_every` steps - the norm `clip_grad_norm_` returned, before
   the clip, when the script clips - and every `histograms_every` steps (200)

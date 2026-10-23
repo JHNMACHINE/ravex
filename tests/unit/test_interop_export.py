@@ -107,9 +107,10 @@ class TestTheOtherSide:
     def test_a_fresh_run_resumes_from_the_export(self, storage, tmp_path, monkeypatch):
         """Train, export, and start again from the export as a foreign checkpoint.
 
-        The resume lands on the first optimizer step (there is no DataLoader),
-        after that step's update — so right after it the model must hold the
-        exported weights, not the fresh ones and not one step past them.
+        There is no DataLoader, so the resume lands at the first forward of
+        the model (GPU-276) - before any step since GPU-275, which used to
+        throw that step's update away. Read where the run then stands, the
+        model must hold the exported weights, not the fresh ones.
         """
         final = train_a_store("torch_save")
         out = tmp_path / "dcp"
@@ -123,9 +124,10 @@ class TestTheOtherSide:
         def resume():
             torch.manual_seed(1)
             model = build()
-            optimizer = torch.optim.Adam(model.parameters(), lr=0.1)
-            model(torch.randn(8, 4)).sum().backward()
-            optimizer.step()
+            # Held: Ravex keeps an optimizer only while the script does.
+            optimizer = torch.optim.Adam(model.parameters(), lr=0.1)  # noqa: F841
+            with torch.no_grad():
+                model(torch.randn(8, 4))
             resumed.update(
                 {name: t.detach().clone() for name, t in model.state_dict().items()}
             )

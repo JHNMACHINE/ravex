@@ -217,6 +217,7 @@ def track(
 
         registry.register_optimizer(optimizer)
         _attach_step_hook(optimizer, runtime)
+        runtime.watch_iterations(optimizer)
     if dataloader is not None:
         registry.register_dataloader(dataloader)
     if scheduler is not None:
@@ -461,13 +462,9 @@ def checkpoint() -> bool:
 
 
 def batch_boundary() -> None:
-    """Hand Ravex the top of a training iteration.
+    """Hand Ravex the top of a training iteration. Rarely needed since GPU-276.
 
-    A loop that iterates a ``DataLoader`` never needs this: Ravex wraps the
-    iterator and takes the boundary from it. A loop over tensors that are
-    already batched has no such moment to borrow — and there is no other point
-    in the iteration that would do, because the work Ravex defers to the
-    boundary is exactly the work that must not happen inside
+    The boundary is where Ravex does the work that must not happen inside
     ``optimizer.step()``:
 
     * a **checkpoint** taken mid-step records a learning rate one step stale,
@@ -476,7 +473,12 @@ def batch_boundary() -> None:
       into the model, underneath an optimizer that has not finished its step,
       after spending however many minutes of network to fetch them.
 
-    So call it at the top of each iteration, before the batch::
+    Ravex takes it on its own: from the ``DataLoader`` iterator when there is
+    one, and otherwise from the first forward, after each step, of a model the
+    optimizer trains. What is left for this call is a loop whose iteration
+    starts somewhere those two do not see - a step that is not followed by a
+    forward of the trained model, say, or a model the optimizer was not built
+    from. There, call it at the top of each iteration, before the batch::
 
         for begin in range(0, len(data), batch_size):
             ravex.batch_boundary()
@@ -485,8 +487,8 @@ def batch_boundary() -> None:
             optimizer.step()
 
     Cheap and idempotent: with nothing due it returns having done nothing, and
-    outside an active run it does nothing at all. Calling it in a loop that
-    *does* have a DataLoader is harmless for the same reason.
+    outside an active run it does nothing at all. Calling it where Ravex
+    already takes the boundary is harmless for the same reason.
     """
     from ravex._runtime import get_runtime
 

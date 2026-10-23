@@ -57,9 +57,10 @@ PyTorch come off when that function returns or raises.
 
 When "noticed on its own" is a guess, such as two models of which only one
 trains, or an optimizer built before the function was entered, name it with
-`ravex.track(model, optimizer)`. A loop with no `DataLoader` calls
-`ravex.batch_boundary()` at the top of each iteration, since the dataloader is
-where Ravex otherwise finds the one moment a checkpoint is consistent.
+`ravex.track(model, optimizer)`. The one moment a checkpoint is consistent,
+the top of an iteration, Ravex takes from the `DataLoader` iterator or, in a
+loop without one, from the first forward of the trained model after each
+step; `ravex.batch_boundary()` hands it over by hand where neither is seen.
 
 ## Configuration
 

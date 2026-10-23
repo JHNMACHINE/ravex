@@ -1125,11 +1125,12 @@ twice. On nodes drawing from the same distribution that is invisible;
 give each node its own data and `step_weighted` costs **45% more loss** than
 the default. Leave it on `mean` unless you have measured otherwise.
 
-**A loop with no `DataLoader` has to hand over the boundary.** A round is
-closed at the top of a training iteration, never inside `optimizer.step()` —
-closing it there would write the averaged parameters into the model underneath
-an optimizer mid-step. Ravex takes that moment from the `DataLoader` iterator,
-so a loop over tensors that are already batched has to give it explicitly:
+**A round closes at the top of an iteration.** Never inside
+`optimizer.step()` — closing it there would write the averaged parameters into
+the model underneath an optimizer mid-step. Ravex takes that moment from the
+`DataLoader` iterator or, without one, from the first forward of the trained
+model after each step (GPU-276). A loop where it sees neither - one that calls
+`model.forward` directly, say - has to give it explicitly:
 
 ```python
 for begin in range(0, len(data), batch_size):
@@ -1138,9 +1139,9 @@ for begin in range(0, len(data), batch_size):
     optimizer.step()
 ```
 
-Without it no round ever closes and every node trains alone for the whole run.
-Ravex warns once, naming the call, a couple of steps after the first round
-comes due.
+Without it no round closes until the run ends - the function returning closes
+the one left due - and every node trains alone until then. Ravex warns once,
+naming the call, a couple of steps after the first round comes due.
 
 **What it needs from the launcher: a store, from one of two places.** Peer
 addresses, the job token and who is in the run live in a key-value store.
