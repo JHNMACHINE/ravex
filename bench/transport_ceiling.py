@@ -14,8 +14,9 @@ Framing plus disk, no network.
 ranks of one job: torch collectives carrying the bytes, over the framing.
 
 **prestage** - `prestage_send`/`prestage_receive`, the same store over a socket
-of our own. Rust end to end since GPU-109, including the loop; the arm exists to
-be compared against `exchange` on the same store in the same run.
+of our own: Rust from GPU-109 to GPU-267, Python since, with the disk read on a
+thread of its own; the arm exists to be compared against `exchange` on the
+same store in the same run.
 
 GPU-84 ran exactly this on 2026-08-21 (128 cores, 4 GiB in 8 files) and found
 1462 MB/s on the wire, 3411 MB/s encoding, and **529 MB/s** through the real
@@ -143,7 +144,7 @@ def arm_exchange(rank: int, source: str, destination: str, chunk: int) -> float:
 
 
 def arm_prestage(rank: int, source: str, destination: str, chunk: int) -> float:
-    """The Rust socket path, one way, on a connection this function makes.
+    """The socket path, one way, on a connection this function makes.
 
     A fresh destination each time for the same reason `arm_exchange` wipes
     one: a second round over a store that is already there measures the skip

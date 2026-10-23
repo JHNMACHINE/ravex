@@ -100,18 +100,18 @@ def install():
     # `encoded_size`: every exchange on the EU+US pair that day came back with
     # `sent_bytes: 0` beside five seconds of transfer. The socket road's
     # figure is what `prestage_send` returns - the bytes it wrote, skip list
-    # applied (`send_store` in src/transport.rs) - so it is read there, and
-    # summed, because a recovery pass can send more than once in a round.
-    original_prestage_send = _replication._core.prestage_send
+    # applied (`send_store` in ravex/_dist/transport.py) - so it is read there,
+    # and summed, because a recovery pass can send more than once in a round.
+    original_prestage_send = _replication.transport.prestage_send
     socket_sent = {"value": None}
 
-    def prestage_send(fileno, source, chunk=_replication.CHUNK):
-        written = original_prestage_send(fileno, source, chunk)
+    def prestage_send(sock, source, chunk=_replication.CHUNK):
+        written = original_prestage_send(sock, source, chunk)
         if socket_sent["value"] is not None:
             socket_sent["value"] += int(written)
         return written
 
-    _replication._core.prestage_send = prestage_send
+    _replication.transport.prestage_send = prestage_send
 
     original_exchange = _replication.exchange_stores
 

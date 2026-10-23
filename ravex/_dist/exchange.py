@@ -39,23 +39,23 @@ replication ring. Same question — "is this
 one of us" — and answering it twice is how two answers end up differing.
 
 **The bytes are moonclip's, and so is the format.** A report is written as a
-moonclip snapshot and moved with the same Rust framing the replication ring
-uses (``_core.prestage_send`` / ``prestage_receive``), manifest included. One
+moonclip snapshot and moved with the same framing the replication ring
+uses (``transport.prestage_send`` / ``prestage_receive``), manifest included. One
 directory per round on both sides, so a transfer carries exactly one report and
 nothing has to be skipped. Nothing here invents a way to write a tensor down;
 :mod:`ravex._dist.report` says why that matters and what it buys.
 
-**A deadline needs SO_RCVTIMEO, not settimeout, and this is not a style
-choice.** ``socket.settimeout`` puts the descriptor into non-blocking mode with
-the timeout enforced in Python — and the descriptor is then handed to Rust,
-where every read comes straight back as "would block". ``RingLink`` knows this
-and answers it with ``settimeout(None)``, which is why *the replication
-transport has no deadline at all* once bytes start moving. That was tolerable
-there. Here the deadline is the entire mechanism, so the socket stays blocking
-and the bound is set on the kernel with ``SO_RCVTIMEO``/``SO_SNDTIMEO``:
-measured on 2026-09-06, a stalled peer aborts the Rust transfer at 1.50 s
-against a 1.5 s bound, where ``settimeout`` aborted it at 0.00 s having
-transferred nothing.
+**A deadline is SO_RCVTIMEO, not settimeout.** It became that while the
+transport was Rust (GPU-109 to GPU-267): ``socket.settimeout`` puts the
+descriptor into non-blocking mode with the timeout enforced in Python, and a
+descriptor handed to Rust came straight back as "would block". The transport
+is Python again and would honour ``settimeout``, but the kernel's bound is the
+one that was measured - a stalled peer aborted the transfer at 1.50 s against
+a 1.5 s bound, on 2026-09-06 - and it bounds every read and write of the
+socket the same way, whoever makes them. ``RingLink`` still clears its timeout
+with ``settimeout(None)``, which is why *the replication transport has no
+deadline at all* once bytes start moving. That is tolerable there; here the
+deadline is the entire mechanism.
 """
 
 from __future__ import annotations
@@ -974,22 +974,25 @@ def adopt_outer_state(loop, exchange: "DeltaExchange", source: int, rank: int,
     return True
 
 
-def _rust_core():
-    """Ravex's own transport, the same one the replication ring is framed by."""
-    from ravex import _core
+def _transport():
+    """Ravex's own transport, the same one the replication ring is framed by.
+    A function so a test can put a slow one in its place."""
+    from ravex._dist import transport
 
-    return _core
+    return transport
 
 
 def set_deadline(sock, seconds: float) -> None:
     """Bound every read and write on ``sock``, **keeping it blocking**.
 
-    ``settimeout`` cannot be used for this. It makes the descriptor
-    non-blocking and enforces the timeout in Python, and the descriptor is then
-    handed to the Rust transport, where the first read returns "would block"
-    immediately — measured at 0.00 s on 2026-09-06, having moved nothing.
+    Not ``settimeout``, which made the descriptor non-blocking while the
+    transport was Rust, and the first read there returned "would block"
+    immediately - measured at 0.00 s on 2026-09-06, having moved nothing.
     ``SO_RCVTIMEO``/``SO_SNDTIMEO`` is the kernel's own bound and leaves the
-    socket blocking: the same test aborted at 1.50 s against a 1.5 s bound.
+    socket blocking: the same test aborted at 1.50 s against a 1.5 s bound. It
+    stays the bound now that the transport is Python (GPU-267): it is the one
+    that was measured, and a timeout error from it is an ``OSError`` like any
+    other the callers already catch.
 
     Windows takes a DWORD of milliseconds where everything else takes a
     ``timeval``, which is the whole reason this is a function.
@@ -1715,9 +1718,8 @@ class DeltaExchange:
                 )
                 return None
 
-            # From here the descriptor belongs to the Rust transport, so the
-            # bound has to be one the kernel enforces on a blocking socket -
-            # see `set_deadline`. The socket-level `timeout` set by
+            # From here the transport has the socket, and the bound is one the
+            # kernel enforces on a blocking socket - see `set_deadline`. The socket-level `timeout` set by
             # `create_connection` is cleared for the same reason.
             connection.settimeout(None)
             set_deadline(connection, max(1.0, deadline - time.monotonic()))
@@ -1727,8 +1729,7 @@ class DeltaExchange:
                 if kind == KIND_STATE
                 else self._peer_round_path(source, round_number)
             )
-            _core = _rust_core()
-            if not _core.prestage_receive(connection.fileno(), destination):
+            if not _transport().prestage_receive(connection, destination):
                 return None
         except (OSError, _socket.timeout):
             return None
@@ -1941,14 +1942,14 @@ class DeltaExchange:
                 connection.sendall(
                     RESPONSE.pack(acknowledgement, OK, 0)
                 )
-                # The descriptor goes to Rust from here, so the bound has to be
-                # the kernel's - see `set_deadline`.
+                # The transport has the socket from here, and the bound is the
+                # kernel's - see `set_deadline`.
                 connection.settimeout(None)
                 set_deadline(connection, SERVE_PATIENCE)
                 # No lock (GPU-119): `wanted` is a directory nothing writes to
                 # any more, and the hold above is what keeps retention off it.
-                _rust_core().prestage_send(
-                    connection.fileno(),
+                _transport().prestage_send(
+                    connection,
                     _report.round_path(self.mine_path, wanted),
                     CHUNK,
                 )
@@ -1991,8 +1992,8 @@ class DeltaExchange:
             connection.sendall(RESPONSE.pack(acknowledgement, OK, 0))
             connection.settimeout(None)
             set_deadline(connection, SERVE_PATIENCE)
-            _rust_core().prestage_send(
-                connection.fileno(), _report.round_path(root, wanted), CHUNK
+            _transport().prestage_send(
+                connection, _report.round_path(root, wanted), CHUNK
             )
         finally:
             with self._lock:
@@ -2024,8 +2025,8 @@ class DeltaExchange:
         connection.sendall(RESPONSE.pack(acknowledgement, OK, 0))
         connection.settimeout(None)
         set_deadline(connection, SERVE_PATIENCE)
-        _rust_core().prestage_send(
-            connection.fileno(),
+        _transport().prestage_send(
+            connection,
             _report.round_path(self.state_path, wanted),
             CHUNK,
         )

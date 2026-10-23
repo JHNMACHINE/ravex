@@ -12,6 +12,16 @@
   `access_key`, `secret_key`, `session_token` and `resolve_credentials`.
   Needs the Moonclip that reads them.
 
+- **The store transport is Python again (GPU-267).** Replication rounds,
+  the pre-staging of a node that joins and `exchange_stores` move stores
+  through `ravex/_dist/transport.py` instead of `src/transport.rs`, with the
+  same wire format, so nodes of this version and of 0.7.8 still understand
+  each other. The two things the Rust bought are kept: the receiving buffer
+  has a cursor instead of a memmove per file (GPU-84), and the disk is read
+  on a thread of its own, overlapping the socket. On Windows loopback, 1 GiB
+  in 8 files: 1508 MB/s, against 977 for the Rust. `prestage_send` and
+  `prestage_receive` take the socket, not its descriptor.
+
 ### Removed
 
 - **`ravex cache` and the S3 client in the compiled core (GPU-267).** The

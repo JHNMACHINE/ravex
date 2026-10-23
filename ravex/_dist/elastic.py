@@ -108,7 +108,7 @@ import socket as _socket
 import struct
 from typing import Any, List, Optional
 
-from ravex import _core
+from ravex._dist import transport
 
 _JOIN_KEY = "gpu94/join/%d"
 
@@ -224,7 +224,7 @@ def prestage_send(sock, source: str, chunk: int = 1 << 20) -> int:
     ``replicate_every``-style periodic re-syncs bring the candidate closer,
     without paying a new TCP handshake for every round.
     """
-    return _core.prestage_send(sock.fileno(), source, chunk)
+    return transport.prestage_send(sock, source, chunk)
 
 
 def prestage_receive(sock, destination: str) -> bool:
@@ -242,7 +242,7 @@ def prestage_receive(sock, destination: str) -> bool:
     does not close its end after a round precisely so the same connection
     can carry the next one.
     """
-    return _core.prestage_receive(sock.fileno(), destination)
+    return transport.prestage_receive(sock, destination)
 
 
 # --------------------------------------------------------------------------

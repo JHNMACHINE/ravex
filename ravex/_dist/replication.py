@@ -97,75 +97,27 @@ import socket as _socket
 import threading
 import time
 
-from ravex import _core
+from ravex._dist import transport
 
 logger = logging.getLogger("ravex")
 
-#: Bytes per chunk on the wire. Bounded on purpose: a real shard is over a
-#: gigabyte, and a whole-store buffer would be that allocation on the training
-#: process at checkpoint time — on top of the shadow copy and whatever the
-#: allocator is already holding. Host memory pressure right there is measured,
-#: not hypothetical; it is what GPU-54 turned out to be.
-CHUNK = _core.CHUNK
-
-# ─── the framing, which is Rust since GPU-109 ───────────────────────────────
+# ─── the framing, in `ravex._dist.transport` ────────────────────────────────
 #
 # `store_files`, the two manifest encodings, `encoded_size`, `encode_store` and
-# `StoreWriter` were written here until GPU-109 and are now names over
-# `ravex._core`. **The format did not change and could not**: a replica written
-# by one version is read back by another, and `exchange_stores` below still
-# moves its bytes over torch collectives through this same framing. It is
-# little-endian throughout — a `<I` count, then `<HQ` plus the name plus a `<B`
-# flag per entry, then the bodies — and `src/transport.rs` is where it lives
-# now.
-#
-# Why they moved is measured rather than assumed, which is the rule GPU-105 set
-# itself and did not follow. Two numbers:
-#
-# * The receiving side buffered every chunk and then did `del pending[:take]`,
-#   a memmove of the tail at every file boundary. The transfer fell from
-#   529 MB/s to 113 MB/s as the chunk grew from 4 to 64 MiB — GPU-84, and the
-#   wrong way round for a block transfer. The Rust holds a cursor instead.
-# * Reading the disk and writing the socket took turns. Measured 2026-09-05
-#   with `bench/transport_ceiling.py`: 1.2 GB/s reading and framing, 4.5 GB/s
-#   on the wire, 0.99 GB/s for the two of them alternating. The Rust reads on
-#   its own thread, bounded to three chunks ahead.
-#
-# The names keep the leading underscores they had. This module's surface is
-# unchanged, `ravex/_dist/elastic.py` imports two of them, and the test suite
-# that covers them was written against the Python and has not been touched.
+# `StoreWriter` were written here until GPU-109, were Rust until GPU-267, and
+# live in `transport` now, which says what the format is and what it must not
+# become. The names keep the leading underscores they had: this module's
+# surface is unchanged, and the test suite that covers it is the one that held
+# the Rust to the Python and the Python back to the Rust.
 
-store_files = _core.store_files
-_encode_manifest = _core.encode_manifest
-_parse_manifest = _core.parse_manifest
-encoded_size = _core.encoded_size
-StoreWriter = _core.StoreWriter
-
-
-def encode_store(path: str, chunk: int = CHUNK, skip: "set[str] | None" = None):
-    """Yield a store as a byte stream, reading from disk as it goes.
-
-    An iterator rather than a buffer, and read file by file rather than packed
-    into a temporary archive first: the archive would be a second full copy on
-    a disk that is already the binding constraint on these machines — the
-    reason ``measure_handoff.sh`` has space guards at all.
-
-    ``skip`` names files whose bytes must not be read or sent — the peer
-    already holds them, byte for byte, and said so before this call. They are
-    still listed in the header, flagged, so the receiver's manifest and pruning
-    stay exactly as complete as a full transfer's; only the body is shorter.
-
-    A function wrapping the class rather than the class itself, so the
-    signature, the defaults and this docstring stay where a reader of this
-    module will look for them.
-    """
-    return _core.StoreEncoder(path, chunk, skip)
-
-
-#: Written last, deleted first. A replica directory is only trustworthy while
-#: this is present: everything else about it — the files, their names, even a
-#: manifest — is equally true of a copy that was cut off half way.
-COMPLETE_MARKER = _core.COMPLETE_MARKER
+CHUNK = transport.CHUNK
+COMPLETE_MARKER = transport.COMPLETE_MARKER
+store_files = transport.store_files
+_encode_manifest = transport.encode_manifest
+_parse_manifest = transport.parse_manifest
+encoded_size = transport.encoded_size
+encode_store = transport.encode_store
+StoreWriter = transport.StoreWriter
 
 
 def replica_is_complete(path: str) -> bool:
@@ -555,10 +507,10 @@ class RingLink:
                         connection.sendall(
                             cls._proof(secret, b"ravex-ring-ack", nonce, peer, rank)
                         )
-                        # Blocking from here on: the descriptor goes to the
-                        # core, and a socket with a timeout is non-blocking
-                        # underneath, where every read would come back as
-                        # "would block".
+                        # Blocking from here on, as since the transport was
+                        # Rust (GPU-109): a round has no deadline once bytes
+                        # start moving, and a peer that dies shows up as a
+                        # reset rather than a timeout.
                         connection.settimeout(None)
                         accepted[peer] = connection
                     except OSError as exc:
@@ -772,7 +724,7 @@ class RingLink:
 
         def pull():
             try:
-                outcome["ok"] = _core.prestage_receive(pull_on.fileno(), destination)
+                outcome["ok"] = transport.prestage_receive(pull_on, destination)
             except BaseException as exc:  # re-raised on the caller's thread
                 outcome["error"] = exc
 
@@ -783,7 +735,7 @@ class RingLink:
 
         try:
             if source is not None:
-                _core.prestage_send(push_on.fileno(), source, chunk)
+                transport.prestage_send(push_on, source, chunk)
         finally:
             if thread is not None:
                 thread.join()
@@ -824,7 +776,7 @@ def exchange_stores(
     """Trade one store for another around the ring.
 
     Two roads under one name since GPU-109. With a :class:`RingLink` the bytes
-    go over Ravex's own sockets, framed by the Rust core; without one they go
+    go over Ravex's own sockets, framed by `ravex._dist.transport`; without one they go
     over torch collectives exactly as they always have. The result is the same
     either way — the same framing, the same skip list, the same replica on the
     receiving disk — and the runtime decides which road on `link` alone.

@@ -447,16 +447,16 @@ def test_a_publish_does_not_wait_for_a_fetch_in_flight(nodes, monkeypatch):
 
     class SlowCore:
         @staticmethod
-        def prestage_send(fileno, source, chunk):
+        def prestage_send(sock, source, chunk):
             serving.set()
             time.sleep(2.0)
             return 0
 
         @staticmethod
-        def prestage_receive(fileno, destination):
+        def prestage_receive(sock, destination):
             return False
 
-    monkeypatch.setattr(exchange_module, "_rust_core", lambda: SlowCore)
+    monkeypatch.setattr(exchange_module, "_transport", lambda: SlowCore)
 
     fetching = threading.Thread(
         target=one.gather,

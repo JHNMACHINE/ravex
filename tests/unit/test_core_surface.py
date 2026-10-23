@@ -24,13 +24,9 @@ from ravex._dist import reshard
 
 PACKAGE = Path(__file__).resolve().parents[2] / "ravex"
 STUB = PACKAGE / "_core.pyi"
-#: The modules that stand in front of the transport half of the core. Two,
-#: because the framing is `replication`'s and the socket that carries it
-#: between machines is `elastic`'s.
-SHIMS = (
-    PACKAGE / "_dist" / "replication.py",
-    PACKAGE / "_dist" / "elastic.py",
-)
+#: The modules that stand in front of the core besides `reshard`: none since
+#: the transport went back to Python (GPU-267).
+SHIMS = ()
 
 #: Not part of the exported surface: dunders, and the version the extension
 #: carries for `test_version_is_single.py` to check.
