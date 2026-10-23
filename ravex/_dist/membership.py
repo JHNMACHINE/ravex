@@ -774,7 +774,9 @@ def apply_state(loop, payload: Dict[str, object]) -> None:
         elif key == MODEL_STEPS_KEY:
             loop.model_steps = int(value.item() if hasattr(value, "item") else value)
         elif key == INNER_STEPS_KEY:
-            current, pending = (int(v) for v in value.tolist())
+            import torch
+
+            current, pending = (int(v) for v in torch.as_tensor(value).tolist())
             if current and getattr(loop, "inner_steps", None) is not None:
                 loop.inner_steps = current
                 loop.pending_inner_steps = pending or None

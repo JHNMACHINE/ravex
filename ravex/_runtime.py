@@ -1820,7 +1820,7 @@ class RavexRuntime:
             self._save_outer_state(self._outer)
             return
 
-        store.set(_FAILOVER_ROUND_KEY % node, str(mine).encode("utf-8"))
+        store.set(_FAILOVER_ROUND_KEY % node, str(mine))
         keys = [_FAILOVER_ROUND_KEY % other for other in range(base)]
         while not store.check(keys):
             if time.monotonic() >= deadline:
@@ -3984,7 +3984,7 @@ class RavexRuntime:
                 "SIGTERM on this rank before any checkpoint was timed: no "
                 "estimate of what the coordinated save costs, attempting it."
             )
-        elif declined:
+        elif declined and notice is not None:
             logger.warning(
                 "SIGTERM on this rank. The last checkpoint took %ss and "
                 "preemption_notice is %ss, so a coordinated save would be "

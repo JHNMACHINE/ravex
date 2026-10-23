@@ -486,10 +486,11 @@ PROBE_TIMEOUT = 5.0
 STAGGER = 3.0
 
 
-def candidates(value: str) -> List[str]:
+def candidates(value: Optional[str]) -> List[str]:
     """The addresses ``outer_rendezvous`` names, in order: one or several,
-    separated by commas. The first is where the run starts."""
-    found = [part.strip() for part in str(value).split(",") if part.strip()]
+    separated by commas. The first is where the run starts. Unset, it names
+    none, and says so rather than trying to parse ``"None"``."""
+    found = [part.strip() for part in str(value or "").split(",") if part.strip()]
     for address in found:
         parse_address(address)
     if not found:

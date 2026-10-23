@@ -428,6 +428,7 @@ def combine(contributions: List[Contribution], mode: str = "mean") -> ParamMap:
                     continue
                 term = contribution.delta[name].to(torch.float32) * weight
                 acc = term if acc is None else acc.add_(term)
+            assert acc is not None  # some weight is above zero, checked above
             combined[name] = acc.mul_(scale / denominator)
     return combined
 
