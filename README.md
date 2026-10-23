@@ -150,6 +150,42 @@ compression; background writes; direct S3/R2 sync.
 thread. Used automatically when Moonclip is not installed. Correct, just larger
 and slower.
 
+### Ravex and Moonclip
+
+**Saving files is Moonclip's, the run is Ravex's** (GPU-267). Ravex decides
+when to save and what, puts it back into the live objects on resume, and
+coordinates one or more machines. Moonclip decides how the bytes land and
+where, bucket keys included. Ravex is pure Python and has no storage code of
+its own: no S3 client, no credentials.
+
+```
+your training script
+        │  @ravex.train_loop
+        ▼
+Ravex     when to save and what: model, optimizer, scheduler, scaler,
+          dataloader position, RNG; resume into the live objects;
+          HF Trainer, Lightning, DeepSpeed, DCP. And the run on one or
+          more machines: rendezvous, joiners, the replication ring,
+          the store transport, reshard planning
+        │  named tensors, a step, metadata
+        ▼
+Moonclip  how the bytes land: deltas, compression, packs, the manifest,
+          integrity, retention, the sync to a bucket and its keys
+        │
+        ▼
+local disk  ·  S3 / R2 bucket
+```
+
+Ravex does copy a store's files between machines - the replication ring, and a
+node joining a run - but as opaque files: it never reads or writes what is in
+them. Its own small records (`run.json`, metrics, the audit log) sit beside
+the checkpoints, and Moonclip carries them to the bucket.
+
+Configuration follows the same line: `storage` in `ravex.yaml` says where the
+bucket is ([configuration.md](docs/configuration.md#storage)); the keys and
+Moonclip's tuning are in
+[Moonclip's README](https://github.com/JHNMACHINE/moonclip#s3-backend).
+
 ## How it works
 
 Ravex patches five things in PyTorch and nothing in your code:
