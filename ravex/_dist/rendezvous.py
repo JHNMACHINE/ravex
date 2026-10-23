@@ -630,7 +630,7 @@ def elect(addresses: List[str], member: Optional[int], job: str, epoch: int,
             else:
                 process = host(mine)
                 store = connect(mine, epoch_job(job, epoch), timeout=timeout)
-                store.set(EPOCH_KEY, str(int(epoch)).encode("utf-8"))
+                store.set(EPOCH_KEY, str(int(epoch)))
                 # A candidate placed before this one may have opened its own
                 # while this one's was starting - a server takes a second or
                 # two to listen, and the probe above saw nothing. The run
@@ -670,7 +670,7 @@ def opened(address: str, job: str, epoch: int, store) -> None:
     record of the job that it is the epoch this server is on."""
     store.set(OPEN_KEY, b"1")
     if epoch:
-        connect(address, job, timeout=PROBE_TIMEOUT).set(CURRENT_KEY, str(int(epoch)).encode("utf-8"))
+        connect(address, job, timeout=PROBE_TIMEOUT).set(CURRENT_KEY, str(int(epoch)))
 
 
 def current(addresses: List[str], job: str, deadline: float, timeout: float = 300.0):
