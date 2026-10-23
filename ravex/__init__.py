@@ -44,7 +44,7 @@ from ravex._dist.membership import RunOver as _RunOver
 
 #: The version, and the only place it is written: the wheel's metadata reads it
 #: from here (``[tool.hatch.version]`` in ``pyproject.toml``) since GPU-267.
-__version__ = "0.7.8"
+__version__ = "0.8.0"
 
 __all__ = [
     "batch_boundary",

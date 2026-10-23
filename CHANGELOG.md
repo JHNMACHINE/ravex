@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.0 — 2026-10-23
 
 ### Changed
 
@@ -10,7 +10,8 @@
   `MOONCLIP_S3_SESSION_TOKEN`, or the `AWS_*` names. **`RAVEX_S3_*` is no
   longer read**: rename those variables. `StorageConfig` loses
   `access_key`, `secret_key`, `session_token` and `resolve_credentials`.
-  Needs the Moonclip that reads them.
+  Needs Moonclip 0.3.1, the first that reads them: `ravex[moonclip]` now
+  asks for it.
 
 - **The store transport is Python again (GPU-267).** Replication rounds,
   the pre-staging of a node that joins and `exchange_stores` move stores
