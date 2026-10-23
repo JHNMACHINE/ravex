@@ -2550,7 +2550,6 @@ class RavexRuntime:
             storage.type = "s3"
         storage.bucket, storage.prefix = bucket
         storage.path = staging
-        storage.resolve_credentials()
         config.backend = "moonclip"
         config.fork_from = None
         parent = MoonclipBackend(config)

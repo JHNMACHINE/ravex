@@ -80,10 +80,10 @@ AUDIT_FILE = "audit.jsonl"
 #: Written into the chain's first entry as its predecessor.
 GENESIS = "0" * 64
 
-#: Configuration fields that never enter the digest. Credentials, because the
-#: digest is meant to be shared; the rest because they say where the config
-#: came from rather than what it is.
-_EXCLUDED_CONFIG = {"access_key", "secret_key", "metrics_token", "source", "problems"}
+#: Configuration fields that never enter the digest. The metrics token,
+#: because the digest is meant to be shared; the rest because they say where
+#: the config came from rather than what it is.
+_EXCLUDED_CONFIG = {"metrics_token", "source", "problems"}
 
 _CHUNK = 8 * 1024 * 1024
 

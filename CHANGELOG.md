@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **Ravex no longer reads a bucket's keys (GPU-267).** Moonclip, which
+  writes to the bucket, reads them from its environment:
+  `MOONCLIP_S3_ACCESS_KEY` / `MOONCLIP_S3_SECRET_KEY` /
+  `MOONCLIP_S3_SESSION_TOKEN`, or the `AWS_*` names. **`RAVEX_S3_*` is no
+  longer read**: rename those variables. `StorageConfig` loses
+  `access_key`, `secret_key`, `session_token` and `resolve_credentials`.
+  Needs the Moonclip that reads them.
+
 ## 0.7.8 — 2026-10-22
 
 ### Fixed

@@ -127,8 +127,9 @@ the file — so a scheduler can override a config committed to the repository:
 RAVEX_CHECKPOINT_EVERY=100 RAVEX_STORAGE_TYPE=r2 RAVEX_STORAGE_BUCKET=runs python train.py
 ```
 
-Credentials are never read from the config file. Set `RAVEX_S3_ACCESS_KEY` /
-`RAVEX_S3_SECRET_KEY`, or the usual `AWS_*` pair.
+Credentials are never read from the config file, nor by Ravex: Moonclip,
+which writes to the bucket, reads `MOONCLIP_S3_ACCESS_KEY` /
+`MOONCLIP_S3_SECRET_KEY`, or the usual `AWS_*` pair.
 
 Full reference: [docs/configuration.md](docs/configuration.md).
 

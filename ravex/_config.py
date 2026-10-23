@@ -193,6 +193,10 @@ class StorageConfig:
 
     ``type`` is ``local``, ``s3`` or ``r2``. ``r2`` is S3-compatible and only
     differs in that a custom endpoint is mandatory.
+
+    No keys: Moonclip reads a bucket's from its environment itself
+    (``MOONCLIP_S3_*``, or ``AWS_*``), because saving files is Moonclip's and
+    the run is Ravex's (GPU-267). Ravex only says where the bucket is.
     """
 
     type: str = "local"
@@ -201,36 +205,11 @@ class StorageConfig:
     prefix: str = ""
     endpoint: Optional[str] = None
     region: str = "us-east-1"
-    access_key: Optional[str] = None
-    secret_key: Optional[str] = None
-    #: The third part of temporary credentials, which a bucket hands out
-    #: scoped to one bucket or one prefix and for a time: with them the keys
-    #: above sign nothing on their own.
-    session_token: Optional[str] = None
     path_style: bool = False
 
     @property
     def is_remote(self) -> bool:
         return self.type in ("s3", "r2")
-
-    def resolve_credentials(self) -> None:
-        """Fill missing credentials from the environment.
-
-        Credentials are never expected in ``ravex.yaml`` — that file lives
-        in the user's repository.
-        """
-        if self.access_key is None:
-            self.access_key = os.environ.get(
-                "RAVEX_S3_ACCESS_KEY"
-            ) or os.environ.get("AWS_ACCESS_KEY_ID")
-        if self.secret_key is None:
-            self.secret_key = os.environ.get(
-                "RAVEX_S3_SECRET_KEY"
-            ) or os.environ.get("AWS_SECRET_ACCESS_KEY")
-        if self.session_token is None:
-            self.session_token = os.environ.get(
-                "RAVEX_S3_SESSION_TOKEN"
-            ) or os.environ.get("AWS_SESSION_TOKEN") or None
 
 
 @dataclass
@@ -807,7 +786,6 @@ class RavexConfig:
             config.source = str(path)
             config._apply_mapping(_read_yaml(path))
         config._apply_env()
-        config.storage.resolve_credentials()
         config._normalize()
         return config
 
@@ -833,9 +811,8 @@ class RavexConfig:
 
         Unknown keys are refused rather than dropped, and the field list is the
         dataclass's own rather than ``hasattr``: ``is_remote`` is a property
-        with no setter and ``resolve_credentials`` is a method, so ``hasattr``
-        accepts both and then assigning to the first raises from a place that
-        has nothing to do with configuration.
+        with no setter, so ``hasattr`` accepts it and then assigning to it
+        raises from a place that has nothing to do with configuration.
         """
         if isinstance(value, StorageConfig):
             self.storage = value

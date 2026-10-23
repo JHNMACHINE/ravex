@@ -137,10 +137,10 @@ class TestFingerprints:
 
 
 class TestConfigDigest:
-    def test_credentials_do_not_enter_it(self):
+    def test_the_metrics_token_does_not_enter_it(self):
         one, two = RavexConfig(), RavexConfig()
-        one.storage.secret_key = "hunter2"
-        two.storage.secret_key = "correct horse"
+        one.metrics_token = "hunter2"
+        two.metrics_token = "correct horse"
         assert audit.config_digest(one) == audit.config_digest(two)
 
     def test_a_setting_that_matters_does(self):

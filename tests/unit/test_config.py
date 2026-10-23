@@ -75,15 +75,18 @@ def test_remote_storage_without_a_bucket_degrades_to_local(monkeypatch):
     assert config.storage.type == "local"
 
 
-def test_credentials_come_from_the_environment(monkeypatch):
+def test_the_config_holds_no_keys(monkeypatch):
+    """A bucket's keys are Moonclip's to read (GPU-267): the config that is
+    written into the audit trail and the run document has nowhere to put
+    them."""
     monkeypatch.setenv("RAVEX_STORAGE_TYPE", "r2")
     monkeypatch.setenv("RAVEX_STORAGE_BUCKET", "runs")
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "ak")
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "sk")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "the-access-key")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "the-secret-key")
 
     config = RavexConfig.load()
     assert config.storage.is_remote
-    assert (config.storage.access_key, config.storage.secret_key) == ("ak", "sk")
+    assert "the-access-key" not in repr(config) and "the-secret-key" not in repr(config)
 
 
 def test_a_truncated_config_does_not_stop_ravex(tmp_path, monkeypatch):
@@ -367,7 +370,7 @@ def test_a_property_on_storage_is_not_something_to_assign_to():
     """`hasattr` accepts `is_remote` and assigning to it raises from nowhere.
 
     The field list is the dataclass's own for this reason: `is_remote` is a
-    property with no setter and `resolve_credentials` is a method.
+    property with no setter.
     """
     config = RavexConfig()
     config.apply_storage({"is_remote": True})

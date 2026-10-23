@@ -645,11 +645,15 @@ rather than failing the run.
 
 ### Credentials
 
-Never in `ravex.yaml` — that file lives in the user's repository. Ravex reads,
-in order:
+Never in `ravex.yaml` — that file lives in the user's repository — and not
+read by Ravex at all: Moonclip, which writes to the bucket, reads them from
+the environment, in order:
 
-1. `RAVEX_S3_ACCESS_KEY` / `RAVEX_S3_SECRET_KEY`
-2. `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`
+1. `MOONCLIP_S3_ACCESS_KEY` / `MOONCLIP_S3_SECRET_KEY`
+   (and `MOONCLIP_S3_SESSION_TOKEN` for temporary credentials)
+2. `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (and `AWS_SESSION_TOKEN`)
+
+Each pair is taken whole from one of the two. See Moonclip's README.
 
 ### Audit trail
 

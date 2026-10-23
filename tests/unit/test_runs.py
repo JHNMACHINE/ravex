@@ -103,8 +103,8 @@ class TestTheDocument:
         assert ravex.runs.describe(str(storage))["run_id"] == born
 
     def test_credentials_never_reach_the_document(self, storage, monkeypatch):
-        monkeypatch.setenv("RAVEX_S3_ACCESS_KEY", "AKIAsecret")
-        monkeypatch.setenv("RAVEX_S3_SECRET_KEY", "shhh")
+        monkeypatch.setenv("MOONCLIP_S3_ACCESS_KEY", "AKIAsecret")
+        monkeypatch.setenv("MOONCLIP_S3_SECRET_KEY", "shhh")
 
         @ravex.train_loop(backend="torch_save", checkpoint_every=10_000)
         def train():

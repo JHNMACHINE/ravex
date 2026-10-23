@@ -512,20 +512,18 @@ class TestSaveDtypeNeedsANewEnoughMoonclip:
 
         assert not any("needs Moonclip" in r.message for r in caplog.records)
 
-# ─── temporary credentials reach Moonclip ───────────────────────────
+# ─── a bucket's keys are Moonclip's ─────────────────────────────────
 
 
 class _Built(Exception):
     """Raised by the stand-in manager once it has what it was given."""
 
 
-@pytest.mark.parametrize("token", [None, "the-token"])
 @pytest.mark.skipif(not HAVE_MOONCLIP, reason="moonclip not installed")
-def test_a_session_token_goes_to_moonclip_with_the_keys(tmp_path, monkeypatch, token):
-    """Temporary credentials sign nothing without their session token: a
-    bucket that hands out ones scoped to a prefix gets a store that can
-    write there only with all three. Without one, nothing is passed, so a
-    Moonclip from before 0.2.0 still takes permanent keys."""
+def test_no_keys_go_to_moonclip(tmp_path, monkeypatch):
+    """Ravex says where the bucket is and nothing about its keys: Moonclip
+    reads them from the environment itself (GPU-267). Keys passed from here
+    would be a second lookup that can disagree with Moonclip's."""
     import moonclip
 
     from ravex._backends import MoonclipBackend
@@ -537,21 +535,13 @@ def test_a_session_token_goes_to_moonclip_with_the_keys(tmp_path, monkeypatch, t
         raise _Built()
 
     monkeypatch.setattr(moonclip, "MoonclipManager", manager)
-    monkeypatch.setenv("RAVEX_S3_ACCESS_KEY", "key")
-    monkeypatch.setenv("RAVEX_S3_SECRET_KEY", "secret")
-    monkeypatch.delenv("AWS_SESSION_TOKEN", raising=False)
-    if token:
-        monkeypatch.setenv("RAVEX_S3_SESSION_TOKEN", token)
-    else:
-        monkeypatch.delenv("RAVEX_S3_SESSION_TOKEN", raising=False)
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "key")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret")
+    monkeypatch.setenv("AWS_SESSION_TOKEN", "token")
     config = make_config(tmp_path, backend="moonclip")
     config.storage.type, config.storage.bucket = "s3", "runs"
-    config.storage.resolve_credentials()
 
     with pytest.raises(_Built):
         MoonclipBackend(config)
-    assert given["s3_access_key"] == "key"
-    if token:
-        assert given["s3_session_token"] == token
-    else:
-        assert "s3_session_token" not in given
+    assert given["s3_bucket"] == "runs"
+    assert not any(name in given for name in ("s3_access_key", "s3_secret_key", "s3_session_token"))

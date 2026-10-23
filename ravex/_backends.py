@@ -363,19 +363,13 @@ class MoonclipBackend(CheckpointBackend):
             )
 
         if storage.is_remote:
-            if not (storage.access_key and storage.secret_key):
-                raise ValueError(
-                    "storage.type is %r but no credentials were found. Set "
-                    "RAVEX_S3_ACCESS_KEY / RAVEX_S3_SECRET_KEY (or "
-                    "AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY)." % storage.type
-                )
+            # No keys: Moonclip reads them from the environment, and says
+            # which variables it looked for when there are none (GPU-267).
             kwargs.update(
                 s3_bucket=storage.bucket,
                 s3_region=storage.region,
                 s3_prefix=storage.prefix,
                 s3_endpoint=storage.endpoint,
-                s3_access_key=storage.access_key,
-                s3_secret_key=storage.secret_key,
                 s3_path_style=storage.path_style,
                 # To the bucket every `checkpoint_every` steps. With a save
                 # per step that is this many saves; with a save per
@@ -391,11 +385,6 @@ class MoonclipBackend(CheckpointBackend):
                     config.checkpoint_every if self.saves_every_step else 1
                 ),
             )
-
-        if storage.is_remote and storage.session_token:
-            # Only when there is one: a Moonclip before 0.2.0 takes no such
-            # keyword, and permanent keys need none.
-            kwargs["s3_session_token"] = storage.session_token
 
         # `MoonclipManager`, not `CheckpointManager`. The latter is Moonclip's
         # convenience layer: it reads RANK/WORLD_SIZE from the environment when

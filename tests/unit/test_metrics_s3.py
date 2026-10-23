@@ -56,8 +56,8 @@ def remote(monkeypatch, tmp_path):
     monkeypatch.setenv("RAVEX_STORAGE_PREFIX", prefix)
     monkeypatch.setenv("RAVEX_STORAGE_ENDPOINT", ENDPOINT)
     monkeypatch.setenv("RAVEX_STORAGE_PATH_STYLE", "true")
-    monkeypatch.setenv("RAVEX_S3_ACCESS_KEY", ACCESS)
-    monkeypatch.setenv("RAVEX_S3_SECRET_KEY", SECRET)
+    monkeypatch.setenv("MOONCLIP_S3_ACCESS_KEY", ACCESS)
+    monkeypatch.setenv("MOONCLIP_S3_SECRET_KEY", SECRET)
     return prefix
 
 

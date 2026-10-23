@@ -45,7 +45,7 @@ FORMAT_VERSION = 1
 #: Configuration fields that never reach disk here. The same list the audit
 #: trail scrubs, for the same reason: this file is meant to be read by a
 #: dashboard, which means it is meant to be shared.
-_EXCLUDED = {"access_key", "secret_key", "metrics_token", "source", "problems"}
+_EXCLUDED = {"metrics_token", "source", "problems"}
 
 
 def new_run_id() -> str:

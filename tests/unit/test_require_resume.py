@@ -84,8 +84,6 @@ class TestCheckpointsReachTheBucketAsTheyAreWritten:
         config.storage.type = "s3"
         config.storage.bucket = "runs"
         config.storage.endpoint = "http://127.0.0.1:1"
-        config.storage.access_key = "key"
-        config.storage.secret_key = "secret"
         for name, value in settings.items():
             setattr(config, name, value)
         config._normalize()
