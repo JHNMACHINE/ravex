@@ -57,8 +57,10 @@ _failed = False
 def _tilelang():
     """``(tilelang, T)`` or None, decided once per process."""
     try:
-        import tilelang
-        import tilelang.language as T
+        # Optional, and absent wherever the kernels cannot run: a type checker
+        # without it installed has nothing to resolve.
+        import tilelang  # pyright: ignore[reportMissingImports]
+        import tilelang.language as T  # pyright: ignore[reportMissingImports]
     except Exception as exc:  # ImportError, or a broken CUDA toolchain
         logger.debug("TileLang is not usable here (%s); using the torch path", exc)
         return None
@@ -116,11 +118,14 @@ def program(bits: int, group: int, in_dtype: str, N: int = ROW):
 
     M = T.symbolic("M")
 
+    # TileLang's annotations are its own language - a shape and a dtype a
+    # buffer is compiled for - and not Python types; pyright reads them as
+    # the latter.
     @T.prim_func
     def quant(
-        X: T.Tensor[(M, N), in_dtype],
-        Y: T.Tensor[(M, N), code_dtype],
-        S: T.Tensor[(M, T.ceildiv(N, group)), FE8M0],
+        X: T.Tensor[(M, N), in_dtype],  # pyright: ignore[reportInvalidTypeForm, reportGeneralTypeIssues]
+        Y: T.Tensor[(M, N), code_dtype],  # pyright: ignore[reportInvalidTypeForm, reportGeneralTypeIssues]
+        S: T.Tensor[(M, T.ceildiv(N, group)), FE8M0],  # pyright: ignore[reportInvalidTypeForm, reportGeneralTypeIssues]
     ):
         with T.Kernel(T.ceildiv(M, blk_m), T.ceildiv(N, group), threads=128) as (pid_m, pid_n):
             x_shared = T.alloc_shared((blk_m, group), in_dtype)
