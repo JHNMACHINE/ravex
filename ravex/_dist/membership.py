@@ -366,6 +366,18 @@ class Membership:
         Separate from :meth:`peers_at` because a joiner calls this too — it has
         to know about *other* joiners to compute its own admission round, and
         it has no peer set of its own to ask for yet.
+
+        **A base member acknowledges a joiner here, the moment it accepts it**
+        (GPU-279), and not later in :func:`serve_joins`. A boundary reads the
+        announcements twice - ``serve_joins`` and then ``peers_at`` - and one
+        written between the two was accepted by the second read and
+        acknowledged only at the next boundary. By then this member had
+        trained the round and published its report, which is all another
+        member needs to reach the announced round and write it on the store;
+        the joiner read that, found this acknowledgement missing, published
+        nothing and asked again, every time the interleaving came round. An
+        acknowledgement made where the acceptance is made is on the store
+        before anything this member publishes afterwards.
         """
         for peer, admit in announced(self.store, self.base_world, self.span()).items():
             if peer == self.rank:
@@ -401,6 +413,28 @@ class Membership:
                     peer, admit, round_number,
                 )
             self.accepted[peer] = admit
+        self._acknowledge_accepted()
+
+    def _acknowledge_accepted(self) -> None:
+        """Write the acknowledgement of every accepted joiner not yet
+        acknowledged. Only a base member's count, as :func:`acknowledged`
+        reads them; a node that joined itself writes none. One that could not
+        be written is tried again at the next read, before anything else this
+        node publishes - the joiner is waiting on it, not the round."""
+        if self.rank >= self.base_world:
+            return
+        for joiner, admit in self.accepted.items():
+            if joiner in self.acknowledged_joiners:
+                continue
+            try:
+                acknowledge(self.store, self.rank, joiner, admit)
+            except Exception as exc:
+                logger.warning(
+                    "Could not acknowledge rank %d's join at round %d (%s); "
+                    "trying again at the next boundary.", joiner, admit, exc,
+                )
+                continue
+            self.acknowledged_joiners.add(joiner)
 
 
 def want_in(store, rank: int) -> None:
@@ -501,14 +535,17 @@ def serve_joins(store, exchange, loop, membership: "Membership") -> None:
 
     Two jobs, in this order:
 
-    1. **Write the outer parameters down** if a candidate is waiting for them,
+    1. **Take in any announcement** and acknowledge it, so the joiner knows it
+       is safe to publish - in :meth:`Membership.refresh`, which is where the
+       acceptance is made, and before step 2 says what round this is: a joiner
+       that reads its round has come checks the acknowledgements next
+       (GPU-279).
+    2. **Write the outer parameters down** if a candidate is waiting for them,
        under the number of the round about to start. A joiner admitted at round
        A takes the state published for A, so it starts that round holding
        exactly what everybody else holds — which is the invariant the whole
        outer loop rests on, and taking state from any earlier round would break
        it by however many rounds it was behind.
-    2. **Take in any announcement** and acknowledge it, so the joiner knows it
-       is safe to publish.
 
     Costs one store scan per boundary on a run nobody is joining, and nothing
     else: no snapshot is written until somebody asks.
@@ -522,12 +559,6 @@ def serve_joins(store, exchange, loop, membership: "Membership") -> None:
             store.set(STATE_AT_KEY, json.dumps(round_number).encode("utf-8"))
         except Exception:
             pass
-
-    for joiner, admit in membership.accepted.items():
-        if joiner in membership.acknowledged_joiners:
-            continue
-        acknowledge(store, membership.rank, joiner, admit)
-        membership.acknowledged_joiners.add(joiner)
 
 
 def state_round(store) -> Optional[int]:

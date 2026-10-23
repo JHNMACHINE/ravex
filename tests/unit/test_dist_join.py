@@ -150,3 +150,60 @@ def test_a_script_catching_exceptions_does_not_swallow_run_over():
     """A BaseException, like KeyboardInterrupt: a script's own `except
     Exception` around its step must not catch it and train on alone."""
     assert not issubclass(_membership.RunOver, Exception)
+
+
+class Loop:
+    """What `serve_joins` reads off an outer loop: its round, and a state."""
+
+    def __init__(self, round_number):
+        self.round_number = round_number
+        self.outer = {"w": torch.zeros(2)}
+        self.optimizer = None
+        self.model_steps = 0
+
+
+class Exchange:
+    """A member's exchange as far as `serve_joins` uses it: the state goes nowhere."""
+
+    def publish_state(self, payload, round_number):
+        pass
+
+
+def test_a_member_that_takes_a_joiner_in_has_acknowledged_it_before_it_trains_the_round():
+    """GPU-279. A round boundary reads the announcements twice: in
+    `serve_joins` and again in `peers_at`. One written between the two was
+    accepted by the second read, and acknowledged only at the next boundary's
+    `serve_joins` - after this member had trained the round and published
+    its report, which is all the other member needs to reach the announced
+    round and say so on the store. The joiner then found this member's
+    acknowledgement missing, published nothing, and asked again for a later
+    round, every time the interleaving came round, until its deadline."""
+    store = FakeStore()
+    member = _membership.Membership(store, 1, BASE_WORLD)
+    _membership.serve_joins(store, Exchange(), Loop(2), member)
+    # The joiner announces between the boundary's two reads.
+    _membership.announce(store, BASE_WORLD, 3)
+    member.peers_at(2)
+    assert _membership.acknowledged(store, BASE_WORLD, [1]) == []
+
+
+def test_a_member_acknowledges_before_it_says_the_announced_round_has_come():
+    """GPU-279. `serve_joins` wrote the round it was at for the joiner to
+    read - which is how a joiner learns its round has come - before the
+    acknowledgements, so a joiner could see its round and check them in
+    between. The acknowledgement is on the store before the round is."""
+    store = FakeStore()
+    member = _membership.Membership(store, 1, BASE_WORLD)
+    _membership.want_in(store, BASE_WORLD)
+    _membership.announce(store, BASE_WORLD, 3)
+    seen = []
+    real_set = store.set
+
+    def watching(key, value):
+        if key == _membership.STATE_AT_KEY:
+            seen.append(_membership.acknowledged(store, BASE_WORLD, [1]))
+        real_set(key, value)
+
+    store.set = watching
+    _membership.serve_joins(store, Exchange(), Loop(2), member)
+    assert seen == [[]], "the round was on the store before the acknowledgement: %s" % seen

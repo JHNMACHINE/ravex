@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Fixed
+
+- **A node joining a run could be turned away by a member that had already
+  taken it in (GPU-279).** A member acknowledged a joiner one step after
+  accepting it: an announcement read at the boundary's second look was
+  acknowledged only at the next boundary, and within one boundary the round
+  was written on the store before the acknowledgements. A joiner that read
+  its round in between found one missing, published nothing and asked again -
+  while every member waited `outer_deadline` for its report in that round,
+  since they had counted it in. The acknowledgement is now written where the
+  joiner is accepted, before anything the member publishes after.
+
 ### Added
 
 - **H can follow the link: `outer_inner_steps: auto` (GPU-231).** Or
