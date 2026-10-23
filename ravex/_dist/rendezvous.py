@@ -63,7 +63,11 @@ import secrets
 import socket
 import threading
 import time
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
+
+if TYPE_CHECKING:
+    # For `host`'s return annotation only; it imports its own at call time.
+    import subprocess
 
 logger = logging.getLogger("ravex")
 

@@ -182,12 +182,10 @@ def _broadcast_object(dist, value, src, group=None):
         payload = torch.frombuffer(bytearray(pickle.dumps(value)), dtype=torch.uint8)
         payload = payload.to(device)
         sizes = torch.tensor([payload.numel()], dtype=torch.long, device=device)
+        dist.broadcast(sizes, src=src, group=group)
     else:
         sizes = torch.empty(1, dtype=torch.long, device=device)
-
-    dist.broadcast(sizes, src=src, group=group)
-
-    if not is_src:
+        dist.broadcast(sizes, src=src, group=group)
         payload = torch.empty(int(sizes[0].item()), dtype=torch.uint8, device=device)
 
     dist.broadcast(payload, src=src, group=group)
