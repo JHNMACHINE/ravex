@@ -34,9 +34,43 @@ network.
     python bench/round_steps_auto.py --overlap
     python bench/round_steps_auto.py --network-seconds 300 --budget-seconds 20000
 
-**Measured** - see the GPU-231 comment on Linear for the table and what it
-says; the numbers depend on the simulated link, and the defaults are one
-inter-continental link for a small model, not a law.
+**Measured**, 2026-10-24: 2 nodes, contiguous shards, 0.48M parameters, a
+step 0.5 s, the network +-20%, seeds 0, 1 and 2, the mean of the three. Held
+out cross entropy, nats per byte, and in brackets the rounds the arm got:
+
+====================== =============== ============== ============== ========
+link (network, budget) H=64            H=500          auto           one node
+====================== =============== ============== ============== ========
+fast (10 s, 2000 s)    **1.3392** (47) 1.3890 (7)     1.3588 (41)    1.4246
+medium (60 s, 2400 s)  1.4870 (26)     1.3890 (7)     **1.3823** (9) 1.3906
+slow (200 s, 2400 s)   2.0950 (11)     **1.4964** (5) 1.8066 (3)     1.3906
+medium, overlapped     1.3989 (40)     **1.3525** (9) 1.3594 (32)    1.3906
+====================== =============== ============== ============== ========
+
+**Where it works, it lands next to the best fixed H without being told
+which one that is.** On the fast link it goes from 500 to ~65 in four rounds
+and ends 0.02 behind H=64, 0.03 ahead of H=500; on the medium one it settles
+at 330-400 and is the best arm, by a little. Neither fixed value is right on
+both links, and each loses by 0.05-0.1 on the one it does not suit.
+
+**On the slow link it loses, and the reason is the one the issue names.** It
+does what it is told - H to 1300-1400, the wait from 45% to 30% - and that
+leaves three rounds in the budget, which is the ceiling
+``bench/outer_convergence.py`` found on rounds rather than on H: 1.81 against
+1.50 at H=500's five rounds. A rule about the network's share cannot see that
+the run is running out of rounds; a floor on rounds per budget, or a lower
+``outer_max_inner_steps``, would.
+
+**Overlapped, a quarter of the round waiting is the wrong target.** H=500
+hides the whole network (0% waiting) and wins; ``auto`` brings H down to ~90
+to reach the quarter it was asked for, and buys rounds it pays for in
+waiting - 0.007 behind. With ``outer_overlap`` the share wants to be near 0, and
+``outer_network_share`` takes anything above it.
+
+One node alone for the same wall clock is ahead of every group arm on the
+medium and slow links: at these budgets the network eats more than the
+second node brings. That is the budget, not H, and is why the comparison
+here is between the arms. Small model, simulated link, one box: a direction.
 """
 
 import argparse

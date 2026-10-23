@@ -1133,7 +1133,13 @@ logged, and the model's series has `train/outer/inner_steps`.
 
 It optimises what the network costs, not the model: nothing during a run says
 what an H does to the loss. `bench/round_steps_auto.py` puts it against fixed
-H at equal wall clock on a simulated link. It does not go with
+H at equal wall clock on a simulated link (two nodes, a small model, three
+seeds): on a fast link and a medium one it ends within 0.02 of the better
+fixed H - a different one on each - where each fixed H loses 0.05-0.1 on the
+link it does not suit. On a slow link it loses to H=500, because the H it
+reaches leaves the run three rounds; there, cap it with
+`outer_max_inner_steps`. With `outer_overlap` set the share lower than a
+quarter: hiding the whole network is what won. It does not go with
 `outer_round_seconds`: the clock closes the round wherever H stands, so the
 rule would read every round as too short. Both set, H stays fixed and the
 problem is logged.
