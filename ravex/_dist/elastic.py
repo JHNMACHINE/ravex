@@ -140,9 +140,11 @@ def generation_store(base_store, generation: int):
     winning it (GPU-175) - so if a future torch makes the bare store safe to
     reuse, nothing will say so; that has to be checked by hand.
     """
-    import torch.distributed as dist
+    # From the module that declares it: `torch.distributed` re-exports it
+    # without listing it.
+    from torch.distributed.distributed_c10d import PrefixStore
 
-    return dist.PrefixStore("gpu94/gen%d" % generation, base_store)
+    return PrefixStore("gpu94/gen%d" % generation, base_store)
 
 
 def announce_join(base_store, candidate_rank: int, address: str) -> None:

@@ -103,8 +103,8 @@ def to_dcp(state: Dict[str, Any], out_dir: str, key: Optional[str] = None) -> Li
 
     Returns notes on what was and was not exported exactly.
     """
-    import torch.distributed.checkpoint as dcp
-    from torch.distributed.checkpoint import FileSystemWriter
+    from torch.distributed.checkpoint.filesystem import FileSystemWriter
+    from torch.distributed.checkpoint.state_dict_saver import save
 
     model, optimizer, notes = _choose(state, key)
     payload: Dict[str, Any] = {
@@ -114,7 +114,7 @@ def to_dcp(state: Dict[str, Any], out_dir: str, key: Optional[str] = None) -> Li
     if optimizer:
         payload["optim"] = optimizer
 
-    dcp.save(payload, storage_writer=FileSystemWriter(out_dir), no_dist=True)
+    save(payload, storage_writer=FileSystemWriter(out_dir), no_dist=True)
     return notes
 
 

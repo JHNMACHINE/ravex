@@ -195,7 +195,9 @@ def grad_norm(optimizer: Any) -> Any:
         return None
     device = grads[0].device
     try:
-        norms = torch._foreach_norm(grads)
+        # Private, and the fastest norm of many tensors torch has; the
+        # fallback below covers a torch without it.
+        norms = torch._foreach_norm(grads)  # pyright: ignore[reportPrivateImportUsage]
     except Exception:
         # Older torch, or a mix of dtypes and devices it does not group.
         norms = [torch.linalg.vector_norm(grad) for grad in grads]

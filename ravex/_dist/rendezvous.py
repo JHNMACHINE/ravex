@@ -150,20 +150,22 @@ def _tcp_store(host: str, port: int, is_master: bool, timeout: float):
     suggests, is not honoured when the argument is passed. The older
     implementation speaks the same protocol, so that is what they get.
     """
-    import torch.distributed as dist
+    # Declared only in torch's C extension, and re-exported by
+    # `torch.distributed` without being listed there.
+    from torch.distributed import TCPStore  # pyright: ignore[reportPrivateImportUsage]
 
-    kwargs = dict(
-        world_size=None,
-        is_master=is_master,
-        timeout=datetime.timedelta(seconds=timeout),
-        wait_for_workers=False,
-    )
     try:
-        return dist.TCPStore(host, port, **kwargs)
+        return TCPStore(
+            host, port, None, is_master, datetime.timedelta(seconds=timeout),
+            wait_for_workers=False,
+        )
     except Exception as exc:
         if "libuv" not in str(exc):
             raise
-    return dist.TCPStore(host, port, use_libuv=False, **kwargs)
+    return TCPStore(
+        host, port, None, is_master, datetime.timedelta(seconds=timeout),
+        wait_for_workers=False, use_libuv=False,
+    )
 
 
 def job_token(token: Optional[str] = None) -> Optional[bytes]:
@@ -392,7 +394,9 @@ def connect(address: str, job: str, timeout: float = 300.0, token: Optional[str]
     a read on purpose (it asks ``check`` before ``get``), so in practice it is
     the first.
     """
-    import torch.distributed as dist
+    # From the module that declares it: `torch.distributed` re-exports it
+    # without listing it.
+    from torch.distributed.distributed_c10d import PrefixStore
 
     if not valid_job(job):
         raise ValueError(
@@ -404,7 +408,7 @@ def connect(address: str, job: str, timeout: float = 300.0, token: Optional[str]
         forwarder = _Forwarder(host, port, secret, timeout)
         _FORWARDERS.append(forwarder)
         host, port = "127.0.0.1", forwarder.port
-    return dist.PrefixStore(JOB_PREFIX % job, _tcp_store(host, port, False, timeout))
+    return PrefixStore(JOB_PREFIX % job, _tcp_store(host, port, False, timeout))
 
 
 def register(store) -> int:

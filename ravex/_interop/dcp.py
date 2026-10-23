@@ -65,7 +65,7 @@ def describe(path: str) -> Dict[str, Dict[str, Any]]:
     hyperparameters — and dropping them silently would make this a description
     of the tensors rather than of the checkpoint.
     """
-    from torch.distributed.checkpoint import FileSystemReader
+    from torch.distributed.checkpoint.filesystem import FileSystemReader
 
     metadata = FileSystemReader(path).read_metadata()
 
@@ -101,10 +101,13 @@ def read(path: str) -> Dict[str, Any]:
     state: Dict[str, Any] = {}
 
     try:
-        from torch.distributed.checkpoint import FileSystemReader
+        from torch.distributed.checkpoint.filesystem import FileSystemReader
+        # Taken from `format_utils` on purpose, and not from the modules that
+        # declare them: that is where torch's own conversion gets them, and an
+        # older torch without them there takes the long way below.
         from torch.distributed.checkpoint.format_utils import (
-            _EmptyStateDictLoadPlanner,
-            _load_state_dict,
+            _EmptyStateDictLoadPlanner,  # pyright: ignore[reportPrivateImportUsage]
+            _load_state_dict,  # pyright: ignore[reportPrivateImportUsage]
         )
     except ImportError:
         return _read_the_long_way(path)
