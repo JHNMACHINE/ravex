@@ -82,6 +82,10 @@ def a_node(rank, world, port, root, rounds, inner, queue, boundary="public", log
             checkpoint_every=10**9,
             checkpoint_on_exit=True,
             outer_overlap=overlap,
+            # Inside every round when the metrics are under test (GPU-274):
+            # the default 10 would skip the first round of 8 steps.
+            histograms_every=inner if log else 200,
+            metrics_every=inner if log else 10,
         )
         def train():
             logging.getLogger("ravex").addHandler(Collect())
@@ -254,6 +258,14 @@ def test_a_multi_node_run_logs_one_series_for_the_model(tmp_path):
 
     other = ravex.metrics.read(str(tmp_path / "cwd1" / "checkpoints"))["scalars"]
     assert "train/loss" not in other and "outer/round" not in other
+
+    # GPU-274: what Ravex takes on its own goes the same way - the gradient
+    # norm averaged over the nodes, and the writer's own histograms on the
+    # model's axis instead of being dropped.
+    assert writer["ravex/grad_norm"]["step"] == [16, 32, 48]
+    histograms = ravex.metrics.read(str(tmp_path / "cwd0" / "checkpoints"))["histograms"]
+    assert [entry["step"] for entry in histograms["weights/0.weight"]] == [16, 32, 48]
+    assert "grads/0.weight" in histograms
 
 
 @pytest.mark.skipif(sys.platform == "darwin", reason="spawn + gloo is slow on macOS")

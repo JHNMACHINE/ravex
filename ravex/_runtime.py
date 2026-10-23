@@ -283,10 +283,17 @@ class RavexRuntime:
         #: record, so the time per step is an average over the interval rather
         #: than the one step that happened to land on the cadence.
         self._metrics_mark: Optional[Tuple[int, float]] = None
+        #: Whether this process takes the gradient norm and the parameter
+        #: histograms: settled at the first step they are due, once the
+        #: process group is up and the models are known (GPU-274).
+        self._training_metrics_apply: Optional[bool] = None
         #: In a multi-node run, where the script's metrics wait for the end of
         #: the round (GPU-135): they are the model's, one value per name over
         #: every node, and not this node's. None otherwise.
         self._round_means: Any = None
+        #: The histograms this node logged in the round being closed, which the
+        #: round's writer adds to the model's series (GPU-274).
+        self._round_histograms: Dict[str, Any] = {}
         #: The model's series, when this node is the one writing it. Opened at
         #: the first round it writes; see `_write_model_series`.
         self._model_writer: Any = None
@@ -681,6 +688,7 @@ class RavexRuntime:
         self.registry.step_count += 1
         if self._metrics is not None:
             self._log_step_metrics(optimizer)
+            self._log_training_metrics(optimizer)
 
         if self.config.outer_loop:
             outer = self._outer_loop()
@@ -956,6 +964,58 @@ class RavexRuntime:
                 values[name] = prepare(name, lr)
             except (TypeError, ValueError):
                 continue
+        if values:
+            self.log_metrics(values, step)
+
+    def _log_training_metrics(self, optimizer: Any) -> None:
+        """The gradient norm and the largest parameters' histograms (GPU-274).
+
+        What a script with nothing but the decorator still gets to see about
+        its model. Here, after ``optimizer.step()``, because it is the one
+        moment Ravex holds the gradients the step used: before the next
+        ``zero_grad()``, whenever the script calls it. Only queued device work,
+        as for anything logged: the writer thread reads it back.
+
+        Rank 0 only - the other ranks' records are dropped anyway, so they do
+        not pay for them. Not on a sharded model: rank 0 holds one shard, a
+        norm or a histogram of it would be a fraction of the model presented
+        as the whole, and gathering the rest is a collective that this
+        rank-0-only path cannot start.
+        """
+        if not self.config.training_metrics:
+            return
+        step = self.registry.step_count
+        norm_due = step % self.config.metrics_every == 0
+        every = self.config.histograms_every
+        histograms_due = every > 0 and step % every == 0
+        if not (norm_due or histograms_due):
+            return
+        if self._training_metrics_apply is None:
+            from ravex._dist.collectives import get_rank
+
+            sharded = self.registry.has_sharded_models()
+            if sharded:
+                logger.info(
+                    "No automatic gradient norm or parameter histograms: the "
+                    "model is sharded, and this rank holds only its shard."
+                )
+            self._training_metrics_apply = get_rank() == 0 and not sharded
+        if not self._training_metrics_apply:
+            return
+        from ravex._metrics import grad_norm, parameter_histograms, prepare
+
+        values: Dict[str, Any] = {}
+        try:
+            if norm_due:
+                norm = grad_norm(optimizer)
+                if norm is not None:
+                    values["ravex/grad_norm"] = prepare("ravex/grad_norm", norm)
+            if histograms_due:
+                values.update(parameter_histograms(self.registry.models, optimizer))
+        except Exception as exc:
+            # A chart missing a point is the whole cost; the step went through.
+            logger.debug("Could not take the training metrics at step %d: %s", step, exc)
+            return
         if values:
             self.log_metrics(values, step)
 
@@ -1846,6 +1906,11 @@ class RavexRuntime:
         try:
             self._before_round()
             means = self._round_means.take() if self._round_means is not None else None
+            # Kept here until the round lands, which with `outer_overlap` is at
+            # the next boundary, before this line runs again (GPU-274).
+            self._round_histograms = (
+                self._round_means.take_histograms() if self._round_means is not None else {}
+            )
             if self.config.outer_overlap:
                 self._launch_round(means)
                 return
@@ -2117,11 +2182,11 @@ class RavexRuntime:
                 "outer/stalled_seconds": report.get("stalled_seconds", seconds),
             }
             values.update(report.get("model_metrics") or {})
-            self._model_writer.put(
-                model_steps,
-                time.time(),
-                {name: Scalar(float(value)) for name, value in values.items()},
-            )
+            prepared: Dict[str, Any] = {name: Scalar(float(value)) for name, value in values.items()}
+            # This node's own histograms of the round: not averaged, see
+            # `RoundMeans` (GPU-274).
+            prepared.update(self._round_histograms)
+            self._model_writer.put(model_steps, time.time(), prepared)
         except Exception as exc:
             # The round is applied; a chart missing a point is the whole cost.
             logger.warning("Could not log outer round %s: %s", report.get("round"), exc)

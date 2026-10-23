@@ -54,7 +54,9 @@ ravex status
 | `name` | `RAVEX_NAME` | `null` | What a person calls this run, written into `run.json`. Unlike `run_id` it may repeat between experiments. Defaults to the store directory's name. |
 | `audit_log` | `RAVEX_AUDIT_LOG` | `false` | Append one hash-chained entry per durable checkpoint to `audit.jsonl` in the store: step, content fingerprint, config digest. See [Audit trail](#audit-trail). |
 | `metrics` | `RAVEX_METRICS` | `true` | Write what `ravex.log_metrics` is given, and the metrics Ravex takes on its own, to `metrics/` in the store. See [Metrics](#metrics). |
-| `metrics_every` | `RAVEX_METRICS_EVERY` | `10` | Steps between two records of the automatic step metrics: learning rate per param group, and time per step. |
+| `metrics_every` | `RAVEX_METRICS_EVERY` | `10` | Steps between two records of the automatic step metrics: learning rate per param group, time per step, and the gradient norm. |
+| `training_metrics` | `RAVEX_TRAINING_METRICS` | `true` | Take the gradient norm and the parameter histograms on Ravex's own, from the parameters the optimizer steps. `false` leaves the learning rate and time per step. See [Metrics](#metrics). |
+| `histograms_every` | `RAVEX_HISTOGRAMS_EVERY` | `200` | Steps between two histograms of the weights and gradients of the largest parameters. `0` turns them off. |
 | `system_metrics_every` | `RAVEX_SYSTEM_METRICS_EVERY` | `30` | Seconds between two samples of the machine: GPU utilisation and memory, CPU, RAM. `0` turns them off. |
 | `metrics_chunk_every` | `RAVEX_METRICS_CHUNK_EVERY` | `15` | Seconds between two metric chunks: how late a reader of the bucket sees a value, and the most a crash loses. See [Metrics](#metrics). |
 | `frameworks.auto_detect` | — | `true` | Whether to identify the training framework in use. File only: there is no environment variable for it. |
@@ -775,12 +777,24 @@ histogram of a million elements.
 process on each.
 
 **Automatic metrics**, with nothing in the script: `ravex/lr` (or
-`ravex/lr/group<N>` with several param groups) and `ravex/step_seconds` every
-`metrics_every` steps, `ravex/checkpoint_seconds` at every checkpoint, and every
-`system_metrics_every` seconds `sys/gpu<N>/…`, `sys/cpu_percent`,
-`sys/ram_percent` and `sys/process_rss_mb`. GPU utilisation needs
-`nvidia-ml-py`; without it only this process's GPU memory is reported. CPU and
-RAM need `psutil`.
+`ravex/lr/group<N>` with several param groups), `ravex/step_seconds` and
+`ravex/grad_norm` every `metrics_every` steps, `ravex/checkpoint_seconds` at
+every checkpoint, and every `system_metrics_every` seconds `sys/gpu<N>/…`,
+`sys/cpu_percent`, `sys/ram_percent` and `sys/process_rss_mb`. GPU utilisation
+needs `nvidia-ml-py`; without it only this process's GPU memory is reported.
+CPU and RAM need `psutil`.
+
+Every `histograms_every` steps come the histograms of the four largest
+parameters the optimizer steps, `weights/<name>` and `grads/<name>`, named
+after the tracked model (`weights/embed.weight`). The gradient norm and the
+histograms are taken right after `optimizer.step()`, from the gradients the
+step used - unscaled already under a `GradScaler` - and like anything logged
+they are queued on the device, never read back on the training thread. With
+several optimizers they come from the one that drives the step count. A sharded
+model (FSDP) gets neither: rank 0 holds one shard, and gathering the rest would
+be a collective. The loss is not among them, because Ravex does not see it
+without wrapping `backward()`: that one line stays the script's.
+`training_metrics: false` turns both off.
 
 **In a multi-node run, the model's metrics** (`outer_loop: true`). Every node
 computes its own loss, on its own shard, at its own step count, and a run is
@@ -792,8 +806,9 @@ the nodes, weighted by the steps behind each. The step of that point is the
 model's, every step taken by every node in every round applied, so a run on four
 nodes and one on a single node are on the same axis. With it come
 `outer/round`, `outer/nodes`, `outer/steps` (the round's total) and
-`outer/seconds`. The `step=` argument does not apply, histograms are not
-averaged and are dropped with a warning, and system metrics stay per machine.
+`outer/seconds`. The `step=` argument does not apply, and system metrics stay
+per machine. Histograms are not averaged: each node keeps its latest one per
+name, and the writer logs its own on the model's series.
 The model's series is its own segment, under rank `-1`, cut only by segments of
 its own kind. For the nodes to be **one run** on the platform they share a
 `run_id`, which the platform's agent sets; without one each node keeps its own

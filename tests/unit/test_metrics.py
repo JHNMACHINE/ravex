@@ -160,6 +160,52 @@ class TestAutomatic:
         assert scalars["ravex/step_seconds"]["step"] == [2, 4, 6]
         assert all(value >= 0 for value in scalars["ravex/step_seconds"]["value"])
 
+    def test_gradient_norm_with_nothing_in_the_script(self, storage):
+        """GPU-274: the norm of the gradients the step used, on the metrics' cadence."""
+
+        @ravex.train_loop(backend="torch_save", checkpoint_every=10_000, metrics_every=2)
+        def train():
+            loop(6, lambda _s, _m: None)
+
+        train()
+        series = ravex.metrics.read(str(storage))["scalars"]["ravex/grad_norm"]
+        assert series["step"] == [2, 4, 6]
+        assert all(value > 0 for value in series["value"])
+
+    def test_the_gradient_norm_is_the_global_one(self):
+        model = torch.nn.Sequential(torch.nn.Linear(4, 3), torch.nn.Linear(3, 2))
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        model(torch.randn(5, 4)).pow(2).sum().backward()
+        expected = torch.cat([p.grad.flatten() for p in model.parameters()]).norm()
+        assert float(_metrics.grad_norm(optimizer)) == pytest.approx(float(expected), rel=1e-5)
+        optimizer.zero_grad(set_to_none=True)
+        assert _metrics.grad_norm(optimizer) is None
+
+    def test_largest_parameters_weights_and_gradients(self, storage):
+        @ravex.train_loop(backend="torch_save", checkpoint_every=10_000, histograms_every=3)
+        def train():
+            loop(6, lambda _s, _m: None)
+
+        train()
+        histograms = ravex.metrics.read(str(storage))["histograms"]
+        # Linear(4, 2): the weight and the bias, named after the model.
+        assert sorted(histograms) == ["grads/bias", "grads/weight", "weights/bias", "weights/weight"]
+        assert [entry["step"] for entry in histograms["weights/weight"]] == [3, 6]
+
+    def test_training_metrics_false_leaves_only_the_step_metrics(self, storage):
+        @ravex.train_loop(
+            backend="torch_save", checkpoint_every=10_000, metrics_every=2,
+            histograms_every=2, training_metrics=False,
+        )
+        def train():
+            loop(4, lambda _s, _m: None)
+
+        train()
+        history = ravex.metrics.read(str(storage))
+        assert "ravex/grad_norm" not in history["scalars"]
+        assert "ravex/lr" in history["scalars"]
+        assert history["histograms"] == {}
+
     def test_checkpoint_duration(self, storage):
         @ravex.train_loop(backend="torch_save", checkpoint_every=2)
         def train():
@@ -415,11 +461,16 @@ def test_a_round_keeps_a_mean_per_name_and_starts_again():
     assert means.take() == {}
 
 
-def test_a_histogram_is_not_averaged_and_says_so(caplog):
+def test_a_histogram_is_not_averaged_the_latest_is_kept():
+    """GPU-274: it used to be dropped, and a multi-node run had none."""
     means = _metrics.RoundMeans()
     means.add(_metrics.prepare_all({"w": torch.arange(10.0)}))
+    means.add(_metrics.prepare_all({"w": torch.arange(20.0)}))
     assert means.take() == {}
-    assert "not averaged" in caplog.text
+    latest = means.take_histograms()
+    assert list(latest) == ["w"]
+    assert _metrics._resolve(latest["w"])["histogram"]["max"] == 19.0
+    assert means.take_histograms() == {}, "a round starts again"
 
 
 def test_the_model_s_value_is_weighted_by_the_steps_behind_each_node():

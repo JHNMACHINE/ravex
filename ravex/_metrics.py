@@ -163,6 +163,83 @@ def _histogram(tensor: Any) -> Histogram:
     return Histogram(low, high, counts[:HISTOGRAM_BINS], counts[HISTOGRAM_BINS], stride)
 
 
+#: How many parameters get their weights and gradients charted (GPU-274): the
+#: largest, which in a transformer are the embedding, the head and the widest
+#: projections - where a run going wrong shows first, and few enough that the
+#: cost stays a few capped reductions however deep the model is.
+HISTOGRAM_PARAMETERS = 4
+
+
+def _gradients(optimizer: Any) -> List[Any]:
+    return [
+        param.grad
+        for group in getattr(optimizer, "param_groups", None) or []
+        for param in group.get("params", [])
+        if getattr(param, "grad", None) is not None and not param.grad.is_sparse
+    ]
+
+
+def grad_norm(optimizer: Any) -> Any:
+    """The global L2 norm of ``optimizer``'s gradients, as a device tensor.
+
+    Queued, never read back: called from the hook after ``optimizer.step()``,
+    on the training thread, where reading it would wait for the GPU. Gradients
+    are what the step just used - unscaled already under a ``GradScaler``,
+    whose ``step`` unscales before calling the optimizer's. None when nothing
+    has a gradient.
+    """
+    import torch
+
+    grads = _gradients(optimizer)
+    if not grads:
+        return None
+    device = grads[0].device
+    try:
+        norms = torch._foreach_norm(grads)
+    except Exception:
+        # Older torch, or a mix of dtypes and devices it does not group.
+        norms = [torch.linalg.vector_norm(grad) for grad in grads]
+    return torch.linalg.vector_norm(
+        torch.stack([norm.to(device=device, dtype=torch.float32) for norm in norms])
+    )
+
+
+def parameter_histograms(models: List[Any], optimizer: Any) -> Dict[str, Any]:
+    """``weights/<name>`` and ``grads/<name>`` of the largest stepped parameters.
+
+    Named after the models Ravex tracks, so a chart says ``embed.weight``
+    rather than a position; a parameter no tracked model owns is ``param<N>``.
+    Each histogram is :func:`_histogram`'s, capped at
+    :data:`HISTOGRAM_MAX_ELEMENTS` sampled elements whatever the tensor's size.
+    """
+    from ravex._dist.collectives import unwrap_model
+
+    names: Dict[int, str] = {}
+    for index, model in enumerate(models):
+        prefix = "" if len(models) == 1 else "model%d." % index
+        try:
+            for name, param in unwrap_model(model).named_parameters():
+                names.setdefault(id(param), prefix + name)
+        except Exception as exc:
+            logger.debug("Could not name the parameters of %s: %s", type(model).__name__, exc)
+    params = [
+        param
+        for group in getattr(optimizer, "param_groups", None) or []
+        for param in group.get("params", [])
+    ]
+    largest = sorted(enumerate(params), key=lambda item: item[1].numel(), reverse=True)
+    out: Dict[str, Any] = {}
+    for position, param in largest[:HISTOGRAM_PARAMETERS]:
+        if param.numel() < 2:
+            continue
+        name = names.get(id(param), "param%d" % position)
+        out["weights/" + name] = _histogram(param)
+        grad = getattr(param, "grad", None)
+        if grad is not None and not grad.is_sparse:
+            out["grads/" + name] = _histogram(grad)
+    return out
+
+
 def _number(value: float) -> Any:
     """A float as JSON can carry it. NaN and infinity become strings.
 
@@ -521,26 +598,26 @@ class RoundMeans:
     Sums stay on the device until :meth:`take`: adding a queued value is as
     asynchronous as queueing it, and the round boundary - which reads the
     parameters back anyway - is where they come home.
+
+    **Histograms are not averaged** - the mean of two distributions' bins over
+    different ranges is not a distribution. Each node keeps its latest one per
+    name instead, and the round's writer logs its own on the model's series
+    (GPU-274): one node's view of the round, which every node started from the
+    same weights. They used to be dropped, and a multi-node run had no
+    histograms at all.
     """
 
     def __init__(self) -> None:
         self._sums: Dict[str, List[Any]] = {}
+        self._histograms: Dict[str, Histogram] = {}
         self._lock = threading.Lock()
-        self._warned_histogram = False
 
     def add(self, values: Mapping[str, Any]) -> None:
-        """Take prepared values. Histograms are not averaged and are dropped."""
+        """Take prepared values: scalars into the sums, histograms as the latest."""
         with self._lock:
             for key, value in values.items():
-                if not isinstance(value, Scalar):
-                    if not self._warned_histogram:
-                        self._warned_histogram = True
-                        logger.warning(
-                            "Histogram %r is not logged: in a multi-node run a "
-                            "metric is the mean over the nodes of a round, and "
-                            "histograms are not averaged.",
-                            key,
-                        )
+                if isinstance(value, Histogram):
+                    self._histograms[key] = value
                     continue
                 pending = value.pending
                 if hasattr(pending, "double"):
@@ -565,6 +642,16 @@ class RoundMeans:
                 continue
             out[key] = [value / count, count]
         return out
+
+    def take_histograms(self) -> Dict[str, "Histogram"]:
+        """The latest histogram per name since the last call, and start again.
+
+        Taken at every round boundary on every node, whether it writes the
+        round or not, so a histogram never lands on a round it was not logged in.
+        """
+        with self._lock:
+            histograms, self._histograms = self._histograms, {}
+        return histograms
 
 
 def model_means(reports: List[Tuple[int, Mapping[str, Any]]]) -> Dict[str, float]:

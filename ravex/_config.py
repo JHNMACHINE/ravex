@@ -747,8 +747,21 @@ class RavexConfig:
     metrics: bool = True
 
     #: Steps between two records of the automatic step metrics: the learning
-    #: rate of every param group and the average time per step.
+    #: rate of every param group, the average time per step and, with
+    #: ``training_metrics``, the gradient norm.
     metrics_every: int = 10
+
+    #: Ravex's own reading of the training, from the parameters the optimizer
+    #: steps: ``ravex/grad_norm`` every ``metrics_every`` steps and the
+    #: histograms of ``histograms_every``, so that a script with nothing but
+    #: the decorator still shows how the model is doing (GPU-274). The loss is
+    #: not among them: Ravex does not see it without wrapping ``backward()``.
+    training_metrics: bool = True
+
+    #: Steps between two histograms of the weights and gradients of the
+    #: largest parameters. Each is reduced on the device and capped in size,
+    #: so this is a few milliseconds every so many steps. Zero turns them off.
+    histograms_every: int = 200
 
     #: Seconds between two samples of the machine: GPU utilisation and memory,
     #: CPU and RAM. Zero turns them off.
@@ -983,6 +996,10 @@ class RavexConfig:
             self.metrics = _as_bool(value, self.metrics)
         if (value := get("METRICS_EVERY")) is not None:
             self.metrics_every = _as_int(value, self.metrics_every)
+        if (value := get("TRAINING_METRICS")) is not None:
+            self.training_metrics = _as_bool(value, self.training_metrics)
+        if (value := get("HISTOGRAMS_EVERY")) is not None:
+            self.histograms_every = _as_int(value, self.histograms_every)
         if (value := get("SYSTEM_METRICS_EVERY")) is not None:
             self.system_metrics_every = _as_float(value, self.system_metrics_every)
         if (value := get("METRICS_CHUNK_EVERY")) is not None:
@@ -1036,6 +1053,7 @@ class RavexConfig:
             "outer_inner_steps",
             "outer_deadline",
             "metrics_every",
+            "histograms_every",
         )
         boolean = (
             "enabled",
@@ -1058,6 +1076,7 @@ class RavexConfig:
             "framework_auto_detect",
             "audit_log",
             "metrics",
+            "training_metrics",
         )
 
         for name in numeric:
@@ -1191,6 +1210,8 @@ class RavexConfig:
             self.outer_deadline = 1
         if self.metrics_every < 1:
             self.metrics_every = 1
+        if self.histograms_every < 0:
+            self.histograms_every = 0
         if self.preemption_notice is not None:
             notice = _as_float(self.preemption_notice, -1.0)
             if not notice > 0:  # NaN too
