@@ -12,6 +12,15 @@
   `access_key`, `secret_key`, `session_token` and `resolve_credentials`.
   Needs the Moonclip that reads them.
 
+### Removed
+
+- **`ravex cache` and the S3 client in the compiled core (GPU-267).** The
+  cache of compiled wheels and kernels is a machine's work, not a run's, and
+  moved to smith (`cache.py`), with the same key, layout and signing
+  protocol: a store `ravex cache` wrote is read there as it is. With it go
+  `src/s3.rs`, `_core.S3Store` and the `rusty-s3`, `ureq`, `url` and `jiff`
+  dependencies; Ravex's Rust core no longer talks to a bucket.
+
 ## 0.7.8 — 2026-10-22
 
 ### Fixed

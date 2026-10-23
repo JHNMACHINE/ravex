@@ -30,8 +30,6 @@ STUB = PACKAGE / "_core.pyi"
 SHIMS = (
     PACKAGE / "_dist" / "replication.py",
     PACKAGE / "_dist" / "elastic.py",
-    # And the bucket client, which only ``ravex cache`` uses (GPU-181).
-    PACKAGE / "_cache.py",
 )
 
 #: Not part of the exported surface: dunders, and the version the extension

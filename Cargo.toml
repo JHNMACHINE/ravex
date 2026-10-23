@@ -10,10 +10,10 @@ name = "ravex"
 # `__init__.py` existed to prevent.
 version = "0.7.8"
 edition = "2021"
-# Set by rusty-s3 0.10, the highest MSRV among the dependencies (pyo3 0.29
-# needs 1.83). Declared so a toolchain that is too old fails with that
-# message rather than with an unrelated error from deep inside a dependency.
-rust-version = "1.85"
+# Set by pyo3 0.29, the highest MSRV among the dependencies. Declared so a
+# toolchain that is too old fails with that message rather than with an
+# unrelated error from deep inside a dependency.
+rust-version = "1.83"
 description = "The arithmetic core of Ravex: reshard planning, checkpoint format readers"
 license = "Apache-2.0"
 repository = "https://github.com/JHNMACHINE/ravex"
@@ -35,14 +35,6 @@ pyo3 = { version = "0.29", features = ["extension-module"], optional = true }
 # hand-parser would silently disagree with the module it is replacing on
 # exactly the inputs nobody thought to test.
 regex = "1"
-# The S3 client for `ravex cache` (GPU-181), the same Moonclip signs and sends
-# with; see `src/s3.rs` for why it is a copy rather than a call. `rusty-s3`
-# signs (GPU-203): SigV4 and nothing else, no I/O, no checksum headers. `url`
-# and `jiff` are the types its signing takes.
-rusty-s3 = { version = "0.10.2", default-features = false, features = ["rustcrypto"] }
-url = "2"
-jiff = { version = "0.2", default-features = false, features = ["std"] }
-ureq = "2"
 
 [features]
 default = ["extension-module"]
