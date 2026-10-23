@@ -1,64 +1,28 @@
 # Ravex
 
 Checkpoint and resume for PyTorch training, from one decorator on the function
-that trains. Inside that function nothing changes — not one line — because
-Ravex notices the model, the optimizer, the scheduler, the AMP scaler and the
-dataloader as they are built.
+that trains. Inside that function nothing changes: Ravex notices the model, the
+optimizer, the LR scheduler, the AMP scaler and the dataloader as they are
+built, counts every `optimizer.step()`, and writes a checkpoint on the cadence
+you configured. If the process dies, running the same command again picks up
+where it stopped.
+
+## Install
 
 ```bash
 pip install ravex
 ```
 
-Ravex is pure Python: one wheel installs on every platform and interpreter
-torch runs on. What changed between versions is in the
-[CHANGELOG](https://github.com/JHNMACHINE/ravex/blob/main/CHANGELOG.md).
+Ravex is pure Python and needs Python 3.11 or later. It does not depend on
+torch, so that it attaches to whatever build you already have (CUDA, ROCm, CPU)
+instead of pulling another one in.
 
-Its default checkpoint engine, [Moonclip](https://github.com/JHNMACHINE/moonclip),
-ships wheels for the same platform — so `pip install "ravex[moonclip]"` is a
-Linux thing, and where it is unavailable Ravex falls back to `torch_save` on its
-own.
+Its default checkpoint engine is [Moonclip](https://github.com/JHNMACHINE/moonclip),
+installed with `pip install "ravex[moonclip]"`. Moonclip publishes wheels only
+for Linux x86_64; elsewhere it has to be built from source, and where it is not
+installed Ravex falls back to `torch_save` on its own.
 
-Decorate your entry point, drop a `ravex.yaml` next to your code, and run what
-you always ran:
-
-```python
-import ravex
-
-@ravex.train_loop(preemption_handler=True)
-def train():
-    ...            # unchanged
-```
-
-```bash
-python train.py
-```
-
-The run now checkpoints itself. If the process dies — spot instance reclaimed,
-node rebooted, OOM killer, power cut — running the same command again picks up
-where it stopped: same weights, same optimizer moments, same LR schedule, same
-RNG state, same position in the dataset.
-
-## Why this is not just `torch.save`
-
-Saving the weights is the easy part. What makes a resumed run *continue* rather
-than merely *restart from a good place* is everything around them:
-
-| Restored | Why it matters |
-|---|---|
-| Model weights and buffers | the obvious part |
-| Optimizer state | Adam moments; without them the first steps after resume are wrong |
-| LR scheduler | resume at the wrong LR and the loss curve visibly kinks |
-| AMP `GradScaler` | its loss scale is tuned state, not a constant |
-| RNG: torch, CUDA, Python, NumPy | dropout masks and augmentations replay identically |
-| Dataset position | you continue with batch 4001, not batch 1 |
-
-Ravex's test suite asserts the strong form of this: a run killed at step 20 and
-resumed produces losses that are **bit-identical**, step by step, to the run
-that was never interrupted, and the same final weights.
-
-## How you use it
-
-One decorator on the function that trains:
+## Use
 
 ```python
 import ravex
@@ -73,357 +37,104 @@ def train():
 train()
 ```
 
-Inside that function nothing changes. Ravex notices the model, the optimizer,
-the LR scheduler, the AMP scaler and the dataloader as they are built, counts
-every `optimizer.step()`, and writes a checkpoint on the cadence you configured.
-Rerun the script and it picks up where it stopped.
+A resumed run continues rather than restarting from a good place, because
+Ravex restores everything around the weights too: optimizer state, LR
+scheduler, AMP loss scale, the torch, CUDA, Python and NumPy RNGs, and the
+position in the dataset. The test suite holds it to the strong form of that: a
+run killed at step 20 and resumed produces the same losses, step by step, and
+the same final weights as the run that was never interrupted.
 
-If "on its own" is a guess — two models and only one being trained, an optimizer
-built before the function was entered — name it:
+`preemption_handler=True` catches SIGTERM and tries to write a final checkpoint
+before the process is killed. Any other keyword argument to `train_loop` is a
+configuration override, and an unknown name raises `TypeError` rather than
+being ignored.
 
-```python
-ravex.track(model, optimizer)
-```
+The decorator is the only way in. Up to 0.0.5 a `.pth` file in site-packages
+attached Ravex to any process with a `ravex.yaml` above it; it was removed so
+that nothing is ever checkpointed by code that does not say so. Importing
+Ravex does nothing until a decorated function is called, and its patches on
+PyTorch come off when that function returns or raises.
 
-**What the decorator buys, beyond being readable.** It is a *boundary*. Ravex
-knows where the loop begins and ends, so the teardown is a `finally` rather than
-an `atexit` hook hoping to run, and it holds the function **before the model
-exists** — which is what resuming onto a different number of ranks needs and
-could never have.
-
-**What it replaced.** Early releases of `pip install ravex` also put a one-line
-`.pth` file in site-packages that ran in *every* Python process in the
-environment and attached Ravex to any of them that had a `ravex.yaml` above the
-working directory. It is gone. It was genuinely zero-code-changes, and it existed
-so a platform could turn on checkpointing for code it did not own — a real thing
-to give up, given up on purpose. What it cost was that Ravex had to guess where
-the loop began, and the guessing is what limited it: with HuggingFace `Trainer`
-and Lightning, dataset and RNG replay could not be made exact, and there was no
-defined moment of exit to write a final sharded checkpoint at. Both were filed as
-accepted limitations. Neither has to be, now.
+When "noticed on its own" is a guess, such as two models of which only one
+trains, or an optimizer built before the function was entered, name it with
+`ravex.track(model, optimizer)`. A loop with no `DataLoader` calls
+`ravex.batch_boundary()` at the top of each iteration, since the dataloader is
+where Ravex otherwise finds the one moment a checkpoint is consistent.
 
 ## Configuration
 
-`ravex.yaml`, anywhere at or above the working directory:
+`ravex.yaml`, at or above the working directory:
 
 ```yaml
-checkpoint_every: 500        # optimizer steps between checkpoints
+checkpoint_every: 500        # optimizer steps between checkpoints (default 100)
 backend: moonclip            # moonclip | torch_save
 storage:
   type: local                # local | s3 | r2
   path: ./checkpoints
 keep_last: 5
-max_steps: null              # optional hard stop, see below
-sharded_checkpoints: gather  # gather | per_rank, for FSDP — see below
+max_steps: null              # stop at this step however many times the process restarted
+sharded_checkpoints: gather  # gather | per_rank, for FSDP
 ```
 
-Every option also reads from `RAVEX_*` environment variables, which win over
-the file — so a scheduler can override a config committed to the repository:
+Every option is also read from a `RAVEX_*` environment variable, which wins
+over the file, and the keyword arguments to `train_loop` win over both. A
+resume is the default (`resume: true`); `RAVEX_ENABLED=0` turns Ravex off for
+one run without touching the code.
 
-```bash
-RAVEX_CHECKPOINT_EVERY=100 RAVEX_STORAGE_TYPE=r2 RAVEX_STORAGE_BUCKET=runs python train.py
-```
+**Storage.** Ravex decides when to save and what, and puts it back into the
+live objects; Moonclip decides how the bytes are written and where, bucket
+included. So `storage` says where the bucket is, and the credentials are never
+read by Ravex or from the config file: Moonclip reads them from
+`MOONCLIP_S3_ACCESS_KEY` / `MOONCLIP_S3_SECRET_KEY` or the usual `AWS_*` pair
+([Moonclip's README](https://github.com/JHNMACHINE/moonclip#s3-backend)).
 
-Credentials are never read from the config file, nor by Ravex: Moonclip,
-which writes to the bucket, reads `MOONCLIP_S3_ACCESS_KEY` /
-`MOONCLIP_S3_SECRET_KEY`, or the usual `AWS_*` pair.
+**More than one GPU or machine.** DDP and FSDP resume on every rank. With FSDP,
+`gather` writes one checkpoint that loads at any world size, bounded by what
+rank 0 can hold; `per_rank` has each rank write its own shard, which is much
+cheaper and resumes only at the same world size (`reshard_on_resume` handles a
+different one after a restart). Across machines without a bucket or a shared
+filesystem, `replicate_every` copies each rank's store to a peer on another
+machine, so losing one machine costs at most that many checkpoints; with a
+bucket, a rank that comes up with an empty disk pulls its store back. Ravex
+also trains across slow links between distant nodes with an outer loop that
+exchanges parameter differences every `outer_inner_steps` instead of gradients
+every step.
 
-Full reference: [docs/configuration.md](docs/configuration.md).
+The full option list, with the measurements behind the defaults:
+[docs/configuration.md](docs/configuration.md). How the patches, the step
+count and the resume work: [docs/how-it-works.md](docs/how-it-works.md).
 
-**What `ravex.log_metrics` costs a step.** Measured with `bench/metrics_cost.py`
-on an RTX 3090: a 16.8M-parameter model at 4.68 ms a step. Logging the loss, the
-gradient norm and the learning rate every step, as device tensors, adds
-**0.5%**. It does not wait for the GPU: the reduction is queued on the device
-and a thread of its own reads it back. Sending the run to a backend as it
-trains (`metrics_endpoint`) adds nothing measurable on top. Histograms are
-the expensive part: a 64-bin histogram of each of the four weight matrices
-(4.2M values each) every ten steps adds **11%**, about 5 ms each time they are
-taken. Log them every hundred steps, not every ten.
+## Limits
 
-## Backends
+- Under HuggingFace `Trainer` and Lightning the state comes back exactly, but
+  with shuffling and dropout on, the resumed run sees a different random draw,
+  because the framework drives the dataloader and the RNG on its own schedule.
+  Plain loops, DDP and FSDP replay exactly.
+- An `IterableDataset` has no index sampler, so its position cannot be
+  replayed; everything else is still restored.
+- A sharded model gets no final checkpoint at exit, since collecting one is a
+  collective and ranks stop being in lockstep at shutdown; the newest
+  checkpoint is the last periodic one.
+- A failed checkpoint is lost, logged, and tried again at the next one;
+  a failure inside Ravex never stops the training (`fallback_on_error`).
 
-**`moonclip`** (default) — the [Moonclip](https://github.com/JHNMACHINE/moonclip)
-engine: per-tensor delta tracking, so unchanged weights cost zero I/O; zstd
-compression; background writes; direct S3/R2 sync.
-
-**`torch_save`** — one `.pt` file per checkpoint, written on a background
-thread. Used automatically when Moonclip is not installed. Correct, just larger
-and slower.
-
-### Ravex and Moonclip
-
-**Saving files is Moonclip's, the run is Ravex's** (GPU-267). Ravex decides
-when to save and what, puts it back into the live objects on resume, and
-coordinates one or more machines. Moonclip decides how the bytes land and
-where, bucket keys included. Ravex is pure Python and has no storage code of
-its own: no S3 client, no credentials.
-
-```
-your training script
-        │  @ravex.train_loop
-        ▼
-Ravex     when to save and what: model, optimizer, scheduler, scaler,
-          dataloader position, RNG; resume into the live objects;
-          HF Trainer, Lightning, DeepSpeed, DCP. And the run on one or
-          more machines: rendezvous, joiners, the replication ring,
-          the store transport, reshard planning
-        │  named tensors, a step, metadata
-        ▼
-Moonclip  how the bytes land: deltas, compression, packs, the manifest,
-          integrity, retention, the sync to a bucket and its keys
-        │
-        ▼
-local disk  ·  S3 / R2 bucket
-```
-
-Ravex does copy a store's files between machines - the replication ring, and a
-node joining a run - but as opaque files: it never reads or writes what is in
-them. Its own small records (`run.json`, metrics, the audit log) sit beside
-the checkpoints, and Moonclip carries them to the bucket.
-
-Configuration follows the same line: `storage` in `ravex.yaml` says where the
-bucket is ([configuration.md](docs/configuration.md#storage)); the keys and
-Moonclip's tuning are in
-[Moonclip's README](https://github.com/JHNMACHINE/moonclip#s3-backend).
-
-## How it works
-
-Ravex patches five things in PyTorch and nothing in your code:
-
-- `nn.Module.__init__` and `.train()` — to notice your models
-- `Optimizer.__init__` — to attach a step hook to every optimizer
-- `DataLoader.__init__` and `.__iter__` — to track the dataset position and to
-  find the one moment where a resume can be applied
-
-The step counter advances once per `optimizer.step()`, so gradient accumulation
-needs no special handling. Checkpoints are collected at the *top of an
-iteration*, never inside one: mid-iteration the LR scheduler has not stepped
-yet, and a checkpoint taken there resumes with a stale learning rate.
-
-That moment comes from the `DataLoader` iterator. **A loop that has no
-`DataLoader`** — one over tensors that are already batched — has none to give,
-and has to hand it over itself:
-
-```python
-for begin in range(0, len(data), batch_size):
-    ravex.batch_boundary()
-    ...
-    optimizer.step()
-    scheduler.step()
-```
-
-Without it a checkpoint falls back to mid-step and pays the stale learning rate
-above, and an [outer round](docs/configuration.md#training-across-the-internet)
-— which cannot fall back, because it *writes* parameters — never closes at all.
-Ravex says so after a couple of steps rather than training on in silence.
-
-Collection runs on the training thread — it has to, to be consistent with the
-step that just finished — and copies the state; the write itself happens in the
-background. What the loop pays for is the copy, not the I/O.
-
-More detail: [docs/how-it-works.md](docs/how-it-works.md).
-
-## Safety
-
-Ravex is designed to be un-noticeable when it works and harmless when it does
-not:
-
-- every hook is wrapped; if one raises, your call still returns normally
-- if a checkpoint fails, Ravex disables itself and logs it — training continues
-- nothing is ever written to stdout; logs go to `log_file`, or to stderr at
-  WARNING and above
-- installing the package starts no checkpointing anywhere, and neither does
-  importing it. Ravex does nothing at all until a decorated function is called,
-  which is a much easier promise to check than the one this used to make: it is
-  visible in the source of the thing being checkpointed
-- the patches go on at that call and come off when it returns, including when it
-  returns by raising. A process that finishes training is a process with an
-  unpatched PyTorch in it
-- `RAVEX_ENABLED=0` turns it off for a single run without touching the code
-
-## Status and limits
-
-Alpha. Works with plain PyTorch loops, and with anything built on them, since
-the hooks are on PyTorch itself.
-
-### With a framework driving the loop
-
-HuggingFace `Trainer` and Lightning are covered by their own tests, and the
-result deserves to be stated precisely rather than as "it works":
-
-- **State restoration is exact.** Model, optimizer, LR scheduler and step count
-  all come back. With the per-step randomness removed, a killed run resumes
-  into a loss sequence identical to the uninterrupted one.
-- **So does the framework's own progress.** Both frameworks stop on a counter
-  of their own — `state.global_step` for `Trainer`, the fit loop's progress for
-  Lightning — and without it a resumed run trains its whole budget again from
-  the checkpoint. Ravex saves and restores the progress in `Trainer.state`
-  (`global_step`, `log_history`, `best_metric` and the rest) and Lightning's
-  `fit_loop` state, so the resume trains what was left and Lightning's
-  `current_epoch` is right. One exception, on `Trainer` only: `state.epoch` is
-  recomputed from its own loop and, after a resume, counts only this process's
-  epochs. Turn the framework's own checkpointing off — `save_strategy="no"`,
-  `enable_checkpointing=False` — or the weights are written twice; Ravex warns
-  when it is on.
-- **Replay is not.** With shuffling and dropout on, the resumed run continues
-  correctly from the checkpointed state but sees a different draw. Both
-  frameworks iterate the dataloader on their own schedule and consume the
-  global RNG around the loop, so the epoch-start snapshot no longer lines up.
-
-Plain loops, DDP and FSDP *are* bit-exact with randomness on. This is a
-framework-interaction limit, not a general one, and it costs you a different
-shuffle from the resume point onwards — not a wrong model.
-
-Verified: plain loops, gradient accumulation, LR schedulers, AMP loss-scale
-state, `num_workers > 0`, DDP, and FSDP. A killed `torchrun` job resumes on
-*every* rank with bit-identical losses, sharded or not, and the checkpoint it
-leaves behind loads into a plain single-process model afterwards.
-
-### Sharded models
-
-With FSDP each rank holds a slice of every parameter, so `state_dict()` returns
-a fragment. Two ways to turn that into a checkpoint, picked with
-`sharded_checkpoints`:
-
-**`gather`** (default) rebuilds the whole state on rank 0, which writes it. The
-checkpoint is then independent of the topology that produced it — eight GPUs in,
-one out — and it does not scale: rank 0 has to hold the entire model and
-optimizer in host memory, and it is the rank that then does the writing.
-
-**`per_rank`** has every rank write its own shard into its own store,
-`<storage.path>/rank_<n>`. Nothing is gathered, so nothing is bounded by one
-rank's memory, and on a 1.48B model collecting the state went from 15.6 s to
-1.5 s. What you give up is the resharding: those shards are cut for one topology,
-so the checkpoint resumes at the same world size and starts clean at any other.
-Needs FSDP2 — under FSDP1 Ravex degrades to `gather` and says so.
-
-Either way, collecting is a **collective**: every rank participates, and there is
-**no final checkpoint at exit** for a sharded model. Shutdown is where ranks stop
-being in lockstep, and a collective nobody else joins hangs. Losing the last few
-steps is bounded; a hang is not. Set `checkpoint_every` accordingly.
-
-Numbers and the FSDP1 details: [docs/configuration.md](docs/configuration.md).
-
-### More than one machine
-
-Ranks, directories and collectives all cross machines unchanged. What does not
-is `per_rank` on local storage: each machine writes only its own ranks' shards
-to its own disk, so no machine holds a whole checkpoint. It resumes only if
-every machine is handed the same ranks again — no launcher promises that — and
-not at all if a machine is lost. Ravex probes the storage at activation and
-says which case you are in rather than letting you find out at the first resume.
-
-Two ways out, and they are not equivalent:
-
-- **A bucket** (`storage.type: s3`). Checkpoints leave the machines on their
-  own, and a rank that comes up with an empty disk pulls its store back, so
-  the bucket is something you can resume from and not only a backup.
-- **`replicate_every`**, when there is no bucket and no shared filesystem. Each
-  rank copies its store to a peer on another machine every N checkpoints.
-  Survives losing any one machine, at a cost of at most N checkpoints of
-  progress.
-
-Keeping the data after the run ends is yours unless a remote is configured —
-and for a sharded model the newest checkpoint is the last periodic one, since
-there is none at exit.
-
-Known limits today:
-
-- **`IterableDataset`**: no index sampler exists, so the stream position cannot
-  be replayed. Everything else is still restored.
-- **Your loop's bounds**: a resumed script runs its own `for epoch in
-  range(N)` again from the top; it has no idea 3000 steps already happened. Set
-  `max_steps` and Ravex ends the run at the right step regardless of how many
-  times the process restarted.
-
-Under AMP, note that an overflowing gradient makes `scaler.step()` skip the
-optimizer. Ravex counts optimizer steps, not loop iterations, so a skipped
-iteration does not advance the counter — which is the right unit, since nothing
-about the model changed, but it does mean the step count and the number of
-batches you fed differ.
-
-The GPU paths — AMP with real fp16 overflow, the CUDA RNG, FSDP1, NCCL — are
-covered by `integration/test_cuda.py`, which skips without a GPU. They were
-last verified on 8× RTX 5060 Ti with torch 2.12/cu130.
-
-## Project layout
-
-Everything under `ravex` is private except `ravex` itself: the public surface
-is `train_loop()`, `track()`, a handful of small helpers (`checkpoint`, `flush`,
-`step`, `status`, `is_active`, `deactivate`), `__version__` and the `ravex`
-command. Every name below that starts with an underscore is free to move.
-
-```
-ravex/
-├── __init__.py       Public surface, and nothing else
-├── _cli.py           ravex status
-├── _config.py        Defaults < ravex.yaml < RAVEX_*
-├── _patches.py       The five monkey patches on PyTorch
-├── _registry.py      What is being trained, held by weakref
-├── _runtime.py       One per process; what the patches call into
-├── _resume.py        Best-effort restore
-├── _backends.py      moonclip | torch_save
-├── _sampler.py       Dataset position
-├── _frameworks.py    HF Trainer / Lightning / Accelerate detection
-├── _dist/            More than one GPU, more than one machine
-│   ├── collectives.py    gather vs per_rank; the SIGTERM channel
-│   ├── reshard.py        8 shards onto 4 ranks — the planner
-│   ├── identity.py       Who wrote this store, as part of which run
-│   ├── replication.py    Each rank copies its store to a peer
-│   ├── transport.py      How a store crosses a socket: the framing and the copy
-│   └── elastic.py        Membership changes without a restart
-└── _interop/         Checkpoints somebody else wrote
-    ├── foreign.py        What is this directory? Layout first, fields second
-    ├── zero.py           DeepSpeed ZeRO stages 1–3
-    ├── dcp.py            torch.distributed.checkpoint — FSDP, Megatron-core
-    ├── convert.py        Into the shape the resume path already consumes
-    └── resume.py         When to act on all that, and when to decline
-```
-
-The two subpackages are groups, not layers: neither re-exports anything, and
-callers import the submodule they want inside the function that wants it. That
-used to be a startup-cost rule — the `.pth` ran in every interpreter on the
-machine, so an import that did not have to happen was paid for by every
-`python -c` on the box. The `.pth` is gone and the discipline is kept for the
-weaker reason that still holds: `_dist.collectives` pulls in
-`torch.distributed`, and a single-process run should load neither subpackage.
-
-The import graph is a DAG with `_runtime` as its only hub; there are no cycles,
-and nothing in `_interop` is imported by anything outside it except `_runtime`.
-
-**And around them**
-
-| Path | |
-|---|---|
-| `tests/unit/` | About 1300 tests in one process, no GPU and no container, and a verdict on any OS. Named for what they cover: `test_dist_*`, `test_interop_*` |
-| `tests/distributed/` | About 100 tests that run several nodes or ranks - processes, or threads over real sockets with deadlines. Linux decides them; `*_nodes.py` is the half of a subject whose other half is in `tests/unit/` |
-| `integration/` | What only exists across a real process boundary — a resume from an empty interpreter, `torchrun`, a SIGKILL that runs no `finally`. Linux, in Docker |
-| `integration/scripts/` | The training scripts those tests kill and restart |
-| `integration/multinode/` | One container per rank, for questions `--nproc_per_node` cannot ask ([README](integration/multinode/README.md)) |
-| `integration/two-machines/` | The rented-box harness: two real hosts, real network |
-| `docs/` | [configuration.md](docs/configuration.md), [how-it-works.md](docs/how-it-works.md) |
-| `.github/workflows/` | `checks.yml` on branches, `tests/unit` only; `ci.yml` on main adds the moonclip backend - `tests/unit` and `tests/distributed` as separate jobs - and both integration jobs |
-
-That is about 22k lines across 38 Python modules (the two subpackages
-included), against 19k lines of tests. There is no Rust since GPU-267: the
-files are Moonclip's, and the reshard planner and the store transport went back
-to Python.
+What changed between versions is in the [CHANGELOG](CHANGELOG.md).
 
 ## Development
 
 ```bash
 pip install -e ".[dev]"
-pytest
+pytest tests/unit
 ```
 
-The unit suite runs in-process. The parts that only exist across a real process
-boundary — a resume starting from an empty interpreter, config discovery from
-the working directory, `torchrun`, and a SIGKILL that runs no `finally` — live
-in `integration/` and need Linux:
+`tests/unit` runs in one process on any OS. `tests/distributed` and
+`integration/` start several processes, use `torchrun` or kill a process with
+SIGKILL, and need Linux. The integration tests run in their own image, with
+`--init` so that the SIGKILL they send is not a no-op:
 
 ```bash
 docker build -f integration/Dockerfile -t ravex-integration .
-docker run --rm ravex-integration
+docker run --rm --init ravex-integration
 ```
 
 ## Licence
