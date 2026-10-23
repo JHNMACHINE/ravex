@@ -749,6 +749,21 @@ class RavexRuntime:
         """Whether ``step`` is a checkpoint, and not one of the deltas between."""
         return step % self.config.checkpoint_every == 0
 
+    def resume_if_ready(self) -> None:
+        """Resume now if it has not happened and the run can be restored.
+
+        Ready means an optimizer exists: what a resume restores is the model
+        and the optimizer together, and one asked for before the optimizer is
+        built would restore the model and leave the optimizer's state behind.
+        Called from the batch boundary and from `ravex.step()`, the two places
+        a loop without a dataloader reaches before its first step (GPU-275).
+        """
+        if not self._enabled or self._resume_attempted or self._restoring:
+            return
+        if not self.registry.optimizers:
+            return
+        self._try_resume()
+
     def on_batch_boundary(self) -> None:
         """Called at the top of each training iteration, before the batch.
 
@@ -758,6 +773,13 @@ class RavexRuntime:
         """
         if not self._enabled:
             return
+        # The top of the first iteration, for a loop with no dataloader: the
+        # model and the optimizer exist and no batch has gone through them.
+        # Left to the first `optimizer.step()` instead, the resume landed
+        # after a forward and backward on the fresh weights - the restored
+        # state overwrote that update, the step was counted anyway, and the
+        # batch it should have trained on never was (GPU-275).
+        self.resume_if_ready()
         # Remembered because the *checkpoint* hatch in `on_step` reads "no
         # dataloader" as "no boundary". A loop that calls
         # `ravex.batch_boundary()` has the boundary without having a

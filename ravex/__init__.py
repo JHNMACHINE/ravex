@@ -505,11 +505,20 @@ def flush() -> None:
 
 
 def step() -> int:
-    """Current optimizer-step count as Ravex sees it."""
+    """Current optimizer-step count as Ravex sees it.
+
+    In a resumed run, the step it resumed at from the moment the optimizer
+    exists: asking is enough to have the resume happen, so a script that
+    prints where it starts, or seeds its first batch from the step, sees the
+    resumed number and not 0 (GPU-275).
+    """
     from ravex._runtime import get_runtime
 
     runtime = get_runtime(create=False)
-    return runtime.step if runtime is not None else 0
+    if runtime is None:
+        return 0
+    runtime.resume_if_ready()
+    return runtime.step
 
 
 def status() -> dict[str, object | None]:
