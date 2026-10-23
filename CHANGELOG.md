@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **H can follow the link: `outer_inner_steps: auto` (GPU-231).** Or
+  `outer_auto_steps: true`. The run starts from 500 steps per round and after
+  every round moves H toward the value at which the training waits
+  `outer_network_share` of the round (a quarter by default) for the network,
+  from the round's own clock: blocking, the whole exchange; with
+  `outer_overlap`, what the network outlasts the next round's training by. At
+  most doubled or halved per round, a change under a tenth of H not made, and
+  inside `outer_min_inner_steps`..`outer_max_inner_steps` (32-2000). The value
+  is decided on the rendezvous store like the round's set, so every node takes
+  the same one at the same round - the round now open when blocking, the next
+  one with `outer_overlap` - and it travels to a joiner, to a resumed run and
+  into the model's series as `train/outer/inner_steps`. Not with
+  `outer_round_seconds`, which is said and turns it off. `bench/round_steps_auto.py`
+  compares it with fixed H at equal wall clock on a simulated link.
+
 ## 0.9.0 — 2026-10-23
 
 ### Fixed

@@ -278,6 +278,41 @@ def decide_round(store, scope, round_number: int, rank: int, collected,
         ) from exc
 
 
+#: The H the run takes after a round: the job's digest, then the round (GPU-231).
+INNER_STEPS_KEY = "ravex/gpu231/inner-steps/%s/%d"
+
+
+def decide_inner_steps(store, scope, round_number: int, rank: int, proposal: int,
+                       deadline: float) -> int:
+    """The H every node takes after ``round_number``, as the store decided it.
+
+    GPU-231. Each node measures its own round and comes to its own answer -
+    its clock, its share of the waiting - and two nodes on two values of H
+    stop closing their rounds together: the one with the smaller H waits for
+    the other at every gather, for as long as the difference takes to train.
+    So, like the round's set (:func:`decide_round`), the first proposal to
+    reach the store with ``compare_set`` is the one that stays, and every node
+    takes that. Which node's measurement wins does not matter much: they
+    measured the same round of the same link.
+
+    Raises once ``deadline`` passes without an answer. The caller keeps the H
+    it has, which costs waiting and never a second model: every node still
+    applies the set the round decided, whatever H filled it.
+    """
+    key = INNER_STEPS_KEY % (_job_digest(scope), round_number)
+    offer = json.dumps({"by": int(rank), "steps": int(proposal)})
+    while True:
+        try:
+            raw = store.compare_set(key, "", offer)
+            break
+        except Exception:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.2)
+    text = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
+    return int(json.loads(text)["steps"])
+
+
 #: Where a node says how far its outer loop had got when the run started: the
 #: job's digest, then its rank (GPU-212).
 PROGRESS_KEY = "ravex/gpu212/progress/%s/%d"

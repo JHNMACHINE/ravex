@@ -983,6 +983,10 @@ def outer_store_config(config):
     else:
         window = config.checkpoint_every * max(int(config.keep_last), 1)
     per_round = max(int(config.outer_inner_steps), 1)
+    if config.outer_auto_steps:
+        # H may come down to its floor (GPU-231), and the rounds inside the
+        # window are counted at the shortest a round can be.
+        per_round = min(per_round, max(int(config.outer_min_inner_steps), 1))
     rounds = -(-window // per_round) + 1
     return replace(
         store_config_at(config, OUTER_STORE),

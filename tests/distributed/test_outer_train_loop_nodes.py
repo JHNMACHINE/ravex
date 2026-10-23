@@ -39,7 +39,7 @@ def _store_client(port):
 
 
 def a_node(rank, world, port, root, rounds, inner, queue, boundary="public", log=False, resume=False, barrier=None,
-           overlap=False):
+           overlap=False, auto=False):
     """One rank: init the group, then a training loop that knows nothing."""
     try:
         import torch.distributed as dist
@@ -82,6 +82,10 @@ def a_node(rank, world, port, root, rounds, inner, queue, boundary="public", log
             checkpoint_every=10**9,
             checkpoint_on_exit=True,
             outer_overlap=overlap,
+            # GPU-231: bounds a run of a few dozen steps can travel inside.
+            outer_auto_steps=auto,
+            outer_min_inner_steps=2,
+            outer_max_inner_steps=32,
             # Inside every round when the metrics are under test (GPU-274):
             # the default 10 would skip the first round of 8 steps.
             histograms_every=inner if log else 200,
@@ -131,8 +135,21 @@ def a_node(rank, world, port, root, rounds, inner, queue, boundary="public", log
                 # (GPU-256). Not the process group's barrier: Ravex uses that
                 # group too, and two collectives meeting out of order hang.
                 barrier.wait(timeout=240)
+            if auto:
+                # The outer parameters as the training ended (GPU-231): the
+                # model also holds the steps trained after the last round,
+                # which differ per rank once H no longer divides the loop's
+                # length. A round still in flight is landed first, while the
+                # peer is there to finish it; the runtime is gone by the time
+                # the decorator returns.
+                from ravex._runtime import get_runtime
+
+                runtime = get_runtime(create=False)
+                runtime._land_round(wait=True)
+                outer.extend(float(value.sum()) for _, value in sorted(runtime._outer.outer.items()))
             return before, model, loss_fn
 
+        outer = []
         # Measured once the run has ended rather than inside it: with
         # `overlap` the last round lands at the shutdown (GPU-230), and a
         # blocking run's model is the same either side of it.
@@ -146,12 +163,13 @@ def a_node(rank, world, port, root, rounds, inner, queue, boundary="public", log
                 after,
                 sums,
                 list(said),
+                outer,
             )
         )
     except BaseException as exc:  # reported rather than a silent empty queue
         import traceback
 
-        queue.put((rank, None, None, None, traceback.format_exc()))
+        queue.put((rank, None, None, None, traceback.format_exc(), None))
     finally:
         try:
             import torch.distributed as dist
@@ -167,7 +185,8 @@ def rounds_of(said):
     return [line for line in said if "Outer round" in line and "took" in line]
 
 
-def run_two(tmp_path, rounds=3, inner=8, boundary="public", log=False, resume=False, overlap=False):
+def run_two(tmp_path, rounds=3, inner=8, boundary="public", log=False, resume=False, overlap=False,
+            auto=False):
     context = mp.get_context("spawn")
     queue = context.Queue()
     barrier = context.Barrier(2)
@@ -177,7 +196,7 @@ def run_two(tmp_path, rounds=3, inner=8, boundary="public", log=False, resume=Fa
         context.Process(
             target=a_node,
             args=(rank, 2, port, str(tmp_path), rounds, inner, queue, boundary, log, resume, barrier,
-                  overlap),
+                  overlap, auto),
         )
         for rank in range(2)
     ]
@@ -185,10 +204,10 @@ def run_two(tmp_path, rounds=3, inner=8, boundary="public", log=False, resume=Fa
         worker.start()
     results = {}
     for _ in workers:
-        rank, before, after, sums, said = queue.get(timeout=300)
+        rank, before, after, sums, said, outer = queue.get(timeout=300)
         if before is None:
             pytest.fail("rank %d failed:\n%s" % (rank, said))
-        results[rank] = (before, after, sums, said)
+        results[rank] = (before, after, sums, said, outer)
     for worker in workers:
         worker.join(60)
         assert worker.exitcode == 0, "rank exited with %s" % worker.exitcode
@@ -206,7 +225,7 @@ def test_a_training_loop_that_knows_nothing_trains_with_a_peer(tmp_path):
     """
     results = run_two(tmp_path)
 
-    for rank, (before, after, _, _said) in results.items():
+    for rank, (before, after, _, _said, _) in results.items():
         assert after < before / 2, "rank %d did not train: %.4f -> %.4f" % (
             rank,
             before,
@@ -229,7 +248,7 @@ def test_rounds_in_flight_still_leave_the_ranks_on_one_model(tmp_path):
     same model, and the log says each landed rather than blocked."""
     results = run_two(tmp_path, rounds=4, overlap=True)
 
-    for rank, (before, after, _, said) in results.items():
+    for rank, (before, after, _, said, _) in results.items():
         assert after < before / 2, "rank %d did not train: %.4f -> %.4f" % (rank, before, after)
         landed = [line for line in said if "landed" in line]
         assert len(landed) == 4, "rank %d: %s" % (rank, said)
@@ -239,6 +258,33 @@ def test_rounds_in_flight_still_leave_the_ranks_on_one_model(tmp_path):
         "the two ranks ended with different models: %s against %s\nrank0: %s\nrank1: %s"
         % (left, right, rounds_of(results[0][3]), rounds_of(results[1][3]))
     )
+
+
+@pytest.mark.skipif(sys.platform == "darwin", reason="spawn + gloo is slow on macOS")
+@pytest.mark.parametrize("overlap", [False, True], ids=["blocking", "overlap"])
+def test_ranks_that_let_the_link_set_h_change_it_together(tmp_path, overlap):
+    """GPU-231 through the runtime: each rank proposes an H from its own
+    clock after every round, the store keeps one, and both take it at the
+    same round. The rounds the two ranks close then pair up one for one with
+    the same number of local steps, and they end on one model."""
+    results = run_two(tmp_path, rounds=6, inner=8, overlap=overlap, auto=True)
+
+    def closed(said):
+        return [line for line in said if line.startswith("Outer round") and "closed over" in line]
+
+    def moved(said):
+        return [line for line in said if line.startswith("Outer rounds go from")]
+
+    for rank, (before, after, _, said, _) in results.items():
+        assert after < before, "rank %d did not train: %.4f -> %.4f" % (rank, before, after)
+    left, right = results[0][3], results[1][3]
+    assert moved(left), "H never moved, so nothing was tested:\n%s" % "\n".join(left)
+    assert [line.split(":")[0] for line in moved(left)] == [line.split(":")[0] for line in moved(right)]
+    assert closed(left) == closed(right), "the ranks closed different rounds:\n%s\n%s" % (
+        "\n".join(closed(left)), "\n".join(closed(right)),
+    )
+    assert results[0][4], "rank 0 reported no outer parameters"
+    assert results[0][4] == pytest.approx(results[1][4], abs=1e-5)
 
 
 @pytest.mark.skipif(sys.platform == "darwin", reason="spawn + gloo is slow on macOS")
@@ -279,7 +325,7 @@ def test_a_loop_that_hands_over_nothing_trains_with_its_peer(tmp_path):
     them due - so the two ranks end on one model, as with the call."""
     results = run_two(tmp_path, boundary="forward")
 
-    for rank, (before, after, _, said) in results.items():
+    for rank, (before, after, _, said, _) in results.items():
         assert after < before / 2, "rank %d did not train: %.4f -> %.4f" % (rank, before, after)
         assert not [line for line in said if "ravex.batch_boundary()" in line], said
     left, right = results[0][2], results[1][2]
@@ -315,7 +361,7 @@ def test_a_loop_that_hands_over_no_boundary_is_told_so(tmp_path):
     """
     results = run_two(tmp_path, boundary="unseen")
 
-    for rank, (_before, _after, _sums, said) in results.items():
+    for rank, (_before, _after, _sums, said, _) in results.items():
         closed = rounds_of(said)
         assert len(closed) == 1 and closed[0].startswith("Outer round 1 "), (
             "rank %d closed rounds the loop never gave it a moment for, or not "

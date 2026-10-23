@@ -1333,12 +1333,20 @@ class RavexRuntime:
         self._outer_peers = self._membership.peers_at(loop.round_number)
         self._say_who_is_unreachable(exchange, self._outer_peers)
         logger.info(
-            "Outer loop on: %s, %d inner step(s) per round%s, reports staged "
+            "Outer loop on: %s, %d inner step(s) per round%s%s, reports staged "
             "in %s.",
             "node %d, joined at round %d" % (rank, loop.round_number)
             if joining
             else "rank %d of %d" % (rank, world),
-            self.config.outer_inner_steps,
+            loop.inner_steps or self.config.outer_inner_steps,
+            " to start, moved by the link between %d and %d to wait %.0f%% "
+            "of the round for the network" % (
+                self.config.outer_min_inner_steps,
+                self.config.outer_max_inner_steps,
+                100.0 * self.config.outer_network_share,
+            )
+            if self.config.outer_auto_steps
+            else "",
             " or %.0fs" % self.config.outer_round_seconds
             if self.config.outer_round_seconds
             else "",
@@ -2019,6 +2027,10 @@ class RavexRuntime:
             # would have launched was trained on parameters nobody holds.
             return
         started = time.monotonic()
+        # What the round cost in training, for the H the next one gets
+        # (GPU-231); read before the exchange starts the next round.
+        trained_seconds = self._outer.trained_seconds()
+        trained_steps = int(self._outer.steps_this_round)
         try:
             self._before_round()
             means = self._round_means.take() if self._round_means is not None else None
@@ -2038,6 +2050,8 @@ class RavexRuntime:
             self._round_failed(exc)
             return
         report["stalled_seconds"] = time.monotonic() - started
+        report["trained_seconds"] = trained_seconds
+        report["trained_steps"] = trained_steps
         self._round_closed(report, time.monotonic() - started)
 
     def _before_round(self) -> None:
@@ -2198,6 +2212,8 @@ class RavexRuntime:
         self._outer.land(holder.flight)
         report = holder.report
         report["stalled_seconds"] = holder.stalled
+        report["trained_seconds"] = holder.flight.trained_seconds
+        report["trained_steps"] = holder.flight.steps
         report["landed_after_steps"] = int(self._outer.steps_this_round)
         logger.info(
             "Outer round %d landed %d local step(s) after it was launched; the "
@@ -2249,9 +2265,79 @@ class RavexRuntime:
                 report.get("between_seconds", 0.0),
                 report.get("between_wait_seconds", 0.0),
             )
+        self._decide_inner_steps(report, seconds)
         self._write_model_series(report, seconds)
         # The round is applied, and this is the state until the next closes.
         self._save_outer_state(self._outer)
+
+    def _decide_inner_steps(self, report: Dict[str, Any], seconds: float) -> None:
+        """Move H toward what the link asks for, the same on every node (GPU-231).
+
+        ``seconds`` is the round's network as the training saw it: blocking,
+        the whole exchange the training stood still for; with
+        `outer_overlap`, launch to result, of which the training waited
+        only ``stalled_seconds``. This node proposes from its own
+        measurement, the store keeps the first proposal
+        (:func:`ravex._dist.exchange.decide_inner_steps`), and every node
+        takes that one, for the round now open when blocking and for the next
+        one with `outer_overlap` - see :meth:`OuterLoop.set_inner_steps`.
+        A round decided empty measured no exchange, and proposes no change.
+        """
+        loop = self._outer
+        exchange = self._exchange
+        if not self.config.outer_auto_steps or loop is None or exchange is None:
+            return
+        if loop.inner_steps is None:
+            return
+        from ravex._dist.exchange import decide_inner_steps
+        from ravex._dist.outer import next_inner_steps
+
+        overlap = bool(self.config.outer_overlap)
+        current = int(loop.inner_steps)
+        proposal = current
+        if report.get("nodes"):
+            proposal = next_inner_steps(
+                current,
+                trained_seconds=float(report.get("trained_seconds") or 0.0),
+                trained_steps=int(report.get("trained_steps") or 0),
+                network_seconds=float(seconds),
+                overlap=overlap,
+                share=self.config.outer_network_share,
+                low=self.config.outer_min_inner_steps,
+                high=self.config.outer_max_inner_steps,
+            )
+        try:
+            decided = decide_inner_steps(
+                exchange.store,
+                exchange.scope_base or exchange.scope,
+                int(report["round"]),
+                int(exchange.rank),
+                proposal,
+                time.monotonic() + min(60.0, float(self.config.outer_deadline)),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not read the H decided after outer round %s (%s: %s); "
+                "this node keeps %d inner step(s) per round, and may wait for "
+                "its peers until a later round is decided.",
+                report.get("round"), type(exc).__name__, exc, current,
+            )
+            return
+        report["inner_steps"] = decided
+        loop.set_inner_steps(decided, now=not overlap)
+        if decided != current:
+            logger.info(
+                "Outer rounds go from %d to %d inner step(s) %s: round %d "
+                "trained %.1fs and its network took %.1fs, against a target of "
+                "%.0f%% of the round waiting.",
+                current,
+                decided,
+                "from the next round" if overlap else "from this round",
+                int(report["round"]),
+                float(report.get("trained_seconds") or 0.0),
+                float(seconds),
+                100.0 * self.config.outer_network_share,
+            )
 
     def _write_model_series(self, report: Dict[str, Any], seconds: float) -> None:
         """Log the round as a point on the model's series (GPU-135).
@@ -2297,6 +2383,10 @@ class RavexRuntime:
                 # training by with `outer_overlap` (GPU-230).
                 "train/outer/stalled_seconds": report.get("stalled_seconds", seconds),
             }
+            if report.get("inner_steps"):
+                # The H decided after this round (GPU-231): what the link
+                # led `outer_auto_steps` to, beside the steps it measured.
+                values["train/outer/inner_steps"] = report["inner_steps"]
             values.update(report.get("model_metrics") or {})
             prepared: Dict[str, Any] = {name: Scalar(float(value)) for name, value in values.items()}
             # This node's own histograms of the round: not averaged, see

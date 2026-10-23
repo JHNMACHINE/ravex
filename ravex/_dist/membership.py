@@ -701,6 +701,9 @@ def _expectation(outer):
 OUTER_PREFIX = "outer::"
 MOMENTUM_PREFIX = "momentum::"
 MODEL_STEPS_KEY = "ravex::model_steps"
+#: H as the run has decided it, and the H decided for the next round: 0 for
+#: none (GPU-231).
+INNER_STEPS_KEY = "ravex::inner_steps"
 
 
 def state_payload(loop) -> Dict[str, object]:
@@ -746,6 +749,16 @@ def state_payload(loop) -> Dict[str, object]:
     # run's axis instead of starting one of their own at zero. An integer
     # tensor, which no `save_dtype` cast touches.
     payload[MODEL_STEPS_KEY] = torch.tensor(int(getattr(loop, "model_steps", 0)), dtype=torch.int64)
+    # H as the run decided it (GPU-231): a joiner holding the configured start
+    # instead would close its rounds at a different step from everyone else.
+    # Shipped even when H is fixed, so the payload has one shape.
+    payload[INNER_STEPS_KEY] = torch.tensor(
+        [
+            int(getattr(loop, "inner_steps", None) or 0),
+            int(getattr(loop, "pending_inner_steps", None) or 0),
+        ],
+        dtype=torch.int64,
+    )
     return payload
 
 
@@ -760,6 +773,11 @@ def apply_state(loop, payload: Dict[str, object]) -> None:
             buffers[key[len(MOMENTUM_PREFIX):]] = value
         elif key == MODEL_STEPS_KEY:
             loop.model_steps = int(value.item() if hasattr(value, "item") else value)
+        elif key == INNER_STEPS_KEY:
+            current, pending = (int(v) for v in value.tolist())
+            if current and getattr(loop, "inner_steps", None) is not None:
+                loop.inner_steps = current
+                loop.pending_inner_steps = pending or None
 
     if not outer:
         raise MembershipError(

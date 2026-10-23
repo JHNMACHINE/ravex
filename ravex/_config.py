@@ -589,7 +589,34 @@ class RavexConfig:
     #: hundreds. So 500 stands: nothing measured argues it down, and what
     #: should actually set it is the link (`bench/round_link_cost.py` reports
     #: the H at which the network is a quarter of the round).
+    #:
+    #: ``auto`` is ``outer_auto_steps: true`` with 500 as the start.
     outer_inner_steps: int = 500
+
+    #: Let the link set H (GPU-231). The run starts from
+    #: `outer_inner_steps` and after every round moves it toward the H at
+    #: which the training waits `outer_network_share` of the round for the
+    #: network - at most doubling or halving it per round, and inside
+    #: `outer_min_inner_steps`..`outer_max_inner_steps`. The value is decided
+    #: on the rendezvous store, so every node changes it at the same round.
+    #: See `ravex._dist.outer.next_inner_steps` for the rule.
+    #:
+    #: **It optimises the network's cost, not the model**: nothing during a
+    #: run says what an H does to the loss. Fewer steps per round has been the
+    #: better model wherever it was measured, which is why H also comes down
+    #: when the network leaves room; the bounds are where that stops holding.
+    #: Not with `outer_round_seconds`, which closes the round on the clock and
+    #: leaves H nothing to decide. Also ``RAVEX_OUTER_AUTO_STEPS``.
+    outer_auto_steps: bool = False
+
+    #: The share of the round the training may wait for the network, under
+    #: `outer_auto_steps`. Between 0 and 1. Also ``RAVEX_OUTER_NETWORK_SHARE``.
+    outer_network_share: float = 0.25
+
+    #: The bounds of an automatic H. See
+    #: `ravex._dist.outer.DEFAULT_MIN_INNER_STEPS` for where they come from.
+    outer_min_inner_steps: int = 32
+    outer_max_inner_steps: int = 2000
 
     #: Close the round on the clock instead of, or as well as, on the count.
     #: **This is the one that makes heterogeneous nodes work**: every node
@@ -949,7 +976,18 @@ class RavexConfig:
         if (value := get("OUTER_LOOP")) is not None:
             self.outer_loop = _as_bool(value, self.outer_loop)
         if (value := get("OUTER_INNER_STEPS")) is not None:
-            self.outer_inner_steps = _as_int(value, self.outer_inner_steps)
+            if value.strip().lower() == "auto":
+                self.outer_auto_steps = True
+            else:
+                self.outer_inner_steps = _as_int(value, self.outer_inner_steps)
+        if (value := get("OUTER_AUTO_STEPS")) is not None:
+            self.outer_auto_steps = _as_bool(value, self.outer_auto_steps)
+        if (value := get("OUTER_NETWORK_SHARE")) is not None:
+            self.outer_network_share = _as_float(value, self.outer_network_share)
+        if (value := get("OUTER_MIN_INNER_STEPS")) is not None:
+            self.outer_min_inner_steps = _as_int(value, self.outer_min_inner_steps)
+        if (value := get("OUTER_MAX_INNER_STEPS")) is not None:
+            self.outer_max_inner_steps = _as_int(value, self.outer_max_inner_steps)
         if (value := get("OUTER_ROUND_SECONDS")) is not None:
             self.outer_round_seconds = _as_float(value, self.outer_round_seconds)
         if (value := get("OUTER_LR")) is not None:
@@ -1042,6 +1080,10 @@ class RavexConfig:
         which the runtime logs once it has somewhere to log to.
         """
         defaults = RavexConfig()
+        if isinstance(self.outer_inner_steps, str) and self.outer_inner_steps.strip().lower() == "auto":
+            # A word in a number's place, on purpose (GPU-231).
+            self.outer_auto_steps = True
+            self.outer_inner_steps = defaults.outer_inner_steps
         numeric = (
             "checkpoint_every",
             "full_every",
@@ -1051,6 +1093,8 @@ class RavexConfig:
             "emergency_check_every",
             "emergency_timeout",
             "outer_inner_steps",
+            "outer_min_inner_steps",
+            "outer_max_inner_steps",
             "outer_deadline",
             "metrics_every",
             "histograms_every",
@@ -1070,6 +1114,7 @@ class RavexConfig:
             "handle_sigterm",
             "emergency_coordination",
             "outer_loop",
+            "outer_auto_steps",
             "outer_error_feedback",
             "outer_overlap",
             "fallback_on_error",
@@ -1206,6 +1251,32 @@ class RavexConfig:
             self.outer_inner_steps = 1
         if self.outer_round_seconds < 0:
             self.outer_round_seconds = 0.0
+        if self.outer_min_inner_steps < 1:
+            self.outer_min_inner_steps = 1
+        if self.outer_max_inner_steps < self.outer_min_inner_steps:
+            self.problems.append(
+                f"outer_max_inner_steps={self.outer_max_inner_steps} is below "
+                f"outer_min_inner_steps={self.outer_min_inner_steps}; using "
+                f"{self.outer_min_inner_steps} for both"
+            )
+            self.outer_max_inner_steps = self.outer_min_inner_steps
+        share = _as_float(self.outer_network_share, -1.0)
+        if not 0.0 < share < 1.0:  # NaN too
+            self.problems.append(
+                f"outer_network_share={self.outer_network_share!r} is not a "
+                "share between 0 and 1; using 0.25"
+            )
+            share = 0.25
+        self.outer_network_share = share
+        if self.outer_auto_steps and self.outer_round_seconds:
+            # GPU-231: the clock closes the round wherever H stands, so the
+            # rule would read every round as too short and push H to the top
+            # of its bounds for nothing.
+            self.problems.append(
+                "outer_auto_steps and outer_round_seconds both set; the round "
+                "closes on the clock, so H stays at outer_inner_steps"
+            )
+            self.outer_auto_steps = False
         if self.outer_deadline < 1:
             self.outer_deadline = 1
         if self.metrics_every < 1:

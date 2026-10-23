@@ -1035,7 +1035,10 @@ are paid once per H steps.
 
 ```yaml
 outer_loop: true
-outer_inner_steps: 500
+outer_inner_steps: 500       # or auto, see below
+outer_network_share: 0.25    # with auto: the share of the round spent waiting
+outer_min_inner_steps: 32    # with auto: the bounds H moves inside
+outer_max_inner_steps: 2000
 outer_round_seconds: 0       # or a wall clock, see below
 outer_lr: 0.7
 outer_momentum: 0.7          # not DiLoCo's 0.9, see below
@@ -1112,6 +1115,28 @@ round late costs under 0.01 of held-out loss, half a round 0.015, a whole
 round 0.05-0.07 - which still leaves the pair 0.11-0.12 ahead of one node
 given the same wall clock. It is off until a run on rented machines puts a
 real network time against those numbers.
+
+**`outer_inner_steps: auto` lets the link set H** (GPU-231), the same as
+`outer_auto_steps: true`. The run starts at 500 and, after every round, moves
+H toward the value at which the training waits `outer_network_share` of the
+round for the network, measured by the round itself: blocking, the whole
+exchange against the round's training; with `outer_overlap`, only what the
+network outlasted the next round's training by. H comes down as well as up -
+fewer steps per round has been the better model wherever it was measured - at
+most halved or doubled in one round, and between `outer_min_inner_steps` and
+`outer_max_inner_steps`. Each node proposes from its own clock and the
+rendezvous store keeps the first proposal, so every node changes H at the same
+round: blocking, the round that starts right after; with `outer_overlap`, the
+one after that, since the next round is already training when a result lands.
+A node that joins or resumes takes the H the run had reached. Each change is
+logged, and the model's series has `train/outer/inner_steps`.
+
+It optimises what the network costs, not the model: nothing during a run says
+what an H does to the loss. `bench/round_steps_auto.py` puts it against fixed
+H at equal wall clock on a simulated link. It does not go with
+`outer_round_seconds`: the clock closes the round wherever H stands, so the
+rule would read every round as too short. Both set, H stays fixed and the
+problem is logged.
 
 **`outer_round_seconds` is what makes nodes of different speeds work.** With a
 step count, every node does the same work and the slowest sets the pace. With a

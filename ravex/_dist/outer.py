@@ -49,6 +49,13 @@ took - at the first batch boundary after it is back, at most a round, since
 the next round waits for it - which is the price, and the network leaves the
 round's time. :meth:`OuterLoop.launch`,
 :class:`RoundInFlight` and :meth:`OuterLoop.land` are the three pieces.
+
+**H can follow the link instead of being guessed (GPU-231).** Every round
+already measures how long its training took and how long the network kept the
+training waiting. :func:`next_inner_steps` turns the two into the H at which
+that wait is a fixed share of the round, a gradual correction at a time; the
+runtime decides the value on the store so that every node changes it at the
+same round, and :meth:`OuterLoop.set_inner_steps` is where it lands.
 """
 
 from __future__ import annotations
@@ -84,6 +91,83 @@ DEFAULT_OUTER_MOMENTUM = 0.7
 #: How contributions are combined. See :func:`combine`, which is where the
 #: argument for the default lives.
 COMBINE_MODES = ("mean", "normalized", "step_weighted")
+
+#: The share of a round the training may spend waiting for the network when H
+#: is chosen by :func:`next_inner_steps` (GPU-231). A quarter, the same line
+#: ``bench/round_link_cost.py`` draws when it reports an H for a link.
+DEFAULT_NETWORK_SHARE = 0.25
+
+#: The bounds an automatic H stays inside. Below 32 the outer step starts to
+#: overwrite the inner optimizer's progress (H=1 was the worst arm of
+#: ``bench/outer_convergence.py`` by far, H=8 already behind H=64); above 2000
+#: a run of a few thousand steps gets a handful of rounds, which is what H=512
+#: lost to there.
+DEFAULT_MIN_INNER_STEPS = 32
+DEFAULT_MAX_INNER_STEPS = 2000
+
+#: How far one round may move H, up or down: a single round's timing is one
+#: noisy sample, and a link that stalls once should not double the next ten.
+MAX_STEP_FACTOR = 2.0
+
+#: A change smaller than this fraction of H is not made. The network's time
+#: varies from round to round by more than that, and an H that moves by three
+#: steps every round says nothing but the noise.
+STEP_DEADBAND = 0.1
+
+
+def next_inner_steps(
+    current: int,
+    *,
+    trained_seconds: float,
+    trained_steps: int,
+    network_seconds: float,
+    overlap: bool,
+    share: float = DEFAULT_NETWORK_SHARE,
+    low: int = DEFAULT_MIN_INNER_STEPS,
+    high: int = DEFAULT_MAX_INNER_STEPS,
+) -> int:
+    """The H at which the training waits ``share`` of the round for the network.
+
+    GPU-231. ``trained_seconds`` over ``trained_steps`` is what one local step
+    costs here, ``network_seconds`` what the round's exchange took from the
+    moment the delta was taken to the moment its result was back. Both are
+    measured by the round that just closed, and the answer assumes the next
+    round costs the same, which is why it is only allowed to move H by
+    :data:`MAX_STEP_FACTOR` at a time.
+
+    **The share is of the round's wall clock, and the two modes reach it
+    differently.** Blocking, the training waits for the whole exchange, so the
+    wait is ``N`` against ``c*H`` of training and the share is ``N / (c*H +
+    N)``: ``H = N (1 - share) / (c share)``. With ``outer_overlap`` the next
+    round trains while the exchange runs, and the training waits only for
+    what the network outlasts it by, ``N - c*H``; that is ``share`` of the
+    round at ``H = N (1 - share) / c``, and an H the network finishes inside
+    is shrunk until it no longer does.
+
+    **A target, not a ceiling.** Fewer steps per round is the better model as
+    far as anything here has measured (H=64 beat H=512 in
+    ``bench/outer_convergence.py``), so H comes down when the network leaves
+    room, not only up when it does not - down to ``low`` and no further, since
+    an H too small is worse still.
+
+    Unchanged when the round measured nothing usable: no step trained, no
+    clock, a share outside ``(0, 1)``.
+    """
+    current = int(current)
+    if trained_steps <= 0 or trained_seconds <= 0 or network_seconds < 0:
+        return current
+    if not 0.0 < share < 1.0:
+        return current
+    per_step = trained_seconds / trained_steps
+    if overlap:
+        wanted = network_seconds * (1.0 - share) / per_step
+    else:
+        wanted = network_seconds * (1.0 - share) / (per_step * share)
+    wanted = min(max(wanted, current / MAX_STEP_FACTOR), current * MAX_STEP_FACTOR)
+    wanted = min(max(wanted, float(low)), float(high))
+    if abs(wanted - current) < STEP_DEADBAND * current:
+        return current
+    return max(int(round(wanted)), 1)
 
 
 def trainable(model) -> List[Tuple[str, Any]]:
@@ -631,6 +715,9 @@ class OuterLoop:
 
         self.model = model
         self.inner_steps = inner_steps
+        #: An H decided for a round that has not started yet (GPU-231). See
+        #: :meth:`set_inner_steps`; taken up by :meth:`launch`.
+        self.pending_inner_steps: Optional[int] = None
         self.round_seconds = round_seconds
         self.combine_mode = combine_mode
         self.node = node
@@ -672,6 +759,28 @@ class OuterLoop:
     def record_step(self) -> None:
         """One local optimizer step happened."""
         self.steps_this_round += 1
+
+    def trained_seconds(self) -> float:
+        """How long the round now open has been training, by the clock."""
+        return time.monotonic() - self._started_at
+
+    def set_inner_steps(self, steps: int, now: bool) -> None:
+        """Change H, for the round now open or for the next one (GPU-231).
+
+        ``now`` when no step of the open round has depended on H yet on any
+        node - a blocking round, decided before the next one trains. With
+        ``outer_overlap`` the next round is already training when a round's
+        result lands, and each node lands it a different number of steps in,
+        so a new H there would close that round at different points on
+        different nodes; it waits instead for the next :meth:`launch`, which
+        every node reaches having landed the same rounds.
+        """
+        steps = max(int(steps), 1)
+        if now:
+            self.inner_steps = steps
+            self.pending_inner_steps = None
+        else:
+            self.pending_inner_steps = steps
 
     def round_is_over(self) -> bool:
         if self.inner_steps is not None and self.steps_this_round >= self.inner_steps:
@@ -828,8 +937,14 @@ class OuterLoop:
         flight = RoundInFlight(
             self, mine, snapshot(self.model, device=self.device), self.steps_this_round
         )
+        flight.trained_seconds = self.trained_seconds()
         self.steps_this_round = 0
         self._started_at = time.monotonic()
+        if self.pending_inner_steps is not None:
+            # The round that starts here is the first every node starts
+            # knowing the new H (GPU-231): see `set_inner_steps`.
+            self.inner_steps = self.pending_inner_steps
+            self.pending_inner_steps = None
         return flight
 
     def land(self, flight: "RoundInFlight") -> None:
@@ -889,6 +1004,10 @@ class OuterLoop:
             "steps_this_round": self.steps_this_round,
             "model_steps": self.model_steps,
             "combine_mode": self.combine_mode,
+            # H as the run had decided it (GPU-231), so a resume goes on from
+            # the value the link had led to rather than the configured start.
+            "inner_steps": self.inner_steps,
+            "pending_inner_steps": self.pending_inner_steps,
             "outer": self.outer,
             "optimizer": self.optimizer.state_dict(),
         }
@@ -898,6 +1017,10 @@ class OuterLoop:
         self.steps_this_round = int(state.get("steps_this_round", 0))
         self.model_steps = int(state.get("model_steps", 0))
         self.combine_mode = state.get("combine_mode", self.combine_mode)
+        if self.inner_steps is not None and state.get("inner_steps"):
+            self.inner_steps = int(state["inner_steps"])
+            pending = state.get("pending_inner_steps")
+            self.pending_inner_steps = int(pending) if pending else None
         if state.get("outer"):
             self.outer = dict(state["outer"])
         if state.get("optimizer"):
@@ -929,6 +1052,8 @@ class RoundInFlight:
         self.steps = int(steps)
         #: The live parameters at launch, fp32. See :meth:`OuterLoop.launch`.
         self.photograph = photograph
+        #: How long the round trained before it was launched (GPU-231).
+        self.trained_seconds = 0.0
         #: Whether the outer step was taken; :meth:`OuterLoop.land` reads it.
         self.applied = False
         self.round_number = loop.round_number
