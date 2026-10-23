@@ -42,10 +42,8 @@ from typing import Any, Callable, Optional, TypeVar
 
 from ravex._dist.membership import RunOver as _RunOver
 
-#: The version, written here and in ``Cargo.toml``, which is what maturin builds
-#: the wheel from. Two places, because maturin has no equivalent of setuptools'
-#: ``dynamic = {attr = ...}``; ``tests/unit/test_version_is_single.py`` fails if they
-#: ever disagree.
+#: The version, and the only place it is written: the wheel's metadata reads it
+#: from here (``[tool.hatch.version]`` in ``pyproject.toml``) since GPU-267.
 __version__ = "0.7.8"
 
 __all__ = [

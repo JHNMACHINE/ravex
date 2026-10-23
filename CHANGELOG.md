@@ -22,6 +22,17 @@
   in 8 files: 1508 MB/s, against 977 for the Rust. `prestage_send` and
   `prestage_receive` take the socket, not its descriptor.
 
+- **Ravex is pure Python again (GPU-267).** The reshard planner is
+  `ravex/_dist/reshard.py`, the implementation that stood before 0.1.0 and
+  that `src/reshard.rs` was held to: the same tests, unchanged, pass on both.
+  With the transport already back in Python, nothing is compiled any more:
+  the build is hatchling instead of maturin, a release is one `py3-none-any`
+  wheel and an sdist instead of a wheel per CPython for Linux x86_64, and
+  `pip install ravex` works on any platform torch runs on, with no Rust
+  toolchain. The version is written once, in `ravex/__init__.py`.
+  `ravex._core`, `Cargo.toml` and `src/` are gone, and `ravex status` no
+  longer reports a compiled core.
+
 ### Removed
 
 - **`ravex cache` and the S3 client in the compiled core (GPU-267).** The

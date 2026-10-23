@@ -1,20 +1,16 @@
 [build-system]
-# maturin, since GPU-105: the reshard planner is Rust and the wheel has a
-# compiled extension in it. The cost is stated plainly because it is the whole
-# trade of that issue — a Ravex wheel is now platform-specific, where a pure
-# Python one installed anywhere, and building from source needs a Rust
-# toolchain rather than only a C compiler that is never invoked.
-requires = ["maturin>=1.5,<2.0"]
-build-backend = "maturin"
+# hatchling, since GPU-267: Ravex is Python only again, so one `py3-none-any`
+# wheel installs anywhere and building from source needs no compiler. From
+# GPU-105 to 0.7.8 it was maturin, for a reshard planner and a store transport
+# in Rust.
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
 
 [project]
 name = "ravex"
-# Read from Cargo.toml, which is where maturin looks and the only place it will
-# look: there is no equivalent of setuptools' `dynamic = {attr = ...}` reading a
-# Python attribute. `ravex/__init__.py` still carries the literal because
-# `ravex status` reports it and importing the package to print a version is what
-# the CLI is trying to avoid; `tests/unit/test_version_is_single.py` fails if the two
-# ever disagree.
+# Read from `ravex/__init__.py` (`[tool.hatch.version]` below), the one place
+# the number is written: `ravex --version` prints the same literal, and a
+# release commit bumps it there and nowhere else.
 dynamic = ["version"]
 description = "Transparent checkpoint and resume for PyTorch training, with no changes to your training code"
 readme = "README.md"
@@ -32,8 +28,9 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
-    # Beta, not Stable: the test suite passes on 3.14t, but nothing yet calls
-    # into the extension from several Python threads at once (GPU-189).
+    # Beta, not Stable: the test suite passes on 3.14t (GPU-189), and Ravex
+    # is pure Python since GPU-267, but its threads have only been run
+    # without the GIL by that suite.
     "Programming Language :: Python :: Free Threading :: 2 - Beta",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
@@ -122,39 +119,24 @@ Changelog = "https://github.com/JHNMACHINE/ravex/blob/main/CHANGELOG.md"
 [project.scripts]
 ravex = "ravex._cli:main"
 
-[tool.maturin]
-# `ravex/` at the repository root is the Python half of a mixed project;
-# maturin finds it from `module-name` and puts the compiled `_core` inside it.
-# Subpackages no longer have to be listed the way setuptools needed — what is
-# under `ravex/` ships, and `tests`, `bench` and `integration` are outside it.
-module-name = "ravex._core"
-features = ["extension-module"]
+[tool.hatch.version]
+path = "ravex/__init__.py"
 
-# CHANGELOG.md is sdist-only and was MANIFEST.in's job until maturin took over
-# the sdist: the source archive is what a distribution packager or an auditor
-# reads, and it was the one place the release notes were missing.
-#
-# `ravex_autoload.pth` was here too until GPU-108, with a long comment about
-# `data_files` installing it one directory above site-packages where Python
-# never runs it. The file is gone, so the trap is not worth documenting at a
-# place that no longer walks past it — the reasoning is in the changelog, where
-# someone wondering why the autoloader disappeared will actually look.
-include = [{ path = "CHANGELOG.md", format = "sdist" }]
+# What `ravex/` holds ships, and nothing else: `tests`, `bench` and
+# `integration` are outside it. Bytecode is excluded because a wheel built from
+# a tree where the tests had already run once shipped a `__pycache__/` of
+# `.pyc` files (Moonclip 0.0.4), and a leftover compiled `_core` from a build
+# before GPU-267 must not ride along either.
+[tool.hatch.build.targets.wheel]
+packages = ["ravex"]
+exclude = ["**/__pycache__", "**/*.py[cod]", "ravex/_core*"]
 
-# maturin copies whatever sits under the Python source directory. Every
-# Moonclip 0.0.4 wheel shipped a `__pycache__/` full of cp314 `.pyc` files for
-# exactly this reason — built from a tree where the tests had already run.
-# `build/` and `dist/` are the second half of that: they are gitignored, but
-# maturin globs the working tree rather than asking git, so a leftover
-# `build/lib/ravex/` from the setuptools era shipped a *second*, stale copy of
-# every module inside the source distribution.
-exclude = [
-    "**/__pycache__/**",
-    "**/*.py[cod]",
-    "build/**",
-    "dist/**",
-    "target/**",
-]
+# CHANGELOG.md is in the sdist: the source archive is what a distribution
+# packager or an auditor reads, and it was the one place the release notes
+# were missing.
+[tool.hatch.build.targets.sdist]
+include = ["/ravex", "/README.md", "/CHANGELOG.md", "/LICENSE", "/NOTICE", "/pyproject.toml"]
+exclude = ["**/__pycache__", "**/*.py[cod]", "ravex/_core*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

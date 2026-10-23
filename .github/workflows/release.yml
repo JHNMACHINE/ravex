@@ -19,7 +19,7 @@ on:
         required: true
 
 # The job token only reads: nothing here pushes, tags or comments, and releases
-# go out with their own PyPI and crates.io tokens.
+# go out with their own PyPI token.
 permissions:
   contents: read
 
@@ -28,48 +28,22 @@ permissions:
 env:
   TAG: ${{ inputs.tag || github.ref_name }}
 
-# Two jobs and a matrix, since GPU-105. Until then this was one job on plain
-# `python:3.12-bookworm` producing a single `py3-none-any` wheel that served
-# every interpreter and platform, because Ravex was pure Python.
-#
-# It is not any more. The reshard planner is a compiled extension, so a wheel is
-# specific to an interpreter *and* a platform, and what used to be one artifact
-# is now an sdist plus one wheel per CPython. Same shape as Moonclip's release,
-# minus the crate job — the Ravex crate is `publish = false` and exists to be
-# built into this package, not to be depended on from Cargo.
-#
-# The split into separate jobs dates from Codeberg's hosted runners, which had a
-# per-job time and memory budget that counted filesystem writes, so `target/`
-# counted too: Moonclip had a single job building six wheels torn out from
-# under it mid-build. It stays so a failed wheel is retried alone.
+# One job and one wheel again, since GPU-267. From GPU-105 to 0.7.8 the reshard
+# planner and the store transport were a compiled extension, so a wheel was
+# specific to an interpreter and a platform and a release was an sdist plus a
+# wheel per CPython, built in the manylinux image with a Rust toolchain. Ravex
+# is Python only now: one `py3-none-any` wheel serves every interpreter and
+# platform, free-threaded 3.14 included, and the sdist builds anywhere.
 jobs:
-  # The source distribution, once — not per interpreter, and before any wheel.
-  #
-  # Without it, `pip install ravex` on macOS, Windows or aarch64 answers "no
-  # matching distribution found", which reads as "this package does not exist"
-  # rather than "there is no wheel for your platform". With it, pip falls back
-  # to building from source: that needs a Rust toolchain, and the error when one
-  # is missing at least names the thing to install.
-  #
-  # First for the same reason Moonclip's crate job is first: if the release
-  # stops here, nothing has been published and the version number is still free.
-  sdist:
+  publish:
     runs-on: ubuntu-latest
     container:
-      image: quay.io/pypa/manylinux_2_28_x86_64
+      image: python:3.12-bookworm
     steps:
-      # The manylinux image carries the Python interpreters, not a Rust
-      # toolchain. Nothing compiles in this job — an sdist ships sources — but
-      # `maturin sdist` shells out to `cargo metadata` to read the crate, so
-      # without cargo it fails before writing anything.
-      - name: Install Rust
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.98.1 --profile minimal --component clippy
-
       # Full history on purpose: the check below has to prove the tagged commit
       # is on main, and a shallow clone cannot answer that question.
-      # By sha rather than by ref name, so a manual rehearsal — where the ref is
-      # a branch and not a tag — checks out the same way a release does.
+      # By sha rather than by ref name, so a manual rehearsal - where the ref is
+      # a branch and not a tag - checks out the same way a release does.
       - name: Checkout
         uses: actions/checkout@v5
         with:
@@ -79,7 +53,7 @@ jobs:
 
       # A tag can be pushed from any commit in the repository, including one on
       # a branch that was never reviewed or merged. Publishing is the one action
-      # here that cannot be undone — PyPI refuses to reuse a version number — so
+      # here that cannot be undone - PyPI refuses to reuse a version number - so
       # the tag has to name a commit that reached main.
       - name: Tag must be on main
         if: ${{ github.event_name == 'push' }}
@@ -98,28 +72,18 @@ jobs:
           fi
           echo "$(git rev-parse --short HEAD) is on main"
 
-      # Three numbers, not two, since the build moved to maturin. `Cargo.toml`
-      # is what the wheel's metadata is built from; `ravex/__init__.py` is what
-      # `ravex status` and `ravex --version` print. `tests/unit/test_version_is_single.py`
-      # keeps them equal on every branch, and this repeats the check at the one
-      # moment where being wrong cannot be undone.
-      #
-      # Ahead of the build and of the token check, because both cost nothing and
-      # the mistake they catch is permanent.
+      # One number: the wheel's metadata reads it from `ravex/__init__.py`
+      # (hatchling's `[tool.hatch.version]`), which is also what `ravex
+      # --version` prints. Ahead of the build and of the token check, because
+      # both cost nothing and the mistake this catches is permanent.
       - name: Tag must match the package version
         if: ${{ github.event_name == 'push' }}
         run: |
           set -eu
-          CARGO=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
-          PACKAGE=$(/opt/python/cp312-cp312/bin/python -c "import ravex; print(ravex.__version__)")
-          echo "Cargo.toml $CARGO, ravex.__version__ $PACKAGE, tag $TAG"
-          if [ "$CARGO" != "$PACKAGE" ]; then
-            echo "Cargo.toml and ravex/__init__.py disagree: the wheel would be" >&2
-            echo "published as $CARGO and report itself as $PACKAGE." >&2
-            exit 1
-          fi
-          if [ "v$CARGO" != "$TAG" ]; then
-            echo "Tag $TAG does not match version $CARGO" >&2
+          VERSION=$(grep -m1 '^__version__ = ' ravex/__init__.py | cut -d'"' -f2)
+          echo "ravex/__init__.py $VERSION, tag $TAG"
+          if [ "v$VERSION" != "$TAG" ]; then
+            echo "Tag $TAG does not match version $VERSION" >&2
             exit 1
           fi
 
@@ -136,23 +100,26 @@ jobs:
           fi
           echo "token present"
 
-      - name: Build the sdist
+      - name: Build the sdist and the wheel
         run: |
           set -eu
-          . "$HOME/.cargo/env"
-          /opt/python/cp312-cp312/bin/pip install --quiet maturin twine
-          export PATH="/opt/python/cp312-cp312/bin:$PATH"
-          maturin sdist --out dist
+          pip install --quiet build twine
+          python -m build --outdir dist
           ls -la dist/
-          twine check dist/*.tar.gz
-          # It has to build without the working tree around it, which is the
-          # whole point of shipping one. The crate is checked by name: an sdist
-          # missing `src/` is one pip cannot build, and the failure would land
-          # on whoever is not on Linux x86_64 rather than here.
+          twine check dist/*
+          # One pure wheel, and the version in its name is the package's.
+          VERSION=$(grep -m1 '^__version__ = ' ravex/__init__.py | cut -d'"' -f2)
+          ls dist/ravex-"$VERSION"-py3-none-any.whl
+          # No compiled file may ride along: a leftover `_core` from an old
+          # editable build would install and then shadow nothing, or worse.
+          python -c 'import sys, zipfile; names = zipfile.ZipFile(sys.argv[1]).namelist(); bad = [n for n in names if n.endswith((".so", ".pyd", ".pyc"))]; assert not bad, bad; assert "ravex/__init__.py" in names; print("wheel layout ok")' dist/*.whl
+          # The sdist has to build without the working tree around it, which
+          # is the whole point of shipping one.
           tmp=$(mktemp -d)
           tar xzf dist/*.tar.gz -C "$tmp"
-          ls "$tmp"/*/pyproject.toml "$tmp"/*/Cargo.toml "$tmp"/*/src/lib.rs
-          ls "$tmp"/*/CHANGELOG.md
+          ls "$tmp"/*/pyproject.toml "$tmp"/*/CHANGELOG.md
+          pip wheel --quiet --no-deps --wheel-dir "$tmp/out" "$tmp"/*/
+          ls "$tmp"/out/*.whl
 
       - name: Upload to PyPI
         if: ${{ github.event_name == 'push' }}
@@ -163,123 +130,9 @@ jobs:
           set -eu
           # `--skip-existing` so a re-run is harmless. Without it, uploading a
           # file PyPI already holds is a 400 whose body twine reports as just
-          # "Bad Request" — which is how this pipeline's first run ever ended,
+          # "Bad Request" - which is how this pipeline's first run ever ended,
           # having raced a manual upload of the same 0.0.2 by forty seconds.
           #
-          # What it costs: re-publishing a version with different content becomes
-          # silence rather than an error. PyPI never overwrites a filename
-          # anyway, so the content cannot really differ; what is lost is the loud
-          # complaint, and that is a fair trade for a re-runnable release.
-          /opt/python/cp312-cp312/bin/twine upload --skip-existing dist/*.tar.gz
-
-  # One wheel per interpreter, one job each. Native wheels rather than a single
-  # abi3 one, matching Moonclip: the stable ABI would cost PyO3's fast paths.
-  #
-  # After the sdist rather than beside it. Running both off nothing would let an
-  # sdist that failed `twine check` still be overtaken by four wheels reaching
-  # PyPI — a version burned with wheels and no source distribution, which
-  # `--skip-existing` then makes unrepairable.
-  wheels:
-    needs: sdist
-    runs-on: ubuntu-latest
-    container:
-      # The PyPA manylinux image ships every supported CPython under
-      # /opt/python/cp3XX-cp3XX/bin/, each with pip — and, unlike plain
-      # bookworm, produces wheels tagged manylinux_2_28 instead of
-      # linux_x86_64, which is the difference between installable and not.
-      image: quay.io/pypa/manylinux_2_28_x86_64
-    strategy:
-      # One interpreter failing must not cancel the others. A missing wheel can
-      # be added to an existing PyPI version afterwards; a cancelled matrix
-      # leaves a half-published release with no way to finish it.
-      fail-fast: false
-      matrix:
-        # Keep in step with the classifiers in pyproject.toml and with the
-        # matrix in ci.yml. A wheel for an interpreter nothing tests is a claim
-        # made by the packaging and by nothing else.
-        # cp314t is 3.14's free-threaded build (GPU-189). PyO3 0.29 declares
-        # the module safe without the GIL by default, so the same source
-        # builds it; without this wheel a 3.14t user compiles from the sdist.
-        python: [cp311, cp312, cp313, cp314, cp314t]
-    steps:
-      - name: Install Rust
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.98.1 --profile minimal --component clippy
-
-      - name: Checkout
-        uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-          # The tag when deploy.yml calls; otherwise what triggered the run.
-          ref: ${{ inputs.tag || github.ref }}
-
-      # Cheap, and repeated here on purpose: these jobs can be re-run
-      # individually, and a wheel whose metadata disagrees with the tag is
-      # exactly what the check in the sdist job exists to prevent.
-      - name: Tag must match the package version
-        if: ${{ github.event_name == 'push' }}
-        run: |
-          set -eu
-          VERSION=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
-          if [ "v$VERSION" != "$TAG" ]; then
-            echo "Tag $TAG does not match version $VERSION" >&2
-            exit 1
-          fi
-
-      - name: Build the ${{ matrix.python }} wheel
-        run: |
-          set -eu
-          . "$HOME/.cargo/env"
-          # The directory is `cp314-cp314t` for the free-threaded build, not
-          # `cp314t-cp314t`: the first half is the interpreter's version and
-          # the second its ABI, and only the ABI carries the `t`.
-          ABI="${{ matrix.python }}"
-          PY="/opt/python/${ABI%t}-${ABI}/bin/python"
-          test -x "$PY" || { echo "interpreter missing: $PY" >&2; exit 1; }
-
-          /opt/python/cp312-cp312/bin/pip install --quiet maturin twine
-          export PATH="/opt/python/cp312-cp312/bin:$PATH"
-
-          maturin build --release --locked --out dist --interpreter "$PY"
-
-          echo "=== built ==="
-          ls -la dist/
-          # The ABI tag has to be this interpreter's. A plain count would pass
-          # even if every job had built the same wheel.
-          # Both tags, not a substring: `cp314` alone also matches a cp314t
-          # wheel, so the GIL job could pass on the other job's output.
-          ls dist/ | grep -q -- "-${ABI%t}-${ABI}-" || {
-            echo "no ${{ matrix.python }} wheel in dist/" >&2; exit 1; }
-          twine check dist/*.whl
-
-          # The compiled core has to be *in* the wheel. It is not optional since
-          # GPU-105 — there is no Python fallback behind it — so a wheel without
-          # it installs and then fails on the first resume, which is the worst
-          # place to find out.
-          #
-          # This used to also assert `ravex_autoload.pth` at the archive root.
-          # GPU-108 removed the autoloader; nothing has to be at the root now.
-          #
-          # Written as `-c` rather than as a heredoc: the body of a `run:` is a
-          # YAML block scalar, so every line of a heredoc arrives indented and
-          # the terminator never matches at column 0. `<<-` would not save it
-          # either — it strips tabs, not spaces.
-          /opt/python/cp312-cp312/bin/python -c 'import sys, zipfile; names = zipfile.ZipFile(sys.argv[1]).namelist(); assert any(n.startswith("ravex/_core.") for n in names), "no compiled core"; print("wheel layout ok")' "$(ls dist/*.whl)"
-
-      - name: Upload to PyPI
-        if: ${{ github.event_name == 'push' }}
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.RAVEX_PYPI_TOKEN }}
-        run: |
-          set -eu
-          # One file per job. PyPI accepts files added to an existing version, so
-          # four jobs filling in one release is a supported flow — and if one
-          # fails, its wheel can be added later without spending a new version.
-          #
-          # Codeberg Packages used to get a copy of the same artifacts, which
-          # bought nothing: identical bytes at an address almost nobody would
-          # point pip at, and a second token to keep alive. Note that
-          # `ravex[moonclip]` resolves its extra from PyPI, so Moonclip has to be
-          # published there before this repository is tagged.
-          /opt/python/cp312-cp312/bin/twine upload --skip-existing dist/*.whl
+          # `ravex[moonclip]` resolves its extra from PyPI, so Moonclip has to
+          # be published there before this repository is tagged.
+          twine upload --skip-existing dist/*

@@ -832,8 +832,8 @@ Ravex says so.
 `ravex.metrics.resolve(chunks)` does the rest: give it each object's key below
 the store (`"metrics/<segment>/000003.jsonl"`) and its text, and the timeline
 comes out the same. That is what a dashboard reading the bucket calls.
-`ravex.metrics` imports nothing compiled, so it loads where Ravex's Rust core
-cannot, such as Cloudflare's Python Workers.
+`ravex.metrics` imports nothing compiled and not torch, so it loads where
+neither can, such as Cloudflare's Python Workers.
 
 ### More than one machine
 

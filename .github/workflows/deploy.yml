@@ -1,12 +1,12 @@
 name: Deploy
 
 # A push to the deploy branch is a release: `git push origin main:deploy`
-# tags the version Cargo.toml and ravex/__init__.py carry, and publishes it
-# with release.yml - the sdist and the wheels to PyPI. The same branch, and the
+# tags the version ravex/__init__.py carries, and publishes it with
+# release.yml - the sdist and the wheel to PyPI. The same branch, and the
 # same workflow, Moonclip deploys from, so no tag is ever typed by hand.
 #
 # The version is chosen by the commit (a `release: ravex x.y.z` commit on
-# main bumps both files and the CHANGELOG), never here. A push whose version is
+# main bumps it and the CHANGELOG), never here. A push whose version is
 # already tagged fails rather than doing nothing: the only reason to push here
 # is to publish, and a version that already went out is a bump that was
 # forgotten.
@@ -54,10 +54,9 @@ jobs:
         id: tag
         run: |
           set -eu
-          VERSION=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
-          PY_VERSION=$(grep -m1 '^__version__ = ' ravex/__init__.py | cut -d'"' -f2)
-          if [ "$VERSION" != "$PY_VERSION" ]; then
-            echo "Cargo.toml says $VERSION and ravex/__init__.py $PY_VERSION." >&2
+          VERSION=$(grep -m1 '^__version__ = ' ravex/__init__.py | cut -d'"' -f2)
+          if [ -z "$VERSION" ]; then
+            echo "no __version__ in ravex/__init__.py" >&2
             exit 1
           fi
           TAG="v$VERSION"

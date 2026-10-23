@@ -9,11 +9,8 @@ dataloader as they are built.
 pip install ravex
 ```
 
-Ravex has a small Rust core — the reshard planner and the replica
-transport — so wheels are built per
-interpreter for Linux x86_64. On any other platform pip falls back to the source
-distribution, which builds if you have a Rust toolchain. What changed between
-versions is in the
+Ravex is pure Python: one wheel installs on every platform and interpreter
+torch runs on. What changed between versions is in the
 [CHANGELOG](https://github.com/JHNMACHINE/ravex/blob/main/CHANGELOG.md).
 
 Its default checkpoint engine, [Moonclip](https://github.com/JHNMACHINE/moonclip),
@@ -324,7 +321,6 @@ command. Every name below that starts with an underscore is free to move.
 ravex/
 ├── __init__.py       Public surface, and nothing else
 ├── _cli.py           ravex status
-├── _core.pyi         Types for the compiled Rust core
 ├── _config.py        Defaults < ravex.yaml < RAVEX_*
 ├── _patches.py       The five monkey patches on PyTorch
 ├── _registry.py      What is being trained, held by weakref
@@ -335,9 +331,10 @@ ravex/
 ├── _frameworks.py    HF Trainer / Lightning / Accelerate detection
 ├── _dist/            More than one GPU, more than one machine
 │   ├── collectives.py    gather vs per_rank; the SIGTERM channel
-│   ├── reshard.py        8 shards onto 4 ranks — re-exports the Rust core
+│   ├── reshard.py        8 shards onto 4 ranks — the planner
 │   ├── identity.py       Who wrote this store, as part of which run
-│   ├── replication.py    Each rank copies its store to a peer — framing from the Rust core
+│   ├── replication.py    Each rank copies its store to a peer
+│   ├── transport.py      How a store crosses a socket: the framing and the copy
 │   └── elastic.py        Membership changes without a restart
 └── _interop/         Checkpoints somebody else wrote
     ├── foreign.py        What is this directory? Layout first, fields second
@@ -369,26 +366,18 @@ and nothing in `_interop` is imported by anything outside it except `_runtime`.
 | `integration/multinode/` | One container per rank, for questions `--nproc_per_node` cannot ask ([README](integration/multinode/README.md)) |
 | `integration/two-machines/` | The rented-box harness: two real hosts, real network |
 | `docs/` | [configuration.md](docs/configuration.md), [how-it-works.md](docs/how-it-works.md) |
-| `src/` | The Rust core: `reshard.rs` is the planner, `transport.rs` frames and moves a store, `python.rs` is the only file that knows an interpreter exists |
 | `.github/workflows/` | `checks.yml` on branches, `tests/unit` only; `ci.yml` on main adds the moonclip backend - `tests/unit` and `tests/distributed` as separate jobs - and both integration jobs |
 
 That is about 22k lines across 38 Python modules (the two subpackages
-included), plus 2.7k of Rust, against 19k lines of tests.
+included), against 19k lines of tests. There is no Rust since GPU-267: the
+files are Moonclip's, and the reshard planner and the store transport went back
+to Python.
 
 ## Development
 
 ```bash
 pip install -e ".[dev]"
 pytest
-```
-
-That editable install compiles the Rust core into the source tree, so it needs a
-toolchain: `rust-toolchain.toml` names the version and rustup will fetch it. The
-half of the engine that has no Python in it has its own tests, and they are the
-faster gate — no interpreter, no torch, milliseconds:
-
-```bash
-cargo test --no-default-features
 ```
 
 The unit suite runs in-process. The parts that only exist across a real process

@@ -87,7 +87,7 @@ distinction is exactly what the reshuffle run turned out to hinge on.
 
 **moonclip comes from PyPI**, so this exercises the working tree's Ravex
 against the *released* engine — which is what a user gets, and it keeps a Rust
-toolchain out of the image. It matters for anything touching remote storage,
+toolchain out of the image (Ravex itself has none to build since GPU-267). It matters for anything touching remote storage,
 which reached the released engine in 0.0.8 — before that the remote was
 push-only and there was nothing to pull back.
 

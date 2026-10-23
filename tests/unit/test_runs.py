@@ -172,13 +172,13 @@ class TestReadingThem:
         assert ravex.runs.discover(str(tmp_path)) == []
 
     @pytest.mark.own_interpreter
-    def test_the_reader_imports_without_the_rust_core(self):
-        """The dashboard runs on Python Workers, which cannot load a compiled module."""
+    def test_the_reader_imports_without_torch(self):
+        """The dashboard runs on Python Workers, which cannot load torch or any compiled module."""
         import subprocess
         import sys
 
         code = (
-            "import sys; sys.modules['ravex._core'] = None; sys.modules['torch'] = None\n"
+            "import sys; sys.modules['torch'] = None\n"
             "import ravex.runs\n"
             "print(ravex.runs.describe('nowhere') is None)"
         )

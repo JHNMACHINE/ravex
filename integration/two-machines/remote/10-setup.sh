@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Install what the phases need. A few minutes, including a Rust toolchain for
-# ravex's core when the image has none.
+# Install what the phases need. A few minutes.
 #
 #   bash $KIT_ROOT/kit/10-setup.sh
 #
@@ -103,18 +102,8 @@ fi
 
 pip install --quiet PyYAML "$MOONCLIP_SPEC"
 
-# **Ravex has a Rust core since GPU-105**, so the editable install below builds
-# it with maturin and wants `cargo`. RunPod's images have a C compiler and no
-# Rust (both pods on 2026-09-15), and the failure arrives after the torch
-# reinstall above, a few minutes in. Linked into /usr/local/bin because every
-# phase is `ssh host '...'`, which never puts ~/.cargo/bin on the PATH.
-if ! command -v cargo >/dev/null; then
-    echo "-- no Rust toolchain: installing one for ravex's core"
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --profile minimal >/dev/null
-    ln -sf "$HOME/.cargo/bin/cargo" "$HOME/.cargo/bin/rustc" \
-        "$HOME/.cargo/bin/rustup" /usr/local/bin/
-fi
+# Ravex is Python only since GPU-267: no toolchain to install for it, where
+# from GPU-105 the editable install wanted `cargo` and RunPod's images had none.
 pip install --quiet --no-deps -e $KIT_ROOT/ravex
 
 # Checks the install rather than arming anything: the training script attaches

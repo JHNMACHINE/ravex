@@ -17,16 +17,17 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(scope="session", autouse=True)
 def ravex_is_installed():
-    """A real install, with the compiled core in it.
+    """A real install of ravex.
 
     This replaced a check that the ``.pth`` autoloader was in site-packages,
     which was the thing that made these tests mean anything until GPU-108. What
     makes them mean something now is narrower and easier to state: the training
     scripts import ravex and are decorated, so the suite needs an importable
-    ravex — and, since GPU-105, one whose extension module actually built.
+    ravex. From GPU-105 to GPU-267 it also needed one whose compiled core had
+    built; Ravex is Python only again.
     """
     try:
-        from ravex import _core  # noqa: F401
+        import ravex  # noqa: F401
     except ImportError as exc:
         pytest.skip(f"ravex is not importable in this interpreter: {exc}")
 

@@ -59,16 +59,6 @@ def _status(_args) -> int:
     config = RavexConfig.load()
     print(f"  resolved     {config.describe()}")
 
-    # The compiled core is not optional since GPU-105, so its absence is a
-    # broken install rather than a missing extra — worth saying plainly here,
-    # because the alternative is an ImportError deep inside a resume.
-    try:
-        from ravex import _core
-
-        print(f"  core         {_core.__version__} (compiled)")
-    except ImportError as exc:
-        print(f"  core         MISSING - {exc}")
-
     for name in ("torch", "moonclip", "yaml"):
         try:
             module = __import__(name)

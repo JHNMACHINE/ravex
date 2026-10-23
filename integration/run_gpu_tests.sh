@@ -23,7 +23,7 @@ echo
 echo "=== install ==="
 pip install -q -e . pytest
 
-# Checks the install, including the compiled core. The training scripts below
+# Checks the install. The training scripts below
 # stay free of any reference to Ravex.
 ravex status
 

@@ -50,21 +50,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends g++ curl \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir deepspeed
 
-# Rust, since GPU-105: the reshard planner is a compiled extension and
-# `pip install -e .` builds it. Debian's rustc is far too old and
-# `rust-toolchain.toml` pins 1.98.1, so that exact version is installed here —
-# naming a different one only makes rustup fetch a second compiler to satisfy
-# the toolchain file.
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.98.1 --profile minimal --component clippy
-ENV PATH="/root/.cargo/bin:${PATH}"
-
 WORKDIR /app
 COPY pyproject.toml README.md LICENSE NOTICE ./
-# The crate. `Cargo.lock` is copied too: the image is a test environment, and a
-# dependency resolving differently here than in CI is a difference nobody asked
-# for and nobody would look for.
-COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
-COPY src ./src
 COPY ravex ./ravex
 COPY tests ./tests
 COPY integration ./integration
@@ -72,7 +59,7 @@ COPY integration ./integration
 RUN pip install --no-cache-dir -e .
 
 # No autoloader to install since GPU-108; `status` stays because a broken
-# install — most likely a compiled core that did not build — is worth failing
+# install is worth failing
 # on here rather than inside the first test.
 RUN ravex status
 
