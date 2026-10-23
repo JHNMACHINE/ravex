@@ -254,7 +254,7 @@ def resolve(chunks: Mapping[str, str]) -> Dict[str, Any]:
     system: Dict[str, Dict[str, Dict[str, List[Any]]]] = {}
     # Collected with the segment's position, so a step logged by two
     # segments - an evaluation at the resume step, say - keeps the later one.
-    scalar_points: Dict[str, List[Tuple[int, int, float, Any]]] = {}
+    scalar_points: Dict[str, List[Tuple[int, int, Optional[float], Any]]] = {}
     histogram_points: Dict[str, List[Tuple[int, int, Dict[str, Any]]]] = {}
 
     for order, header in enumerate(headers):

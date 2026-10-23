@@ -1422,6 +1422,8 @@ class DeltaExchange:
         peer still asking it for a relay - which is exactly what the test for
         the relay did the first time it ran, on the run's last round.
         """
+        if self._last_decided is None:
+            return
         round_number, members = self._last_decided
         digest = _job_digest(self.scope)
         waiting = [m for m in members if m != self.rank]
@@ -1692,6 +1694,11 @@ class DeltaExchange:
         """
         from ravex._dist.replication import RingLink
 
+        if kind == KIND_RELAY and owner is None:
+            raise ValueError("a relay asks for someone's report: owner is required")
+        # Whose report this is: the owner's when relayed, the peer's otherwise.
+        source = owner if kind == KIND_RELAY and owner is not None else peer
+
         address = self._address_of(peer, deadline)
         if address is None:
             return None
@@ -1721,7 +1728,7 @@ class DeltaExchange:
                 )
             )
             if kind == KIND_RELAY:
-                connection.sendall(OWNER.pack(int(owner)))
+                connection.sendall(OWNER.pack(int(source)))
 
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -1758,7 +1765,6 @@ class DeltaExchange:
             # `create_connection` is cleared for the same reason.
             connection.settimeout(None)
             set_deadline(connection, max(1.0, deadline - time.monotonic()))
-            source = owner if kind == KIND_RELAY else peer
             destination = (
                 self._peer_state_round_path(peer, round_number)
                 if kind == KIND_STATE

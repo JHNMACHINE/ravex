@@ -318,9 +318,8 @@ def _modules_near_the_top(root: Any, depth: int = 3):
         below = []
         for module in frontier:
             yield module
-            children = getattr(module, "children", None)
-            if callable(children):
-                below.extend(children())
+            if callable(getattr(module, "children", None)):
+                below.extend(module.children())
         frontier = below
 
 

@@ -764,6 +764,8 @@ def state_payload(loop) -> Dict[str, object]:
 
 def apply_state(loop, payload: Dict[str, object]) -> None:
     """Put a :func:`state_payload` into this node's loop, and into its model."""
+    import torch
+
     outer = {}
     buffers = {}
     for key, value in payload.items():
@@ -772,10 +774,8 @@ def apply_state(loop, payload: Dict[str, object]) -> None:
         elif key.startswith(MOMENTUM_PREFIX):
             buffers[key[len(MOMENTUM_PREFIX):]] = value
         elif key == MODEL_STEPS_KEY:
-            loop.model_steps = int(value.item() if hasattr(value, "item") else value)
+            loop.model_steps = int(torch.as_tensor(value).item())
         elif key == INNER_STEPS_KEY:
-            import torch
-
             current, pending = (int(v) for v in torch.as_tensor(value).tolist())
             if current and getattr(loop, "inner_steps", None) is not None:
                 loop.inner_steps = current

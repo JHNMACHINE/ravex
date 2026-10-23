@@ -31,7 +31,10 @@ from __future__ import annotations
 
 import functools
 import logging
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
+
+if TYPE_CHECKING:
+    import torch
 
 logger = logging.getLogger("ravex")
 
@@ -62,6 +65,15 @@ def _tilelang():
     return tilelang, T
 
 
+def _loaded():
+    """``(tilelang, T)``, for code that only runs once :func:`available`
+    has said yes; raises otherwise, rather than unpacking a None."""
+    found = _tilelang()
+    if found is None:
+        raise RuntimeError("TileLang is not usable in this process")
+    return found
+
+
 def available() -> bool:
     """Whether the kernels can run in this process at all."""
     if _failed:
@@ -83,7 +95,7 @@ def program(bits: int, group: int, in_dtype: str, N: int = ROW):
     on a machine without a GPU - lowering and ``nvcc`` need none - which is how
     a kernel's errors are found before a node is rented for it.
     """
-    _, T = _tilelang()
+    _, T = _loaded()
 
     def fast_log2_ceil(x):
         """ceil(log2(x)) from the float's bits: exponent, plus one if any
@@ -139,11 +151,11 @@ def program(bits: int, group: int, in_dtype: str, N: int = ROW):
 
 @functools.lru_cache(maxsize=None)
 def _kernel(bits: int, group: int, in_dtype: str, target: str = "auto"):
-    tilelang, _ = _tilelang()
+    tilelang, _ = _loaded()
     return tilelang.compile(program(bits, group, in_dtype), target=target)
 
 
-def encode(tensor, fmt) -> Optional[Tuple["object", "object"]]:
+def encode(tensor, fmt) -> Optional[Tuple["torch.Tensor", "torch.Tensor"]]:
     """``(codes, exponents)`` as :func:`ravex._dist.quant.encode` lays them
     out, on the CPU — or None, and the caller takes the torch path."""
     import torch
