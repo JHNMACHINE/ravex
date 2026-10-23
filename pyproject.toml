@@ -41,9 +41,8 @@ classifiers = [
 dependencies = ["PyYAML>=5.1"]
 
 [project.optional-dependencies]
-# 0.0.8, and the floor has moved three times for the same reason: each time, the
-# version below it loses or wedges something Ravex's own defaults walk straight
-# into.
+# 0.3.1, and the floor has moved each time for the same reason: the version
+# below it loses or wedges something Ravex's own defaults walk straight into.
 #
 #   >=0.0.4  `keep_last` stopped erasing the whole checkpoint history instead
 #            of trimming it. (The old `>=0.2` was not satisfiable by any
@@ -104,7 +103,10 @@ dependencies = ["PyYAML>=5.1"]
 #            0.2.1 since GPU-217: with temporary credentials a store could be
 #            saved to R2 and never listed, so never restored - R2 refuses
 #            the session token in a listing's query.
-moonclip = ["moonclip>=0.2.1"]
+#            0.3.1 since GPU-267: Ravex no longer passes a bucket's keys, and
+#            Moonclip reads them from its environment only since 0.3.1; an
+#            older one refuses a bucket without them.
+moonclip = ["moonclip>=0.3.1"]
 dev = ["pytest>=7", "numpy"]
 
 [project.urls]
