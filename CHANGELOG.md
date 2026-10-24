@@ -16,6 +16,18 @@
 
 ### Added
 
+- **Each node's own series in a multi-node run (GPU-232).** Beside the model's
+  series - one point per outer round, the mean over the nodes - every node
+  now writes what the script logs, as it is logged, on its own steps, into a
+  segment whose header says `"node": true`. The first process of each machine
+  writes it (`LOCAL_RANK` 0), whatever rank the node holds; scalars only, the
+  histograms stay on the model's series. `ravex.metrics.read` returns them
+  under `nodes`, `{host: {name: series}}`, kept out of `scalars` and cut at a
+  resume of their own machine only, so nodes that all start from step 0 do
+  not cut each other's lines. A reader older than this one takes a node
+  segment for an ordinary rank-0 one: read a multi-node store with this
+  version or later.
+
 - **H can follow the link: `outer_inner_steps: auto` (GPU-231).** Or
   `outer_auto_steps: true`. The run starts from 500 steps per round and after
   every round moves H toward the value at which the training waits
