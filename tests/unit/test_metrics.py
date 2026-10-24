@@ -345,7 +345,7 @@ class TestTimeline:
 
     def test_an_empty_store_reads_as_empty(self, tmp_path):
         history = ravex.metrics.read(str(tmp_path / "nothing"))
-        assert history == {"scalars": {}, "histograms": {}, "system": {}, "segments": []}
+        assert history == {"scalars": {}, "histograms": {}, "system": {}, "nodes": {}, "segments": []}
 
 
 class TestHistogramOnTheDevice:
@@ -515,3 +515,108 @@ def test_the_model_timeline_is_cut_by_its_own_segments_only(tmp_path):
     node.put(3, 2.0, {"sys/cpu": _metrics.Scalar(50.0)})
     node.close()
     assert ravex.metrics.read(str(tmp_path))["scalars"]["train/loss"]["step"] == [100]
+
+
+# ─── a multi-node run's own node series, GPU-232 ──────────────────────────
+
+
+def node_segment(path, host, start, points, monkeypatch):
+    """One node's segment, as the node on ``host`` writes it."""
+    monkeypatch.setattr(_metrics.socket, "gethostname", lambda: host)
+    writer = _metrics.MetricsWriter(str(path), 0, start, chunk_every=0, node=True)
+    for step, value in points:
+        writer.put(step, float(step), {"train/loss": _metrics.Scalar(value), "sys/cpu": _metrics.Scalar(1.0)})
+    writer.close()
+
+
+def test_three_nodes_starting_at_step_zero_keep_each_other_s_points(tmp_path, monkeypatch):
+    """Every node counts from its own step 0. Chained as one timeline, each
+    segment would cut the one before it at 0 and leave one line standing."""
+    for host in ("node-a", "node-b", "node-c"):
+        node_segment(tmp_path, host, 0, [(10, 1.0), (20, 2.0)], monkeypatch)
+    history = ravex.metrics.read(str(tmp_path))
+    assert sorted(history["nodes"]) == ["node-a", "node-b", "node-c"]
+    for host in history["nodes"]:
+        assert history["nodes"][host]["train/loss"]["step"] == [10, 20]
+    assert "train/loss" not in history["scalars"], "a node's line is not the model's series"
+    assert sorted(history["system"]) == ["node-a", "node-b", "node-c"]
+
+
+def test_a_node_s_restart_cuts_its_own_line_only(tmp_path, monkeypatch):
+    node_segment(tmp_path, "node-a", 0, [(10, 1.0), (20, 2.0), (30, 3.0)], monkeypatch)
+    node_segment(tmp_path, "node-b", 0, [(10, 5.0), (20, 6.0), (30, 7.0)], monkeypatch)
+    # node-a comes back from its checkpoint at 15 and redoes 20.
+    node_segment(tmp_path, "node-a", 15, [(20, 9.0)], monkeypatch)
+    nodes = ravex.metrics.read(str(tmp_path))["nodes"]
+    assert nodes["node-a"]["train/loss"]["step"] == [10, 20]
+    assert nodes["node-a"]["train/loss"]["value"] == [1.0, 9.0]
+    assert nodes["node-b"]["train/loss"]["step"] == [10, 20, 30]
+
+
+def test_node_segments_do_not_cut_the_model_series(tmp_path, monkeypatch):
+    model = _metrics.MetricsWriter(str(tmp_path), _metrics.MODEL_RANK, 0, chunk_every=0)
+    model.put(1000, 1.0, {"train/loss": _metrics.Scalar(2.0)})
+    model.close()
+    node_segment(tmp_path, "node-a", 0, [(10, 1.0)], monkeypatch)
+    history = ravex.metrics.read(str(tmp_path))
+    assert history["scalars"]["train/loss"]["step"] == [1000]
+    assert history["nodes"]["node-a"]["train/loss"]["step"] == [10]
+
+
+def test_a_single_process_run_has_no_node_series(storage):
+    @ravex.train_loop(backend="torch_save", checkpoint_every=10_000)
+    def train():
+        loop(3, lambda step, _m: ravex.log_metrics({"train/loss": 1.0}))
+
+    train()
+    history = ravex.metrics.read(str(storage))
+    assert history["nodes"] == {}
+    assert history["scalars"]["train/loss"]["step"] == [1, 2, 3]
+    assert all("node" not in header for header in history["segments"])
+
+
+def test_a_node_session_marks_its_segment(tmp_path):
+    session = _metrics.MetricsSession(str(tmp_path), 0, chunk_every=0, node=True)
+    session.log(4, _metrics.prepare_all({"train/loss": 1.0}))
+    session.begin(0, lambda: 4)
+    session.close(4)
+    (header,) = ravex.metrics.segments(str(tmp_path))
+    assert header["node"] is True
+
+
+def test_a_node_logs_into_the_round_and_into_its_own_line(storage):
+    """What a node of a multi-node run does with a logged value: the round's
+    mean for the model's series, and the value itself on the node's line.
+    Played on one process by giving the runtime what the outer loop gives it."""
+    from ravex._runtime import get_runtime
+
+    means = _metrics.RoundMeans()
+
+    @ravex.train_loop(backend="torch_save", checkpoint_every=10_000, training_metrics=False)
+    def train():
+        runtime = get_runtime(create=False)
+        runtime._round_means = means
+        runtime._metrics.node = True
+        loop(3, lambda step, _m: ravex.log_metrics({"train/loss": float(step), "w": torch.arange(4.0)}))
+
+    train()
+    assert means.take()["train/loss"] == [2.0, 3]
+    history = ravex.metrics.read(str(storage))
+    (host,) = history["nodes"]
+    assert history["nodes"][host]["train/loss"]["step"] == [1, 2, 3]
+    assert "w" not in history["nodes"][host], "histograms stay on the model's series"
+    assert "train/loss" not in history["scalars"]
+
+
+def test_a_node_s_line_is_written_by_the_first_process_of_its_machine(tmp_path, monkeypatch):
+    """A node can hold any rank among the others; its line is its machine's."""
+    from ravex._dist import collectives
+
+    monkeypatch.setattr(collectives, "get_rank", lambda: 1)
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    session = _metrics.MetricsSession(str(tmp_path), 0, chunk_every=0, node=True)
+    session.begin(0, lambda: 0)
+    session.log(1, _metrics.prepare_all({"train/loss": 1.0}))
+    session.close(1)
+    (own,) = ravex.metrics.read(str(tmp_path))["nodes"].values()
+    assert own["train/loss"]["step"] == [1]

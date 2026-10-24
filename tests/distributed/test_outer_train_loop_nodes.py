@@ -317,6 +317,14 @@ def test_a_multi_node_run_logs_one_series_for_the_model(tmp_path):
     assert [entry["step"] for entry in histograms["train/weights/0.weight"]] == [16, 32, 48]
     assert "train/grads/0.weight" in histograms
 
+    # GPU-232: and beside the model's series, each node's own line, every
+    # step it logged, on its own steps, in its own store.
+    for rank in (0, 1):
+        nodes = ravex.metrics.read(str(tmp_path / ("cwd%d" % rank) / "checkpoints"))["nodes"]
+        (own,) = nodes.values()
+        assert own["train/loss"]["step"] == list(range(1, 25))
+        assert own["train/loss"]["value"] == [1.0 + 2.0 * rank] * 24
+
 
 @pytest.mark.skipif(sys.platform == "darwin", reason="spawn + gloo is slow on macOS")
 def test_a_loop_that_hands_over_nothing_trains_with_its_peer(tmp_path):

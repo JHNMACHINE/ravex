@@ -362,6 +362,7 @@ class RavexRuntime:
                     self.config.storage.path,
                     self.config.system_metrics_every,
                     self.config.metrics_chunk_every,
+                    node=bool(self.config.outer_loop),
                 )
                 if self.config.outer_loop:
                     from ravex._metrics import RoundMeans
@@ -880,13 +881,22 @@ class RavexRuntime:
         """Queue already-prepared metrics. See `ravex.log_metrics`."""
         if self._metrics is None or not self._enabled:
             return
+        local_step = self.registry.step_count if step is None else int(step)
         if self._round_means is not None:
             # A multi-node run: the model's metrics, averaged over the nodes
-            # at the end of the round (GPU-135). `step` does not apply - the
-            # model's axis is its steps over every node, known only then.
+            # at the end of the round (GPU-135), on the model's axis - its
+            # steps over every node, known only then.
             self._round_means.add(values)
+            # And this node's own line, on its own steps (GPU-232). Scalars
+            # only: the round's writer already logs one node's histograms on
+            # the model's series, and a copy per node is bins nobody compares.
+            from ravex._metrics import Scalar
+
+            scalars = {key: value for key, value in values.items() if isinstance(value, Scalar)}
+            if scalars:
+                self._metrics.log(local_step, scalars)
             return
-        self._metrics.log(self.registry.step_count if step is None else int(step), values)
+        self._metrics.log(local_step, values)
 
     def _open_run_record(self, uploader: Any) -> None:
         """Write `run.json` if this store is new, and say the run is running.

@@ -23,6 +23,15 @@ computes the same loss under data parallelism, or a meaningless partial one
 under anything else, and eight copies of either help nobody. System metrics are
 per machine, so the first process on each machine samples its own.
 
+**A multi-node run writes two series** (GPU-232). Each node is rank 0 of its
+own world and logs its own loss on its own shard, at its own step count. The
+model's series is the mean over the nodes, one point per outer round, under
+:data:`MODEL_RANK` (see :class:`RoundMeans`). Beside it every node writes its
+own scalars as they are logged, on its local steps, into a segment whose
+header says ``"node": true``: the machine is what tells two nodes' lines
+apart, and a reader keeps them out of the model's series and cuts each one at
+a resume of its own machine only.
+
 **A remote store** (GPU-152). With ``storage.type: s3`` the chunks are written
 into the staging directory, and each one is handed to Moonclip's
 ``sync_prefix`` as it lands, so the bucket holds the metrics while the run is
@@ -346,6 +355,7 @@ class MetricsWriter:
         start_step: int,
         chunk_every: float = 15.0,
         uploader: Optional[Callable[[str], None]] = None,
+        node: bool = False,
     ) -> None:
         self.started = time.time()
         self.host = socket.gethostname()
@@ -365,6 +375,10 @@ class MetricsWriter:
             "start_step": start_step,
             "time": self.started,
         }
+        if node:
+            # One node's own series in a multi-node run (GPU-232). Only when
+            # true, so a single-process run's header is what it always was.
+            self._header["node"] = True
         self._sequence = 0
         self._queue: "queue.Queue[Optional[Tuple[int, float, Dict[str, Any]]]]" = queue.Queue(
             maxsize=QUEUE_LIMIT
@@ -607,11 +621,12 @@ MODEL_RANK = -1
 class RoundMeans:
     """What this node logged during an outer round, as a mean per name (GPU-135).
 
-    In a multi-node run the script's metrics are not sent as they are logged:
-    every node computes its own loss on its own shard, at its own step count,
-    and a run is one model. So each node keeps a running sum here, sends the
-    mean with its round report, and the round's writer logs the mean over the
-    nodes, weighted by the steps behind each.
+    Every node of a multi-node run computes its own loss on its own shard, at
+    its own step count, and a run is one model. So for the model's series each
+    node keeps a running sum here, sends the mean with its round report, and
+    the round's writer logs the mean over the nodes, weighted by the steps
+    behind each. The node's own points go to its own series as well (GPU-232):
+    the mean is what the model did, the lines are where each node got there.
 
     Sums stay on the device until :meth:`take`: adding a queued value is as
     asynchronous as queueing it, and the round boundary - which reads the
@@ -718,10 +733,19 @@ class MetricsSession:
     logged before then waits here.
     """
 
-    def __init__(self, directory: str, system_every: float, chunk_every: float = 15.0) -> None:
+    def __init__(
+        self,
+        directory: str,
+        system_every: float,
+        chunk_every: float = 15.0,
+        node: bool = False,
+    ) -> None:
         self.directory = directory
         self.system_every = system_every
         self.chunk_every = chunk_every
+        #: This process is a node of a multi-node run, and what the script
+        #: logs here is that node's own series (GPU-232).
+        self.node = node
         self._pending: List[Tuple[int, float, Dict[str, Any]]] = []
         self._writer: Optional[MetricsWriter] = None
         self._sampler: Optional[SystemSampler] = None
@@ -747,13 +771,15 @@ class MetricsSession:
 
             rank = get_rank()
             local_rank = _environment_rank("LOCAL_RANK")
-            self._accepts_user = rank == 0
+            # A node's own series is written by the first process of its
+            # machine (GPU-232), whatever rank the node holds among the others.
+            self._accepts_user = (local_rank or 0) == 0 if self.node else rank == 0
             samples_machine = self.system_every > 0 and (local_rank or 0) == 0
             if not (self._accepts_user or samples_machine):
                 self._pending.clear()
                 return
             self._writer = MetricsWriter(
-                self.directory, rank, start_step, self.chunk_every, uploader
+                self.directory, rank, start_step, self.chunk_every, uploader, node=self.node
             )
             if self._accepts_user:
                 for record in self._pending:

@@ -8,6 +8,7 @@
     loss = history["scalars"]["train/loss"]      # {"step": [...], "time": [...], "value": [...]}
     weights = history["histograms"]["weights"]   # [{"step", "time", "min", "max", "counts", ...}]
     gpu = history["system"]["node-a"]["sys/gpu0/utilization"]
+    own = history["nodes"]["node-a"]["train/loss"]  # a multi-node run's node, on its own steps
 
 The path is the run's ``storage.path``, the same one its checkpoints are in.
 
@@ -31,6 +32,13 @@ holds - one value per step, as if the run had never been interrupted.
 System metrics are exempt. They describe machines, not the model: a GPU that
 was at 100% for the 200 steps that were thrown away really was at 100%, and
 that is worth seeing when someone asks what a crash cost.
+
+**A multi-node run's nodes** (GPU-232). Each node's own series is written in
+segments marked ``"node": true``, on that node's local steps. They are never
+part of the model's series, and the rule above applies to them one machine at
+a time: a node's segment is cut only by the next segment of the same machine,
+because every node starts its count at its own step and would otherwise cut
+the others' lines at a number on a different axis.
 
 Values that are NaN or infinite come back as floats. On disk they are strings
 (``"nan"``), because a browser's JSON parser refuses them bare.
@@ -232,6 +240,10 @@ def resolve(chunks: Mapping[str, str]) -> Dict[str, Any]:
     ``system``
         ``{host: {name: {"step", "time", "value"}}}``, sorted by time and never
         cut at a resume.
+    ``nodes``
+        ``{host: {name: {"step", "time", "value"}}}``: each node's own scalars
+        in a multi-node run, sorted by step and cut at a resume of that
+        machine only. Empty for any other run.
     ``segments``
         The headers, oldest first, each with ``cut_at``: the step past which
         its points were dropped, or ``None`` for the segment that is current.
@@ -242,9 +254,18 @@ def resolve(chunks: Mapping[str, str]) -> Dict[str, Any]:
     # run's model series (GPU-135), written under a rank of its own because
     # its steps are the model's and not any process's. Each is cut by the
     # segments of its own kind only.
+    # A node's own series is a timeline per machine (GPU-232).
+    chains: Dict[Any, List[Dict[str, Any]]] = {}
+    for header in headers:
+        if header.get("node"):
+            key: Any = ("node", str(header.get("host", "unknown")))
+        else:
+            key = header.get("rank", 0)
+        chains.setdefault(key, []).append(header)
     cut_at: Dict[str, Optional[int]] = {}
-    for timeline in (0, MODEL_RANK):
-        chain = [header for header in headers if header.get("rank", 0) == timeline]
+    for timeline, chain in chains.items():
+        if timeline not in (0, MODEL_RANK) and not isinstance(timeline, tuple):
+            continue
         for index, header in enumerate(chain):
             following = chain[index + 1] if index + 1 < len(chain) else None
             cut_at[header["segment"]] = None if following is None else int(following["start_step"])
@@ -252,6 +273,8 @@ def resolve(chunks: Mapping[str, str]) -> Dict[str, Any]:
     scalars: Dict[str, Dict[str, List[Any]]] = {}
     histograms: Dict[str, List[Dict[str, Any]]] = {}
     system: Dict[str, Dict[str, Dict[str, List[Any]]]] = {}
+    nodes: Dict[str, Dict[str, Dict[str, List[Any]]]] = {}
+    node_points: Dict[Tuple[str, str], List[Tuple[int, int, Optional[float], Any]]] = {}
     # Collected with the segment's position, so a step logged by two
     # segments - an evaluation at the resume step, say - keeps the later one.
     scalar_points: Dict[str, List[Tuple[int, int, Optional[float], Any]]] = {}
@@ -260,7 +283,8 @@ def resolve(chunks: Mapping[str, str]) -> Dict[str, Any]:
     for order, header in enumerate(headers):
         segment = header["segment"]
         limit = cut_at.get(segment)
-        is_primary = header.get("rank", 0) in (0, MODEL_RANK)
+        is_node = bool(header.get("node"))
+        is_primary = not is_node and header.get("rank", 0) in (0, MODEL_RANK)
         host = str(header.get("host", "unknown"))
         for name, text in by_segment[segment][1:]:
             for record in _records(text, segment + "/" + name):
@@ -276,7 +300,15 @@ def resolve(chunks: Mapping[str, str]) -> Dict[str, Any]:
                         series["time"].append(when)
                         series["value"].append(_value(raw))
                         continue
-                    if not is_primary or (limit is not None and step > limit):
+                    if limit is not None and step > limit:
+                        continue
+                    if is_node:
+                        if not (isinstance(raw, dict) and "histogram" in raw):
+                            node_points.setdefault((host, key), []).append(
+                                (step, order, when, _value(raw))
+                            )
+                        continue
+                    if not is_primary:
                         continue
                     if isinstance(raw, dict) and "histogram" in raw:
                         entry = dict(raw["histogram"], step=step, time=when)
@@ -285,16 +317,9 @@ def resolve(chunks: Mapping[str, str]) -> Dict[str, Any]:
                         scalar_points.setdefault(key, []).append((step, order, when, _value(raw)))
 
     for key, points in scalar_points.items():
-        points.sort(key=lambda point: (point[0], point[1]))
-        series = scalars[key] = _series()
-        for step, _order, when, value in points:
-            if series["step"] and series["step"][-1] == step:
-                series["time"][-1] = when
-                series["value"][-1] = value
-                continue
-            series["step"].append(step)
-            series["time"].append(when)
-            series["value"].append(value)
+        scalars[key] = _by_step(points)
+    for (host, key), points in node_points.items():
+        nodes.setdefault(host, {})[key] = _by_step(points)
 
     for key, entries in histogram_points.items():
         entries.sort(key=lambda point: (point[0], point[1]))
@@ -318,5 +343,21 @@ def resolve(chunks: Mapping[str, str]) -> Dict[str, Any]:
         "scalars": scalars,
         "histograms": histograms,
         "system": system,
+        "nodes": nodes,
         "segments": headers,
     }
+
+
+def _by_step(points: List[Tuple[int, int, Optional[float], Any]]) -> Dict[str, List[Any]]:
+    """One value per step, the latest segment's where two logged the same one."""
+    points.sort(key=lambda point: (point[0], point[1]))
+    series = _series()
+    for step, _order, when, value in points:
+        if series["step"] and series["step"][-1] == step:
+            series["time"][-1] = when
+            series["value"][-1] = value
+            continue
+        series["step"].append(step)
+        series["time"].append(when)
+        series["value"].append(value)
+    return series
