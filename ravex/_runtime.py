@@ -1260,9 +1260,7 @@ class RavexRuntime:
         self._membership = Membership(store, rank, world, ceiling=ceiling)
         self.store_for_joins = store
         self._outer_joined = joining
-        root = self.config.outer_root or os.path.join(
-            self.config.storage.path, "rounds", str(rank)
-        )
+        root = self.config.outer_root or os.path.join(self._rounds_base(), str(rank))
         exchange = self._open_exchange(rank, store, root)
         self._exchange = exchange
         self._region_exchanges = self._open_region_exchanges(rank, store, root, exchange)
@@ -1714,11 +1712,21 @@ class RavexRuntime:
         # The members' state, taken in place of this node's own.
         self._save_outer_state(self._outer)
 
+    def _rounds_base(self) -> str:
+        """Where round reports are staged unless ``outer_root`` says: beside
+        the checkpoint store, ``<store>.rounds``, never inside it (GPU-240).
+        Inside, the closing sync carried every report up to the bucket and a
+        restore brought them back down - 24 files and 6.7 MB per node in the
+        GPU-235 bench - for files that matter only while their round is open.
+        Nothing reads them from the store: a peer fetches a report over the
+        exchange, and a rejoin or a failover opens a directory of its own."""
+        return os.path.normpath(self.config.storage.path) + ".rounds"
+
     def _round_root(self, node: int) -> str:
         """Where node ``node`` stages its round reports. Under the epoch, after
         a failover: numbers start from zero again there, and a directory of
         the previous epoch's node with the same number is not this one's."""
-        base = self.config.outer_root or os.path.join(self.config.storage.path, "rounds")
+        base = self.config.outer_root or self._rounds_base()
         if self._epoch:
             base = os.path.join(base, "e%d" % self._epoch)
         return os.path.join(base, "node%d" % node) if self.config.outer_root else \

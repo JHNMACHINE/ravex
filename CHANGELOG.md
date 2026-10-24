@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **Round reports are staged beside the checkpoint store, not inside it
+  (GPU-240).** Without `outer_root` they went to `<storage.path>/rounds/`, so
+  the closing sync carried every report up to the bucket and a restore brought
+  them back down - 24 files and 6.7 MB per node in the GPU-235 bench, for
+  files that matter only while their round is open. The default is now
+  `<storage.path>.rounds/`. Nothing read them from the store: a peer takes a
+  report over the exchange, and a rejoin or a failover opens a directory of
+  its own. A bucket written by an earlier version keeps its `rounds/` until it
+  is removed by hand; a resume brings it down once and never reads it.
+
 ## 0.10.0 — 2026-10-24
 
 ### Fixed

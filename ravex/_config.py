@@ -699,11 +699,12 @@ class RavexConfig:
     #: Also ``RAVEX_OUTER_OVERLAP``.
     outer_overlap: bool = False
 
-    #: Where round reports are staged. Defaults to `rounds/` beside the
-    #: checkpoint store. Kept apart from the checkpoints deliberately: these
-    #: are in-flight working copies with their own retention, and mixing them
-    #: into the store a resume reads from is how a round report becomes a
-    #: checkpoint nobody meant to keep.
+    #: Where round reports are staged. Defaults to ``<storage.path>.rounds``,
+    #: beside the checkpoint store and not inside it (GPU-240). Kept apart from
+    #: the checkpoints deliberately: these are in-flight working copies with
+    #: their own retention, and mixing them into the store a resume reads from
+    #: is how a round report becomes a checkpoint nobody meant to keep - and,
+    #: with a bucket, how they travel up at the close and down at the resume.
     outer_root: Optional[str] = None
 
     #: The address of a ``ravex rendezvous`` server, ``host:port`` (GPU-129).

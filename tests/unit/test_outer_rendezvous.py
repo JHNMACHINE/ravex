@@ -14,6 +14,7 @@ that is the property that fails silently: nodes that stopped exchanging still
 train, and their loss still falls.
 """
 
+import os
 import threading
 import time
 
@@ -162,6 +163,32 @@ def test_a_bad_rendezvous_setting_is_reported_rather_than_raised(monkeypatch, tm
     assert config.outer_job == "default"
     said = " | ".join(config.problems)
     assert "outer_rendezvous" in said and "outer_job" in said, said
+
+
+def test_round_reports_are_staged_beside_the_store_and_not_in_it(tmp_path):
+    """GPU-240: inside the store, the closing sync carried every report up to
+    the bucket and a restore brought them down again. Every way a node opens
+    its exchange - the start, a rejoin, an epoch after a failover - stages
+    outside the directory the checkpoints sync from."""
+    from ravex._config import RavexConfig
+    from ravex._runtime import RavexRuntime
+
+    runtime = RavexRuntime.__new__(RavexRuntime)
+    runtime.config = RavexConfig()
+    runtime.config.storage.path = str(tmp_path / "store") + os.sep
+    runtime._epoch = 0
+    store = str(tmp_path / "store")
+
+    for epoch in (0, 2):
+        runtime._epoch = epoch
+        root = os.path.abspath(runtime._round_root(1))
+        assert os.path.commonpath([root, store]) != store, root
+        assert root.startswith(store + ".rounds"), root
+    assert os.path.abspath(runtime._rounds_base()) == store + ".rounds"
+
+    # Given explicitly, the place is the caller's, as before.
+    runtime.config.outer_root = str(tmp_path / "elsewhere")
+    assert runtime._round_root(1).startswith(runtime.config.outer_root)
 
 
 # ─── whole nodes ───────────────────────────────────────────────────────

@@ -73,7 +73,8 @@ def a_node(rank, world, port, root, rounds, inner, queue, boundary="public", log
         @ravex.train_loop(
             outer_loop=True,
             outer_inner_steps=inner,
-            outer_root=os.path.join(root, "rank%d" % rank),
+            # No `outer_root`: the default is under test too, beside the
+            # store in `checkpoints.rounds` and never inside it (GPU-240).
             outer_deadline=60,
             enabled=True,
             # A second run in the same directories resumes the first's
@@ -224,6 +225,14 @@ def test_a_training_loop_that_knows_nothing_trains_with_a_peer(tmp_path):
     different, and the loss would drop anyway.
     """
     results = run_two(tmp_path)
+
+    for rank in range(2):
+        # GPU-240: the reports are staged beside the store, so the sync of
+        # the store to a bucket carries checkpoints and nothing else.
+        cwd = tmp_path / ("cwd%d" % rank)
+        assert (cwd / "checkpoints").is_dir(), sorted(os.listdir(cwd))
+        assert not (cwd / "checkpoints" / "rounds").exists(), sorted(os.listdir(cwd / "checkpoints"))
+        assert (cwd / "checkpoints.rounds").is_dir(), sorted(os.listdir(cwd))
 
     for rank, (before, after, _, _said, _) in results.items():
         assert after < before / 2, "rank %d did not train: %.4f -> %.4f" % (
